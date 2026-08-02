@@ -16,18 +16,57 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          # Read the version from go.mod so a toolchain bump happens in one
+          # place. Pinning it here separately is how CI ended up unable to
+          # build its own module.
+          go-version-file: go.mod
           cache: true
+
       - name: go mod tidy (verify dependencies are clean)
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
+
+      # Formatting was not checked before, which is how unformatted code
+      # reached main. `gofmt -l` prints offending files but still exits 0,
+      # so the output has to be tested explicitly.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
       - name: vet
         run: go vet ./...
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+
+      # -race matters specifically here: Prometheus calls Collect
+      # concurrently when scrapes overlap, which is exactly where a race in
+      # this exporter lives (and did).
       - name: test
         run: go test -race -v ./...
+
       - name: build (host arch)
         run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/kea-prom-exporter .
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: gosec
+        run: go run github.com/securego/gosec/v2/cmd/gosec@latest -quiet ./...
 
   docker:
     runs-on: ubuntu-latest

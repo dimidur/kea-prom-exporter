@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -173,6 +174,33 @@ func TestPerPoolStatisticsAreNotDoubleCounted(t *testing.T) {
 			t.Errorf("kea_dhcp4_addresses_assigned has %d series, want %d (one per subnet, per-pool keys excluded)",
 				len(mf.GetMetric()), len(subnets))
 		}
+	}
+}
+
+func TestConcurrentScrapesAreRaceFree(t *testing.T) {
+	// Prometheus may call Collect concurrently when scrapes overlap. The
+	// scrape-error counter used to be a package-level uint64 incremented
+	// without synchronisation, which `go test -race` flags here.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "down", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	const scrapes = 8
+	var wg sync.WaitGroup
+	for range scrapes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ch := make(chan prometheus.Metric, 64)
+			c.Collect(ch)
+		}()
+	}
+	wg.Wait()
+
+	if got := c.scrapeErrorCount.Load(); got != scrapes {
+		t.Errorf("scrapeErrorCount = %d after %d failing scrapes, want %d", got, scrapes, scrapes)
 	}
 }
 

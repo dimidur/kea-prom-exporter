@@ -1,0 +1,21 @@
+# Dependencies are pinned in go.mod/go.sum so builds are reproducible, which
+# also means they never move on their own. Dependabot is what makes a pinned
+# dependency a decision rather than neglect -- an outdated x/sys was already
+# carrying a known advisory here.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly

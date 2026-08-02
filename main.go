@@ -22,6 +22,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -30,13 +31,13 @@ import (
 )
 
 var (
-	listenAddr      = flag.String("listen", envOr("LISTEN", ":9547"), "Prometheus metrics listen address (also LISTEN env).")
-	keaURL          = flag.String("kea-url", envOr("KEA_URL", "http://127.0.0.1:8001/"), "Kea HTTP control socket URL (also KEA_URL env).")
-	keaUser         = flag.String("kea-user", envOr("KEA_USER", ""), "Kea HTTP basic auth user (also KEA_USER env). Empty disables auth.")
-	keaPassFile     = flag.String("kea-password-file", envOr("KEA_PASSWORD_FILE", ""), "Path to file containing Kea HTTP basic auth password (also KEA_PASSWORD_FILE env). Precedence over --kea-password.")
-	keaPass         = flag.String("kea-password", envOr("KEA_PASSWORD", ""), "Kea HTTP basic auth password (also KEA_PASSWORD env). Prefer --kea-password-file for production.")
-	httpTimeout     = flag.Duration("kea-timeout", 5*time.Second, "Kea API request timeout.")
-	scrapeService   = flag.String("kea-service", "dhcp4", "Kea service name to scrape (currently only dhcp4 is implemented).")
+	listenAddr    = flag.String("listen", envOr("LISTEN", ":9547"), "Prometheus metrics listen address (also LISTEN env).")
+	keaURL        = flag.String("kea-url", envOr("KEA_URL", "http://127.0.0.1:8001/"), "Kea HTTP control socket URL (also KEA_URL env).")
+	keaUser       = flag.String("kea-user", envOr("KEA_USER", ""), "Kea HTTP basic auth user (also KEA_USER env). Empty disables auth.")
+	keaPassFile   = flag.String("kea-password-file", envOr("KEA_PASSWORD_FILE", ""), "Path to file containing Kea HTTP basic auth password (also KEA_PASSWORD_FILE env). Precedence over --kea-password.")
+	keaPass       = flag.String("kea-password", envOr("KEA_PASSWORD", ""), "Kea HTTP basic auth password (also KEA_PASSWORD env). Prefer --kea-password-file for production.")
+	httpTimeout   = flag.Duration("kea-timeout", 5*time.Second, "Kea API request timeout.")
+	scrapeService = flag.String("kea-service", "dhcp4", "Kea service name to scrape (currently only dhcp4 is implemented).")
 )
 
 func envOr(key, fallback string) string {
@@ -115,9 +116,14 @@ type collector struct {
 	pkt4Sent     *prometheus.Desc
 
 	// HA state.
-	haLocalState  *prometheus.Desc
-	haPartnerAge  *prometheus.Desc
-	haCommBroken  *prometheus.Desc
+	haLocalState *prometheus.Desc
+	haPartnerAge *prometheus.Desc
+	haCommBroken *prometheus.Desc
+
+	// Cumulative scrape failures. Atomic and per-collector, not a package
+	// global: Prometheus may call Collect concurrently for overlapping
+	// scrapes, and a plain counter increment there is a data race.
+	scrapeErrorCount atomic.Uint64
 
 	// Track stat keys we don't have a mapping for. Logged exactly
 	// once each — keeps scrape noise low while still surfacing drift.
@@ -176,8 +182,6 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.haCommBroken
 }
 
-var scrapeErrorCount uint64
-
 func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	ctx, cancel := context.WithTimeout(context.Background(), *httpTimeout)
 	defer cancel()
@@ -196,11 +200,12 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	if statErr != nil && haErr != nil {
 		upValue = 0
 	}
+	errCount := c.scrapeErrorCount.Load()
 	if statErr != nil || haErr != nil {
-		scrapeErrorCount++
+		errCount = c.scrapeErrorCount.Add(1)
 	}
 	ch <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, upValue)
-	ch <- prometheus.MustNewConstMetric(c.scrapeErrors, prometheus.CounterValue, float64(scrapeErrorCount))
+	ch <- prometheus.MustNewConstMetric(c.scrapeErrors, prometheus.CounterValue, float64(errCount))
 }
 
 func (c *collector) collectStats(ctx context.Context, ch chan<- prometheus.Metric) error {
@@ -343,6 +348,9 @@ func (c *collector) collectHA(ctx context.Context, ch chan<- prometheus.Metric) 
 
 func loadPassword(file, inline string) (string, error) {
 	if file != "" {
+		// #nosec G304 -- the path is supplied by the operator via
+		// --kea-password-file / KEA_PASSWORD_FILE. Reading an operator-named
+		// file is the feature; there is no untrusted input on this path.
 		b, err := os.ReadFile(file)
 		if err != nil {
 			return "", fmt.Errorf("read kea-password-file %q: %w", file, err)

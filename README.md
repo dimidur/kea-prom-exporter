@@ -86,7 +86,7 @@ Multi-arch build:
 
 ```bash
 docker buildx build --platform linux/amd64,linux/arm64 \
-  -t ghcr.io/dimidur/kea-prom-exporter:0.1.0 --push .
+  -t dimidur/kea-prom-exporter:0.1.0 --push .
 ```
 
 ## Scraping it

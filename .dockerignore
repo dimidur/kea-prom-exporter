@@ -1,0 +1,15 @@
+# Keep the build context small; the Dockerfile only needs the module files
+# and sources. .git and any local build output are pure upload cost.
+.git
+.github
+*.md
+!README.md
+testdata
+kea-prom-exporter
+kea-prom-exporter-*
+*.test
+*.out
+*.prof
+.dockerignore
+.gitignore
+LICENSE
