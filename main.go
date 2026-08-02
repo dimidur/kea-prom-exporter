@@ -1,11 +1,11 @@
-// Prometheus exporter for ISC Kea DHCPv4 (Kea 3.1.x).
+// Prometheus exporter for ISC Kea DHCPv4 (Kea 3.x).
 //
 // On each /metrics scrape the exporter POSTs `statistic-get-all` and
 // `status-get` to the kea-dhcp4 daemon's HTTP control socket (basic
 // auth) and translates the responses into Prometheus metrics.
 //
-// POC scope: a handful of headline metrics covering lease pool
-// utilisation, packet counters, and HA peer state. Forward-compatible
+// Scope: a headline metric set covering lease pool utilisation, packet
+// counters, and HA peer state -- not full statistic coverage. Forward-compatible
 // by design — an unknown statistic key is logged once and ignored
 // rather than failing the scrape, so a Kea release that adds new
 // statistics degrades to missing metrics instead of no metrics.
@@ -98,18 +98,19 @@ func (k *keaClient) call(ctx context.Context, command string) (*keaResponse, err
 // collector implements prometheus.Collector. Each /metrics scrape
 // triggers a single statistic-get-all + status-get round trip — we
 // emit ConstMetrics inline rather than maintaining a pre-registered
-// gauge cache, which avoids label-set drift surprises when Kea adds
-// new dimensions (the lesson from mweinelt's bug).
+// gauge cache, which avoids label-set drift surprises when Kea adds new
+// statistic dimensions between releases.
 type collector struct {
 	kea *keaClient
 
 	// Scrape health.
 	up           *prometheus.Desc
+	commandUp    *prometheus.Desc
 	scrapeErrors *prometheus.Desc
 
 	// dhcp4 lease metrics, subnet-scoped.
 	addressesAssigned *prometheus.Desc
-	addressesTotal    *prometheus.Desc
+	addressesCapacity *prometheus.Desc
 
 	// dhcp4 packet counters.
 	pkt4Received *prometheus.Desc
@@ -120,10 +121,11 @@ type collector struct {
 	haPartnerAge *prometheus.Desc
 	haCommBroken *prometheus.Desc
 
-	// Cumulative scrape failures. Atomic and per-collector, not a package
-	// global: Prometheus may call Collect concurrently for overlapping
-	// scrapes, and a plain counter increment there is a data race.
-	scrapeErrorCount atomic.Uint64
+	// Cumulative scrape failures per command. Atomic and per-collector, not
+	// package globals: Prometheus may call Collect concurrently for
+	// overlapping scrapes, and a plain counter increment there is a data race.
+	statErrorCount atomic.Uint64
+	haErrorCount   atomic.Uint64
 
 	// Track stat keys we don't have a mapping for. Logged exactly
 	// once each — keeps scrape noise low while still surfacing drift.
@@ -140,15 +142,18 @@ func newCollector(k *keaClient) *collector {
 		up: prometheus.NewDesc(
 			"kea_up", "1 if the last scrape of the Kea control socket succeeded, else 0.",
 			nil, nil),
+		commandUp: prometheus.NewDesc(
+			"kea_command_up", "1 if this Kea control command succeeded on the last scrape, else 0.",
+			[]string{"command"}, nil),
 		scrapeErrors: prometheus.NewDesc(
-			"kea_scrape_errors_total", "Cumulative count of scrape errors since exporter start.",
-			nil, nil),
+			"kea_scrape_errors_total", "Cumulative scrape errors since exporter start, by command.",
+			[]string{"command"}, nil),
 
 		addressesAssigned: prometheus.NewDesc(
 			ns+"_addresses_assigned", "Currently assigned IPv4 addresses in the pool.",
 			[]string{"subnet"}, nil),
-		addressesTotal: prometheus.NewDesc(
-			ns+"_addresses_total", "Pool size (total IPv4 addresses available in the subnet).",
+		addressesCapacity: prometheus.NewDesc(
+			ns+"_addresses_capacity", "Pool size: total IPv4 addresses available in the subnet.",
 			[]string{"subnet"}, nil),
 
 		pkt4Received: prometheus.NewDesc(
@@ -172,9 +177,10 @@ func newCollector(k *keaClient) *collector {
 
 func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.up
+	ch <- c.commandUp
 	ch <- c.scrapeErrors
 	ch <- c.addressesAssigned
-	ch <- c.addressesTotal
+	ch <- c.addressesCapacity
 	ch <- c.pkt4Received
 	ch <- c.pkt4Sent
 	ch <- c.haLocalState
@@ -196,16 +202,32 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		log.Printf("status-get failed: %v", haErr)
 	}
 
+	// kea_up is 0 if ANY command failed. Reporting 1 while half the metric
+	// set is silently missing is worse than reporting down: an operator
+	// alerting on kea_up == 0 would never see a half-broken scrape.
 	upValue := 1.0
-	if statErr != nil && haErr != nil {
+	if statErr != nil || haErr != nil {
 		upValue = 0
 	}
-	errCount := c.scrapeErrorCount.Load()
-	if statErr != nil || haErr != nil {
-		errCount = c.scrapeErrorCount.Add(1)
-	}
 	ch <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, upValue)
-	ch <- prometheus.MustNewConstMetric(c.scrapeErrors, prometheus.CounterValue, float64(errCount))
+
+	// Per-command health and error counters, so the two failure modes are
+	// distinguishable without reading logs.
+	c.emitCommandHealth(ch, "statistic-get-all", statErr, &c.statErrorCount)
+	c.emitCommandHealth(ch, "status-get", haErr, &c.haErrorCount)
+}
+
+func (c *collector) emitCommandHealth(
+	ch chan<- prometheus.Metric, command string, err error, counter *atomic.Uint64,
+) {
+	value := 1.0
+	count := counter.Load()
+	if err != nil {
+		value = 0
+		count = counter.Add(1)
+	}
+	ch <- prometheus.MustNewConstMetric(c.commandUp, prometheus.GaugeValue, value, command)
+	ch <- prometheus.MustNewConstMetric(c.scrapeErrors, prometheus.CounterValue, float64(count), command)
 }
 
 func (c *collector) collectStats(ctx context.Context, ch chan<- prometheus.Metric) error {
@@ -248,7 +270,7 @@ func mostRecentValue(raw json.RawMessage) (float64, bool) {
 
 func (c *collector) emitStat(ch chan<- prometheus.Metric, key string, value float64) {
 	// subnet-scoped stats, e.g. "subnet[1].assigned-addresses" and
-	// (Kea 3.x) "subnet[1].pool[0].assigned-addresses". For POC we
+	// (Kea 3.x) "subnet[1].pool[0].assigned-addresses". We
 	// roll up to the subnet level and ignore the per-pool variants —
 	// the per-subnet keys still exist alongside per-pool in 3.x.
 	if strings.HasPrefix(key, "subnet[") {
@@ -268,13 +290,22 @@ func (c *collector) emitStat(ch chan<- prometheus.Metric, key string, value floa
 		case "assigned-addresses":
 			ch <- prometheus.MustNewConstMetric(c.addressesAssigned, prometheus.GaugeValue, value, subnetID)
 		case "total-addresses":
-			ch <- prometheus.MustNewConstMetric(c.addressesTotal, prometheus.GaugeValue, value, subnetID)
+			ch <- prometheus.MustNewConstMetric(c.addressesCapacity, prometheus.GaugeValue, value, subnetID)
 		default:
 			c.noteUnhandled(key)
 		}
 		return
 	}
 	// Global packet counters: pkt4-<op>-{sent,received}.
+	//
+	// "pkt4-received" and "pkt4-sent" are Kea's GRAND TOTALS, not a packet
+	// type -- pkt4-sent equals pkt4-offer-sent + pkt4-ack-sent exactly.
+	// Emitting them beside the per-type series made
+	// sum(kea_dhcp4_packets_sent_total) return twice the real count. They are
+	// dropped: the per-type series already add up to them.
+	if key == "pkt4-received" || key == "pkt4-sent" {
+		return
+	}
 	if strings.HasPrefix(key, "pkt4-") {
 		switch {
 		case strings.HasSuffix(key, "-received"):
