@@ -1,6 +1,6 @@
 module github.com/dimidur/kea-prom-exporter
 
-go 1.25.0
+go 1.25.12
 
 require github.com/prometheus/client_golang v1.24.1
 
