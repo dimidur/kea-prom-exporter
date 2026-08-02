@@ -10,7 +10,7 @@
 #   docker buildx build --platform linux/amd64,linux/arm64 \
 #     -t dimidur/kea-prom-exporter:<tag> --push .
 
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src
