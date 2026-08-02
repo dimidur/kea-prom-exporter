@@ -1,0 +1,19 @@
+# Build artifacts
+/kea-prom-exporter
+*.exe
+
+# Test + profiling outputs
+*.test
+*.out
+*.prof
+coverage.txt
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local override env (basic-auth creds during testing)
+.env
+.env.local

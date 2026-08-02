@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+      - name: go mod tidy (verify dependencies are clean)
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test -race -v ./...
+      - name: build (host arch)
+        run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/kea-prom-exporter .
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: build multi-arch image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: kea-prom-exporter:ci
