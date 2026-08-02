@@ -1,6 +1,6 @@
 # kea-prom-exporter
 
-Prometheus exporter for **ISC Kea DHCP 3.1.x**, written in Go.
+Prometheus exporter for **ISC Kea DHCP 3.x**, written in Go.
 
 Surfaces lease-pool utilisation, packet counters, and — the reason this exists —
 **HA peer state**, so a failed-over or partner-down DHCP cluster is visible in
@@ -8,8 +8,13 @@ Prometheus and alertable like anything else.
 
 ## Status
 
-**Proof of concept.** It scrapes a small headline set today, and is built so
-that unknown statistics never break a scrape.
+**Early, but working.** Verified end-to-end against a live **Kea 3.2.0** peer in
+hot-standby HA: every metric below returns real data. The scope is a headline
+metric set rather than full statistic coverage — see the roadmap.
+
+Unit tests run against **response fixtures captured from that same live Kea**,
+so the parser is pinned to the shape Kea actually emits, including the per-pool
+statistic dimension introduced in 3.x.
 
 ## Metrics
 
@@ -112,10 +117,10 @@ Grouped by milestone rather than date.
 
 ### v0.1 — green CI, scrapes a live Kea peer
 
-- [ ] Commit `go.sum` so CI's `git diff --exit-code go.mod go.sum` step succeeds.
-- [ ] Smoke-test against a live Kea 3.1.8 peer and confirm `/metrics` returns
-  every declared metric.
-- [ ] Unit tests over captured `statistic-get-all` + `status-get` fixtures, so
+- [x] Commit `go.sum` so CI's `git diff --exit-code go.mod go.sum` step succeeds.
+- [x] Verify against a live Kea peer — confirmed on 3.2.0 in hot-standby HA;
+  every declared metric returns real data.
+- [x] Unit tests over captured `statistic-get-all` + `status-get` fixtures, so
   regressions surface in CI without a live Kea.
 - [ ] Tagged `v0.1.0` with a multi-arch image published from CI.
 
