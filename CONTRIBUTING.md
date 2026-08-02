@@ -7,15 +7,17 @@ reports into Prometheus metrics, with HA state as the part that matters most.
 
 Include:
 
-- your **Kea version** (`version-get`, or the exporter logs it at startup)
+- your **Kea version** (`kea-dhcp4 -V`, or `version-get` against the control socket)
 - whether the **HA hook** is loaded — HA metrics are skipped entirely when it
   isn't, which looks identical to "the metrics are missing"
 - the exporter's log output; unmapped statistics are logged once each and are
   usually the explanation for a metric you expected but didn't get
 
-If a scrape fails, `kea_up 0` plus `kea_scrape_errors_total` climbing is the
-signature. If the exporter is up but a *specific* metric is absent, that's the
-unmapped-statistic path instead, and the log will say so.
+`kea_up 0` means at least one control command failed;
+`kea_command_up{command="..."}` says which, and
+`kea_scrape_errors_total{command="..."}` counts them. If the exporter is up but
+a *specific* metric is absent, that's the unmapped-statistic path instead, and
+the log will say so.
 
 ## Development
 

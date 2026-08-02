@@ -21,27 +21,27 @@ statistic dimension introduced in 3.x.
 | metric | labels | meaning |
 | --- | --- | --- |
 | `kea_dhcp4_addresses_assigned` | `subnet` | leases currently issued |
-| `kea_dhcp4_addresses_total` | `subnet` | pool size |
+| `kea_dhcp4_addresses_capacity` | `subnet` | pool size |
 | `kea_dhcp4_packets_received_total` | `type` | DHCPv4 packets in, by op |
 | `kea_dhcp4_packets_sent_total` | `type` | DHCPv4 packets out, by op |
 | `kea_dhcp4_ha_local_state_info` | `state`, `role` | HA state of this peer |
 | `kea_dhcp4_ha_partner_last_contact_seconds` | — | seconds since last partner heartbeat |
 | `kea_dhcp4_ha_communication_interrupted` | — | 1 when HA communication is broken |
-| `kea_up` | — | 1 when the last scrape reached Kea |
-| `kea_scrape_errors_total` | — | cumulative scrape failures |
+| `kea_up` | — | 1 only when **every** control command succeeded |
+| `kea_command_up` | `command` | 1 when that specific command succeeded |
+| `kea_scrape_errors_total` | `command` | cumulative failures, per command |
 
 On each `/metrics` request the exporter POSTs `statistic-get-all` and
 `status-get` to the `kea-dhcp4` HTTP control socket and translates the replies.
 
 **Unknown statistic keys are logged once and ignored, never fatal.** A future
 Kea release that adds statistics degrades to *missing* metrics rather than *no*
-metrics. Extending coverage is a matter of adding map entries in
+metrics. Extending coverage means adding a case to `emitStat` in
 [`main.go`](main.go).
 
 ## Build
 
 ```bash
-go mod tidy   # first time after cloning, to materialise go.sum
 go build -o kea-prom-exporter .
 ```
 
@@ -151,8 +151,8 @@ Grouped by milestone rather than date.
   to a Stork server. If you want Stork, run Stork.
 - **isc-dhcp support.** Kea 3.x only; the legacy `isc-dhcpd` is a different
   daemon with a different management surface.
-- **General-purpose Kea CLI.** Read-only: `statistic-get-all`, `status-get`,
-  `version-get`. No `config-set`, no `lease-add`.
+- **General-purpose Kea CLI.** Read-only: it issues `statistic-get-all` and
+  `status-get`, nothing else. No `config-set`, no `lease-add`.
 
 ## Alternatives
 

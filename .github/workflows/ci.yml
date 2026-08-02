@@ -76,7 +76,10 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
-    needs: test
+    # Both gates: building and scanning an image whose dependencies just
+    # failed an audit wastes minutes and shows a green docker job beside a
+    # red security one.
+    needs: [test, security]
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3

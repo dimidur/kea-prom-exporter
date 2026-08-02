@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -54,36 +55,146 @@ func TestCollectAgainstRealKeaOutput(t *testing.T) {
 	defer srv.Close()
 
 	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+
+	// Exact values, not "the family is non-empty". The previous version of
+	// this test asserted only presence, which let a mislabelled aggregate
+	// counter through (pkt4-sent emitted as type="sent" beside the real
+	// types, doubling any sum()).
+	expected := `
+# HELP kea_dhcp4_addresses_assigned Currently assigned IPv4 addresses in the pool.
+# TYPE kea_dhcp4_addresses_assigned gauge
+kea_dhcp4_addresses_assigned{subnet="1"} 23
+# HELP kea_dhcp4_addresses_capacity Pool size: total IPv4 addresses available in the subnet.
+# TYPE kea_dhcp4_addresses_capacity gauge
+kea_dhcp4_addresses_capacity{subnet="1"} 121
+`
+	if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
+		"kea_dhcp4_addresses_assigned", "kea_dhcp4_addresses_capacity"); err != nil {
+		t.Errorf("subnet metrics: %v", err)
+	}
+
+	haExpected := `
+# HELP kea_dhcp4_ha_communication_interrupted 1 if HA communication with the partner is interrupted, else 0.
+# TYPE kea_dhcp4_ha_communication_interrupted gauge
+kea_dhcp4_ha_communication_interrupted 0
+# HELP kea_dhcp4_ha_local_state_info HA state of this peer (info-metric; value always 1; state in label).
+# TYPE kea_dhcp4_ha_local_state_info gauge
+kea_dhcp4_ha_local_state_info{role="primary",state="hot-standby"} 1
+`
+	if err := testutil.CollectAndCompare(c, strings.NewReader(haExpected),
+		"kea_dhcp4_ha_local_state_info", "kea_dhcp4_ha_communication_interrupted"); err != nil {
+		t.Errorf("HA metrics: %v", err)
+	}
+}
+
+func TestPacketTypesDoNotIncludeTheAggregate(t *testing.T) {
+	// Kea reports pkt4-sent as the grand total alongside pkt4-offer-sent and
+	// pkt4-ack-sent. Emitting it as type="sent" makes sum() return double.
+	raw := fixture(t, "statistic-get-all.json")
+	var resp []struct {
+		Arguments map[string]json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	aggregate, ok := mostRecentValue(resp[0].Arguments["pkt4-sent"])
+	if !ok {
+		t.Fatal("fixture has no pkt4-sent aggregate to guard against")
+	}
+
+	srv := keaStub(t, raw, fixture(t, "status-get.json"))
+	defer srv.Close()
+	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
 	reg := prometheus.NewPedanticRegistry()
 	if err := reg.Register(c); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-
 	mfs, err := reg.Gather()
 	if err != nil {
 		t.Fatalf("gather: %v", err)
 	}
 
-	got := map[string]int{}
+	var sum float64
 	for _, mf := range mfs {
-		got[mf.GetName()] = len(mf.GetMetric())
+		if mf.GetName() != "kea_dhcp4_packets_sent_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "type" && (l.GetValue() == "sent" || l.GetValue() == "received") {
+					t.Errorf("aggregate exported as a packet type: type=%q", l.GetValue())
+				}
+			}
+			sum += m.GetCounter().GetValue()
+		}
+	}
+	if sum != aggregate {
+		t.Errorf("per-type packets sum to %v, Kea's aggregate is %v; they must agree", sum, aggregate)
+	}
+}
+
+func TestMetricNamesSatisfyPromlint(t *testing.T) {
+	// Catches convention breaches automatically -- e.g. a gauge carrying the
+	// _total suffix, which is reserved for counters.
+	srv := keaStub(t, fixture(t, "statistic-get-all.json"), fixture(t, "status-get.json"))
+	defer srv.Close()
+	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	problems, err := testutil.CollectAndLint(c)
+	if err != nil {
+		t.Fatalf("lint: %v", err)
+	}
+	for _, p := range problems {
+		t.Errorf("promlint: %s: %s", p.Metric, p.Text)
+	}
+}
+
+func TestPartialFailureIsVisible(t *testing.T) {
+	// statistic-get-all fails, status-get succeeds. kea_up must be 0 -- the
+	// alternative is reporting healthy while every lease metric is missing --
+	// and the per-command series must say which half broke.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "statistic-get-all") {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(fixture(t, "status-get.json"))
+	}))
+	defer srv.Close()
+
+	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	reg := prometheus.NewPedanticRegistry()
+	if err := reg.Register(c); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
 	}
 
-	// Every metric the README advertises must be produced from real output.
-	for _, name := range []string{
-		"kea_up",
-		"kea_scrape_errors_total",
-		"kea_dhcp4_addresses_assigned",
-		"kea_dhcp4_addresses_total",
-		"kea_dhcp4_packets_received_total",
-		"kea_dhcp4_packets_sent_total",
-		"kea_dhcp4_ha_local_state_info",
-		"kea_dhcp4_ha_partner_last_contact_seconds",
-		"kea_dhcp4_ha_communication_interrupted",
-	} {
-		if got[name] == 0 {
-			t.Errorf("metric %s absent or empty; got families: %v", name, got)
+	got := map[string]float64{}
+	for _, mf := range mfs {
+		for _, m := range mf.GetMetric() {
+			name := mf.GetName()
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "command" {
+					name += "{" + l.GetValue() + "}"
+				}
+			}
+			if g := m.GetGauge(); g != nil {
+				got[name] = g.GetValue()
+			}
 		}
+	}
+	if got["kea_up"] != 0 {
+		t.Errorf("kea_up = %v on partial failure, want 0", got["kea_up"])
+	}
+	if got["kea_command_up{statistic-get-all}"] != 0 {
+		t.Errorf("kea_command_up{statistic-get-all} = %v, want 0", got["kea_command_up{statistic-get-all}"])
+	}
+	if got["kea_command_up{status-get}"] != 1 {
+		t.Errorf("kea_command_up{status-get} = %v, want 1", got["kea_command_up{status-get}"])
 	}
 }
 
@@ -144,7 +255,7 @@ func TestPerPoolStatisticsAreNotDoubleCounted(t *testing.T) {
 		}
 	}
 	if perPool == 0 {
-		t.Skip("fixture has no per-pool statistics; nothing to guard against")
+		t.Fatal("fixture lost its per-pool statistics; this guard is now vacuous")
 	}
 
 	srv := keaStub(t, raw, fixture(t, "status-get.json"))
@@ -199,8 +310,8 @@ func TestConcurrentScrapesAreRaceFree(t *testing.T) {
 	}
 	wg.Wait()
 
-	if got := c.scrapeErrorCount.Load(); got != scrapes {
-		t.Errorf("scrapeErrorCount = %d after %d failing scrapes, want %d", got, scrapes, scrapes)
+	if got := c.statErrorCount.Load(); got != scrapes {
+		t.Errorf("statErrorCount = %d after %d failing scrapes, want %d", got, scrapes, scrapes)
 	}
 }
 
@@ -212,7 +323,7 @@ func TestMostRecentValue(t *testing.T) {
 		ok   bool
 	}{
 		{"kea sample shape", `[[42, "2026-08-02 20:04:57.000000"]]`, 42, true},
-		{"newest sample wins", `[[7, "2026-08-02 20:04:57"], [3, "2026-08-02 19:00:00"]]`, 7, true},
+		{"first sample is taken (Kea reports newest first)", `[[7, "2026-08-02 20:04:57"], [3, "2026-08-02 19:00:00"]]`, 7, true},
 		{"float value", `[[1.5, "2026-08-02 20:04:57"]]`, 1.5, true},
 		{"empty list", `[]`, 0, false},
 		{"not a list", `{"nope": 1}`, 0, false},
