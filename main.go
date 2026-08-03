@@ -12,11 +12,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -57,30 +59,74 @@ type keaResponse struct {
 }
 
 type keaClient struct {
-	url    string
-	user   string
-	pass   string
-	client *http.Client
+	url      string
+	user     string
+	password string
+	service  string
+	timeout  time.Duration
+	client   *http.Client
 }
 
+// keaCommand is marshalled rather than formatted into a string. The service
+// name is operator-supplied, and hand-built JSON would let a stray quote
+// change the command actually sent.
+type keaCommand struct {
+	Command string   `json:"command"`
+	Service []string `json:"service"`
+}
+
+// errBodyLimit caps how much of an error response is quoted back. Kea
+// explains 400/401/403 in the body, and a bare "HTTP 401" is the least
+// useful possible message for the most common misconfiguration.
+const errBodyLimit = 512
+
 func (k *keaClient) call(ctx context.Context, command string) (*keaResponse, error) {
-	body := fmt.Sprintf(`{"command":"%s","service":["%s"]}`, command, *scrapeService)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, k.url, strings.NewReader(body))
+	service := k.service
+	if service == "" {
+		service = "dhcp4"
+	}
+	body, err := json.Marshal(keaCommand{Command: command, Service: []string{service}})
+	if err != nil {
+		return nil, fmt.Errorf("encode command %q: %w", command, err)
+	}
+
+	// Per-request deadline. One deadline shared across the whole scrape let a
+	// slow first command starve the second, whose failure was then reported
+	// as if the second command were at fault.
+	timeout := k.timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, k.url, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if k.user != "" {
-		req.SetBasicAuth(k.user, k.pass)
+		req.SetBasicAuth(k.user, k.password)
 	}
 	resp, err := k.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("kea call %q: %w", command, err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	defer func() {
+		// Drain before closing so the connection can be reused: the JSON
+		// decoder stops after the first value and may leave bytes behind.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, errBodyLimit))
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyLimit))
+		if msg := strings.TrimSpace(string(detail)); msg != "" {
+			return nil, fmt.Errorf("kea call %q: HTTP %d: %s", command, resp.StatusCode, msg)
+		}
 		return nil, fmt.Errorf("kea call %q: HTTP %d", command, resp.StatusCode)
 	}
+
 	var arr []keaResponse
 	if err := json.NewDecoder(resp.Body).Decode(&arr); err != nil {
 		return nil, fmt.Errorf("decode response for %q: %w", command, err)
@@ -117,9 +163,11 @@ type collector struct {
 	pkt4Sent     *prometheus.Desc
 
 	// HA state.
-	haLocalState *prometheus.Desc
-	haPartnerAge *prometheus.Desc
-	haCommBroken *prometheus.Desc
+	haEnabled        *prometheus.Desc
+	haLocalState     *prometheus.Desc
+	haPartnerAge     *prometheus.Desc
+	haPartnerInTouch *prometheus.Desc
+	haCommBroken     *prometheus.Desc
 
 	// Cumulative scrape failures per command. Atomic and per-collector, not
 	// package globals: Prometheus may call Collect concurrently for
@@ -163,11 +211,18 @@ func newCollector(k *keaClient) *collector {
 			ns+"_packets_sent_total", "Total DHCPv4 packets sent by type.",
 			[]string{"type"}, nil),
 
+		haEnabled: prometheus.NewDesc(
+			ns+"_ha_enabled", "1 when Kea reports an HA relationship, 0 when the HA hook is not loaded.",
+			nil, nil),
 		haLocalState: prometheus.NewDesc(
 			ns+"_ha_local_state_info", "HA state of this peer (info-metric; value always 1; state in label).",
-			[]string{"state", "role"}, nil),
+			[]string{"state", "role", "mode"}, nil),
 		haPartnerAge: prometheus.NewDesc(
-			ns+"_ha_partner_last_contact_seconds", "Seconds since the last successful heartbeat from the HA partner.",
+			ns+"_ha_partner_last_contact_seconds",
+			"Seconds since the last successful heartbeat from the HA partner. Absent until the partner has been contacted at least once.",
+			nil, nil),
+		haPartnerInTouch: prometheus.NewDesc(
+			ns+"_ha_partner_in_touch", "1 once this peer has been in contact with its HA partner, else 0.",
 			nil, nil),
 		haCommBroken: prometheus.NewDesc(
 			ns+"_ha_communication_interrupted", "1 if HA communication with the partner is interrupted, else 0.",
@@ -183,14 +238,17 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.addressesCapacity
 	ch <- c.pkt4Received
 	ch <- c.pkt4Sent
+	ch <- c.haEnabled
 	ch <- c.haLocalState
 	ch <- c.haPartnerAge
+	ch <- c.haPartnerInTouch
 	ch <- c.haCommBroken
 }
 
 func (c *collector) Collect(ch chan<- prometheus.Metric) {
-	ctx, cancel := context.WithTimeout(context.Background(), *httpTimeout)
-	defer cancel()
+	// No shared deadline here: keaClient.call bounds each request on its own,
+	// so a slow first command cannot starve the second.
+	ctx := context.Background()
 
 	statErr := c.collectStats(ctx, ch)
 	haErr := c.collectHA(ctx, ch)
@@ -244,6 +302,11 @@ func (c *collector) collectStats(ctx context.Context, ch chan<- prometheus.Metri
 	for key, raw := range stats {
 		val, ok := mostRecentValue(raw)
 		if !ok {
+			// Kea also reports string- and duration-typed statistics. Route
+			// them through the same once-only log as unmapped keys: dropping
+			// them silently left an absent metric with nothing anywhere
+			// explaining why.
+			c.noteUnhandled(key)
 			continue
 		}
 		c.emitStat(ch, key, val)
@@ -251,14 +314,20 @@ func (c *collector) collectStats(ctx context.Context, ch chan<- prometheus.Metri
 	return nil
 }
 
-// mostRecentValue extracts the first element of the most recent sample
-// from Kea's `[[value, ts], ...]` shape.
+// mostRecentValue extracts the value of the newest sample from Kea's
+// `[[value, ts], ...]` shape. Kea reports samples newest-first, so the newest
+// is index 0.
 func mostRecentValue(raw json.RawMessage) (float64, bool) {
 	var samples [][]json.RawMessage
 	if err := json.Unmarshal(raw, &samples); err != nil {
 		return 0, false
 	}
 	if len(samples) == 0 || len(samples[0]) == 0 {
+		return 0, false
+	}
+	// json.Unmarshal of `null` into a float64 succeeds and leaves 0, so a
+	// null sample would silently report zero rather than being skipped.
+	if string(bytes.TrimSpace(samples[0][0])) == "null" {
 		return 0, false
 	}
 	var v float64
@@ -345,6 +414,7 @@ type haStatus struct {
 			Remote struct {
 				Age                    float64 `json:"age"`
 				CommunicationInterrupt bool    `json:"communication-interrupted"`
+				InTouch                bool    `json:"in-touch"`
 			} `json:"remote"`
 		} `json:"ha-servers"`
 	} `json:"high-availability"`
@@ -359,16 +429,36 @@ func (c *collector) collectHA(ctx context.Context, ch chan<- prometheus.Metric) 
 	if err := json.Unmarshal(resp.Arguments, &s); err != nil {
 		return fmt.Errorf("decode status-get arguments: %w", err)
 	}
+	// Absent HA metrics could mean the hook is not loaded, or that status-get
+	// failed. This makes the first case explicit so the two are
+	// distinguishable without reading logs.
 	if len(s.HighAvailability) == 0 {
-		// HA hook not loaded — quietly skip these metrics.
+		ch <- prometheus.MustNewConstMetric(c.haEnabled, prometheus.GaugeValue, 0)
 		return nil
+	}
+	ch <- prometheus.MustNewConstMetric(c.haEnabled, prometheus.GaugeValue, 1)
+
+	if len(s.HighAvailability) > 1 {
+		log.Printf("status-get reported %d HA relationships; only the first is exported",
+			len(s.HighAvailability))
 	}
 	ha := s.HighAvailability[0]
 	ch <- prometheus.MustNewConstMetric(
 		c.haLocalState, prometheus.GaugeValue, 1,
-		ha.HAServers.Local.State, ha.HAServers.Local.Role)
-	ch <- prometheus.MustNewConstMetric(
-		c.haPartnerAge, prometheus.GaugeValue, ha.HAServers.Remote.Age)
+		ha.HAServers.Local.State, ha.HAServers.Local.Role, ha.HAMode)
+
+	// Kea reports age 0 when it has never been in touch with the partner.
+	// Exporting that unconditionally reads on a dashboard as "contacted 0
+	// seconds ago" — the exact inverse of the truth — so the gauge is only
+	// emitted when it means something, alongside an explicit in-touch signal.
+	inTouch := 0.0
+	if ha.HAServers.Remote.InTouch {
+		inTouch = 1
+		ch <- prometheus.MustNewConstMetric(
+			c.haPartnerAge, prometheus.GaugeValue, ha.HAServers.Remote.Age)
+	}
+	ch <- prometheus.MustNewConstMetric(c.haPartnerInTouch, prometheus.GaugeValue, inTouch)
+
 	commVal := 0.0
 	if ha.HAServers.Remote.CommunicationInterrupt {
 		commVal = 1
@@ -394,20 +484,30 @@ func loadPassword(file, inline string) (string, error) {
 func main() {
 	flag.Parse()
 
-	pass, err := loadPassword(*keaPassFile, *keaPass)
+	secret, err := loadPassword(*keaPassFile, *keaPass)
 	if err != nil {
 		log.Fatal(err)
 	}
-	if *keaUser != "" && pass == "" {
+	if *keaUser != "" && secret == "" {
 		log.Fatal("kea-user set but no password provided (use --kea-password-file or --kea-password)")
+	}
+	// Only dhcp4 is mapped. Without this, --kea-service=dhcp6 returns a valid
+	// response whose every key is unmapped: an empty metric set under a
+	// kea_dhcp4_ namespace, reported as kea_up 1.
+	if *scrapeService != "dhcp4" {
+		log.Fatalf("--kea-service=%q is not supported; only dhcp4 is implemented", *scrapeService)
 	}
 
 	k := &keaClient{
-		url:  *keaURL,
-		user: *keaUser,
-		pass: pass,
+		url:      *keaURL,
+		user:     *keaUser,
+		password: secret,
+		service:  *scrapeService,
+		timeout:  *httpTimeout,
 		client: &http.Client{
-			Timeout: *httpTimeout,
+			// Generous relative to the per-request context deadline, which is
+			// what actually bounds a call; this is a backstop.
+			Timeout: *httpTimeout * 2,
 		},
 	}
 

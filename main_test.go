@@ -8,7 +8,9 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -34,8 +36,11 @@ func fixture(t *testing.T, name string) []byte {
 func keaStub(t *testing.T, statistics, status []byte) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body := make([]byte, r.ContentLength)
-		if _, err := r.Body.Read(body); err != nil && err.Error() != "EOF" {
+		// io.ReadAll, not a single Read into a ContentLength-sized buffer:
+		// Read is allowed to return short, which silently dispatched the
+		// request to the "unexpected command" branch.
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
 			t.Errorf("read request body: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -77,12 +82,23 @@ kea_dhcp4_addresses_capacity{subnet="1"} 121
 # HELP kea_dhcp4_ha_communication_interrupted 1 if HA communication with the partner is interrupted, else 0.
 # TYPE kea_dhcp4_ha_communication_interrupted gauge
 kea_dhcp4_ha_communication_interrupted 0
+# HELP kea_dhcp4_ha_enabled 1 when Kea reports an HA relationship, 0 when the HA hook is not loaded.
+# TYPE kea_dhcp4_ha_enabled gauge
+kea_dhcp4_ha_enabled 1
 # HELP kea_dhcp4_ha_local_state_info HA state of this peer (info-metric; value always 1; state in label).
 # TYPE kea_dhcp4_ha_local_state_info gauge
-kea_dhcp4_ha_local_state_info{role="primary",state="hot-standby"} 1
+kea_dhcp4_ha_local_state_info{mode="hot-standby",role="primary",state="hot-standby"} 1
+# HELP kea_dhcp4_ha_partner_in_touch 1 once this peer has been in contact with its HA partner, else 0.
+# TYPE kea_dhcp4_ha_partner_in_touch gauge
+kea_dhcp4_ha_partner_in_touch 1
+# HELP kea_dhcp4_ha_partner_last_contact_seconds Seconds since the last successful heartbeat from the HA partner. Absent until the partner has been contacted at least once.
+# TYPE kea_dhcp4_ha_partner_last_contact_seconds gauge
+kea_dhcp4_ha_partner_last_contact_seconds 2
 `
 	if err := testutil.CollectAndCompare(c, strings.NewReader(haExpected),
-		"kea_dhcp4_ha_local_state_info", "kea_dhcp4_ha_communication_interrupted"); err != nil {
+		"kea_dhcp4_ha_local_state_info", "kea_dhcp4_ha_communication_interrupted",
+		"kea_dhcp4_ha_enabled", "kea_dhcp4_ha_partner_in_touch",
+		"kea_dhcp4_ha_partner_last_contact_seconds"); err != nil {
 		t.Errorf("HA metrics: %v", err)
 	}
 }
@@ -335,5 +351,275 @@ func TestMostRecentValue(t *testing.T) {
 				t.Errorf("mostRecentValue(%s) = (%v, %v), want (%v, %v)", tc.in, got, ok, tc.want, tc.ok)
 			}
 		})
+	}
+}
+
+func TestNullSampleIsSkippedRatherThanReportedAsZero(t *testing.T) {
+	// Kea emits `[[null, "<ts>"]]` for a statistic it has no value for yet.
+	// json.Unmarshal of null into a float64 succeeds and leaves 0, so without
+	// an explicit guard the exporter reports a confident zero.
+	if got, ok := mostRecentValue(json.RawMessage(`[[null, "2026-08-02 20:04:57"]]`)); ok {
+		t.Errorf("mostRecentValue(null sample) = (%v, true), want ok=false", got)
+	}
+}
+
+func TestCommandIsValidJSONWhateverTheServiceName(t *testing.T) {
+	// The service name reaches the wire from a flag. Built with fmt.Sprintf it
+	// was possible to inject a quote and change the command actually sent.
+	var got keaCommand
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Errorf("request body is not valid JSON: %v (%s)", err, body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":0,"arguments":{}}]`))
+	}))
+	defer srv.Close()
+
+	k := &keaClient{url: srv.URL, service: `dhcp4","injected":"`, client: srv.Client()}
+	if _, err := k.call(t.Context(), "status-get"); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if got.Command != "status-get" {
+		t.Errorf("command = %q, want status-get", got.Command)
+	}
+	if len(got.Service) != 1 || got.Service[0] != `dhcp4","injected":"` {
+		t.Errorf("service = %q, want the literal flag value carried as one element", got.Service)
+	}
+}
+
+func TestHTTPErrorBodyIsReportedAndBounded(t *testing.T) {
+	// Kea explains 401/403 in the body. "HTTP 401" alone is the least useful
+	// possible message for the most common misconfiguration -- but an
+	// unbounded body would let a proxy's HTML error page into the logs.
+	long := strings.Repeat("x", errBodyLimit*4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, long, http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	k := &keaClient{url: srv.URL, client: srv.Client()}
+	_, err := k.call(t.Context(), "status-get")
+	if err == nil {
+		t.Fatal("call succeeded against a 401")
+	}
+	if !strings.Contains(err.Error(), "HTTP 401") {
+		t.Errorf("error does not name the status: %v", err)
+	}
+	if !strings.Contains(err.Error(), "xxxx") {
+		t.Errorf("error does not quote the response body: %v", err)
+	}
+	if n := strings.Count(err.Error(), "x"); n > errBodyLimit {
+		t.Errorf("error quotes %d body bytes, want at most %d", n, errBodyLimit)
+	}
+}
+
+func TestNon200SuccessStatusIsAccepted(t *testing.T) {
+	// Kea itself answers 200, but a reverse proxy in front of the control
+	// socket may legitimately answer 204/206 or similar. Rejecting anything
+	// but exactly 200 turned a working deployment into kea_up 0.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`[{"result":0,"arguments":{}}]`))
+	}))
+	defer srv.Close()
+
+	k := &keaClient{url: srv.URL, client: srv.Client()}
+	if _, err := k.call(t.Context(), "status-get"); err != nil {
+		t.Errorf("call on HTTP 202: %v", err)
+	}
+}
+
+func TestKeaResultErrorIsSurfaced(t *testing.T) {
+	// A non-zero `result` is HTTP 200 with a failure inside. Kea returns 1 for
+	// an error and 2 for an unsupported command; both must fail the scrape.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":2,"text":"'status-get' command not supported"}]`))
+	}))
+	defer srv.Close()
+
+	k := &keaClient{url: srv.URL, client: srv.Client()}
+	_, err := k.call(t.Context(), "status-get")
+	if err == nil {
+		t.Fatal("call succeeded against result=2")
+	}
+	if !strings.Contains(err.Error(), "result=2") || !strings.Contains(err.Error(), "not supported") {
+		t.Errorf("error drops Kea's own explanation: %v", err)
+	}
+}
+
+func TestHAHookAbsentIsDistinguishableFromScrapeFailure(t *testing.T) {
+	// No `high-availability` key means the hook is not loaded. That must be
+	// an explicit 0, not silence -- otherwise it is indistinguishable from
+	// status-get having failed.
+	status := []byte(`[{"result":0,"arguments":{"pid":1,"uptime":10}}]`)
+	srv := keaStub(t, fixture(t, "statistic-get-all.json"), status)
+	defer srv.Close()
+
+	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	expected := `
+# HELP kea_dhcp4_ha_enabled 1 when Kea reports an HA relationship, 0 when the HA hook is not loaded.
+# TYPE kea_dhcp4_ha_enabled gauge
+kea_dhcp4_ha_enabled 0
+`
+	if err := testutil.CollectAndCompare(c, strings.NewReader(expected), "kea_dhcp4_ha_enabled"); err != nil {
+		t.Errorf("ha_enabled: %v", err)
+	}
+	// And the scrape itself is healthy: an absent hook is not an error.
+	if got := testutil.ToFloat64(upOnly{c}); got != 1 {
+		t.Errorf("kea_up = %v with the HA hook absent, want 1", got)
+	}
+}
+
+func TestPartnerAgeIsAbsentUntilInTouch(t *testing.T) {
+	// Kea reports age 0 when it has never reached the partner. Exported
+	// unconditionally that reads as "contacted 0 seconds ago" -- the inverse
+	// of the truth -- so the gauge is withheld until in-touch is true.
+	status := []byte(`[{"result":0,"arguments":{"high-availability":[{"ha-mode":"hot-standby",
+	  "ha-servers":{"local":{"role":"primary","state":"waiting"},
+	  "remote":{"age":0,"communication-interrupted":true,"in-touch":false}}}]}}]`)
+	srv := keaStub(t, fixture(t, "statistic-get-all.json"), status)
+	defer srv.Close()
+
+	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	expected := `
+# HELP kea_dhcp4_ha_partner_in_touch 1 once this peer has been in contact with its HA partner, else 0.
+# TYPE kea_dhcp4_ha_partner_in_touch gauge
+kea_dhcp4_ha_partner_in_touch 0
+`
+	if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
+		"kea_dhcp4_ha_partner_in_touch", "kea_dhcp4_ha_partner_last_contact_seconds"); err != nil {
+		t.Errorf("partner contact metrics: %v", err)
+	}
+}
+
+func TestBasicAuthIsSentOnlyWhenAUserIsConfigured(t *testing.T) {
+	cases := []struct {
+		name     string
+		user     string
+		password string
+		wantAuth bool
+	}{
+		{"credentials configured", "kea", "s3cret", true},
+		{"no user means no auth header", "", "s3cret", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				user, password, ok := r.BasicAuth()
+				if ok != tc.wantAuth {
+					t.Errorf("basic auth present = %v, want %v", ok, tc.wantAuth)
+				}
+				if ok && (user != tc.user || password != tc.password) {
+					t.Errorf("credentials = %q/%q, want %q/%q", user, password, tc.user, tc.password)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`[{"result":0,"arguments":{}}]`))
+			}))
+			defer srv.Close()
+
+			k := &keaClient{url: srv.URL, user: tc.user, password: tc.password, client: srv.Client()}
+			if _, err := k.call(t.Context(), "status-get"); err != nil {
+				t.Fatalf("call: %v", err)
+			}
+		})
+	}
+}
+
+func TestPerRequestTimeoutBoundsEachCallSeparately(t *testing.T) {
+	// One deadline shared across the scrape let a slow first command consume
+	// the budget and made the second fail as if it were at fault. Each call
+	// now carries its own.
+	// The first handler must outlive the first call's deadline, then be
+	// released explicitly. Waiting on r.Context() instead would deadlock:
+	// net/http only starts watching for a client disconnect once the request
+	// body has been consumed, and this handler never reads it.
+	release := make(chan struct{})
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":0,"arguments":{}}]`))
+	}))
+	// Registered after Close so it runs before it: the handler has to be let
+	// go before Close will stop waiting on it.
+	defer srv.Close()
+	defer close(release)
+
+	k := &keaClient{url: srv.URL, timeout: 50 * time.Millisecond, client: srv.Client()}
+	ctx := t.Context()
+	if _, err := k.call(ctx, "statistic-get-all"); err == nil {
+		t.Fatal("first call succeeded, expected it to time out")
+	}
+	if _, err := k.call(ctx, "status-get"); err != nil {
+		t.Errorf("second call inherited the first call's exhausted deadline: %v", err)
+	}
+}
+
+func TestLoadPassword(t *testing.T) {
+	dir := t.TempDir()
+	file := dir + "/secret"
+	// Trailing newline is what an editor or `echo` leaves behind; sending it
+	// to Kea is an authentication failure with no useful diagnostic.
+	if err := os.WriteFile(file, []byte("from-file\n"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		file    string
+		inline  string
+		want    string
+		wantErr bool
+	}{
+		{"file wins over inline", file, "inline", "from-file", false},
+		{"trailing newline stripped", file, "", "from-file", false},
+		{"inline when no file", "", "inline", "inline", false},
+		{"neither is not an error", "", "", "", false},
+		{"missing file is an error", dir + "/absent", "inline", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := loadPassword(tc.file, tc.inline)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("loadPassword(%q, %q) error = %v, wantErr %v", tc.file, tc.inline, err, tc.wantErr)
+			}
+			if got != tc.want {
+				t.Errorf("loadPassword(%q, %q) = %q, want %q", tc.file, tc.inline, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUnparseableStatisticIsLoggedOnceNotDroppedSilently(t *testing.T) {
+	// Kea also reports string- and duration-typed statistics. They cannot
+	// become a float, but an absent metric with nothing explaining why is a
+	// worse outcome than a one-line log.
+	stats := []byte(`[{"result":0,"arguments":{
+	  "pkt4-ack-sent":[[1,"2026-08-02 20:04:57"]],
+	  "some-string-stat":[["not-a-number","2026-08-02 20:04:57"]]}}]`)
+	srv := keaStub(t, stats, fixture(t, "status-get.json"))
+	defer srv.Close()
+
+	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	ch := make(chan prometheus.Metric, 64)
+	c.Collect(ch)
+	close(ch)
+	for range ch { //nolint:revive // draining; the assertion is on c.unhandled
+	}
+
+	c.unhandledMu.Lock()
+	defer c.unhandledMu.Unlock()
+	if _, ok := c.unhandled["some-string-stat"]; !ok {
+		t.Errorf("unparseable statistic not recorded as unhandled: %v", c.unhandled)
 	}
 }
