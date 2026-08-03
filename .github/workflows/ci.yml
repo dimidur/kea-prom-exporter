@@ -18,12 +18,17 @@ on:
 permissions:
   contents: read
 
+# Actions are pinned to commit SHAs, not tags: `@v4` is mutable and its owner
+# can repoint it at any commit, so a tag is a version constraint rather than a
+# pin. The trailing comment records the release each SHA corresponds to, which
+# is also what Dependabot reads when it bumps them.
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           # Read the version from go.mod so a toolchain bump happens in one
           # place. Pinning it here separately is how CI ended up unable to
@@ -52,8 +57,14 @@ jobs:
       - name: vet
         run: go vet ./...
 
+      # Pinned rather than @latest: an unpinned tool turns main red without a
+      # code change, and re-running an old commit's CI no longer reproduces
+      # what that commit passed. Dependabot does not track `go run pkg@ver` in
+      # a workflow, so these are bumped by hand -- a `go.mod` tool directive
+      # would automate it at the cost of ~50 indirect deps in a single-file
+      # binary's module graph.
       - name: staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
 
       # -race matters specifically here: Prometheus calls Collect
       # concurrently when scrapes overlap, which is exactly where a race in
@@ -67,15 +78,15 @@ jobs:
   security:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
           cache: true
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
       - name: gosec
-        run: go run github.com/securego/gosec/v2/cmd/gosec@latest -quiet ./...
+        run: go run github.com/securego/gosec/v2/cmd/gosec@v2.28.0 -quiet ./...
 
   docker:
     runs-on: ubuntu-latest
@@ -84,12 +95,12 @@ jobs:
     # red security one.
     needs: [test, security]
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: build multi-arch image (no push)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -99,7 +110,7 @@ jobs:
       # Load a single-arch copy so the scanner has something to inspect;
       # the multi-arch build above stays in the buildx cache only.
       - name: build for scanning
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           load: true
@@ -108,7 +119,7 @@ jobs:
       # Trivy rather than Docker Scout: it needs no registry credentials, so
       # this gate also runs on pull requests from forks.
       - name: scan image
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: kea-prom-exporter:scan
           format: table
