@@ -51,8 +51,15 @@ On each `/metrics` request the exporter POSTs `statistic-get-all` and
 
 **Unknown statistic keys are logged once and ignored, never fatal.** A future
 Kea release that adds statistics degrades to *missing* metrics rather than *no*
-metrics. Extending coverage means adding a case to `emitStat` in
-[`main.go`](main.go).
+metrics, and `kea_exporter_unhandled_statistics` counts them.
+
+Extending coverage starts with a row in one of the tables in
+[`statmap.go`](statmap.go) — `exactStats` for a fixed name, `subnetStats` for a
+`subnet[N].` suffix, `packetStats` for a `pkt4-` direction. That decides which
+`statID` a key maps to; the metric it becomes is then wired in
+[`collector.go`](collector.go): a `statID`, a descriptor field, its `NewDesc`,
+a line in `Describe`, and a `statMetrics` row. The tables remove the branching,
+not the wiring, and the tests fail if the two halves disagree.
 
 ## Build
 
