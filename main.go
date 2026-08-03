@@ -26,6 +26,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -38,7 +40,68 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// Set at build time with -X main.version / -X main.revision. Both are empty
+// or "dev" for a plain `go build`, which falls back to the VCS data Go stamps
+// into the build info -- the image build cannot use that fallback, because
+// .dockerignore keeps .git out of the build context.
 var (
+	version  = "dev"
+	revision = ""
+)
+
+// buildID is the resolved identity of this binary, captured once rather than
+// re-derived per scrape.
+type buildID struct{ version, revision, goVersion string }
+
+// resolveIdentity takes the injected values as parameters rather than reading
+// the package variables, so it is exercisable from a test without mutating
+// global state -- which is a data race the moment any test runs in parallel.
+func resolveIdentity(ver, rev string) buildID {
+	id := buildID{version: ver, revision: rev, goVersion: runtime.Version()}
+
+	// Both fields get a placeholder rather than being left empty: an empty
+	// label value reads as "not built yet" rather than "not recorded", and an
+	// empty VERSION build-arg is reachable (a workflow_dispatch release run
+	// produces no semver output).
+	if id.version == "" {
+		id.version = "dev"
+	}
+
+	info, ok := debug.ReadBuildInfo()
+	if ok && info.GoVersion != "" {
+		id.goVersion = info.GoVersion
+	}
+	if id.revision != "" {
+		// An injected revision is taken at face value. The image build has no
+		// .git, so the -dirty suffix below is unavailable on that path.
+		return id
+	}
+
+	id.revision = "unknown"
+	if !ok {
+		return id
+	}
+	var dirty bool
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			id.revision = setting.Value
+		case "vcs.modified":
+			dirty = setting.Value == "true"
+		}
+	}
+	if dirty && id.revision != "unknown" {
+		// A dirty build is not the commit it claims to be, and silently
+		// reporting the clean SHA is how "but that fix is deployed" happens.
+		id.revision += "-dirty"
+	}
+	return id
+}
+
+func buildIdentity() buildID { return resolveIdentity(version, revision) }
+
+var (
+	showVersion   = flag.Bool("version", false, "Print version information and exit.")
 	listenAddr    = flag.String("listen", ":9547", "Prometheus metrics listen address.")
 	keaURL        = flag.String("kea-url", "http://127.0.0.1:8001/", "Kea HTTP control socket URL.")
 	keaUser       = flag.String("kea-user", "", "Kea HTTP basic auth user. Empty disables auth.")
@@ -51,8 +114,9 @@ var (
 )
 
 // envForFlag maps each flag to the environment variable that can set it.
-// Every flag is settable from the environment; the container documentation
-// leans on that, and two of them previously had no equivalent.
+// Every flag that configures the running exporter is settable this way; the
+// container documentation leans on that. Meta-flags that exit immediately,
+// currently only --version, are deliberately absent.
 var envForFlag = map[string]string{
 	"listen":            "LISTEN",
 	"kea-url":           "KEA_URL",
@@ -230,7 +294,8 @@ func (k *keaClient) call(ctx context.Context, command string) (*keaResponse, err
 // gauge cache, which avoids label-set drift surprises when Kea adds new
 // statistic dimensions between releases.
 type collector struct {
-	kea *keaClient
+	kea   *keaClient
+	build buildID
 
 	// Scrape health.
 	up           *prometheus.Desc
@@ -251,6 +316,13 @@ type collector struct {
 	haPartnerAge     *prometheus.Desc
 	haPartnerInTouch *prometheus.Desc
 	haCommBroken     *prometheus.Desc
+
+	// Identity of the running binary, and how long a scrape took. Both are
+	// standard for an exporter: the first is the first question asked in a bug
+	// report, the second is what tells you the exporter rather than Kea is the
+	// slow part.
+	buildInfo     *prometheus.Desc
+	scrapeSeconds *prometheus.Desc
 
 	// Count of statistics Kea reports that this exporter has no mapping for.
 	// The names are only logged, and only at debug -- a gauge makes drift
@@ -277,6 +349,7 @@ func newCollector(k *keaClient) *collector {
 	const ns = "kea_dhcp4"
 	return &collector{
 		kea:       k,
+		build:     buildIdentity(),
 		unhandled: make(map[string]struct{}),
 		log:       slog.Default(),
 
@@ -321,6 +394,15 @@ func newCollector(k *keaClient) *collector {
 			ns+"_ha_communication_interrupted", "1 if HA communication with the partner is interrupted, else 0.",
 			nil, nil),
 
+		buildInfo: prometheus.NewDesc(
+			"kea_exporter_build_info",
+			"Build identity of the running exporter (info-metric; value always 1).",
+			[]string{"version", "revision", "goversion"}, nil),
+		scrapeSeconds: prometheus.NewDesc(
+			"kea_scrape_duration_seconds",
+			"Duration of the exporter's collection for this scrape, including the Kea round trips.",
+			nil, nil),
+
 		unhandledStats: prometheus.NewDesc(
 			"kea_exporter_unhandled_statistics",
 			"Number of distinct Kea statistics seen that this exporter has no mapping for.",
@@ -341,6 +423,8 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.haPartnerAge
 	ch <- c.haPartnerInTouch
 	ch <- c.haCommBroken
+	ch <- c.buildInfo
+	ch <- c.scrapeSeconds
 	ch <- c.unhandledStats
 }
 
@@ -348,6 +432,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	// No shared deadline here: keaClient.call bounds each request on its own,
 	// so a slow first command cannot starve the second.
 	ctx := context.Background()
+	start := time.Now()
 
 	statErr := c.collectStats(ctx, ch)
 	haErr := c.collectHA(ctx, ch)
@@ -377,6 +462,13 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	unhandled := float64(len(c.unhandled))
 	c.unhandledMu.Unlock()
 	ch <- prometheus.MustNewConstMetric(c.unhandledStats, prometheus.GaugeValue, unhandled)
+
+	ch <- prometheus.MustNewConstMetric(c.buildInfo, prometheus.GaugeValue, 1,
+		c.build.version, c.build.revision, c.build.goVersion)
+
+	// Emitted last so it covers everything above it, including the failure
+	// paths -- a scrape that timed out is exactly the one worth timing.
+	ch <- prometheus.MustNewConstMetric(c.scrapeSeconds, prometheus.GaugeValue, time.Since(start).Seconds())
 }
 
 func (c *collector) emitCommandHealth(
@@ -590,6 +682,11 @@ func loadPassword(file, inline string) (string, error) {
 
 func main() {
 	flag.Parse()
+	if *showVersion {
+		id := buildIdentity()
+		fmt.Printf("kea-prom-exporter %s (revision %s, %s)\n", id.version, id.revision, id.goVersion)
+		return
+	}
 	envProblems := applyEnv(flag.CommandLine, os.LookupEnv)
 
 	logger, logProblems := newLogger(*logLevel, *logFormat)

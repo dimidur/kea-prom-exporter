@@ -51,6 +51,36 @@ daemon's behaviour.
 If you add support for statistics that the existing fixtures don't contain,
 please add a fixture captured from a real Kea rather than composing one by hand.
 
+## Test style
+
+Every test opens with a comment stating the behaviour under test and why it is
+worth pinning, then uses `// Arrange` / `// Act` / `// Assert` section markers.
+Keep both: the comment says why the test exists, the markers say where to look.
+
+```go
+func TestSomething(t *testing.T) {
+    // Why this matters, in one or two lines.
+
+    // Arrange
+    srv := keaStub(t, ...)
+
+    // Act
+    got := collectAll(c)
+
+    // Assert
+    if len(got) == 0 { ... }
+}
+```
+
+Table-driven tests mark the sections inside the subtest, where the acting
+happens — not around the table literal.
+
+A test that cannot fail is worse than no test. When adding one, make it fail
+first — break the code it guards and watch it go red. The metric-count floor
+and the double-counting guards were each written that way, and one earlier
+version of the channel test was replaced because it turned out it could not
+fail.
+
 ## Things worth knowing before changing the collector
 
 - **`Collect` can run concurrently.** Prometheus calls it once per scrape and
