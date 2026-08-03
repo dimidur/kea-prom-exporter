@@ -10,13 +10,20 @@
 # Build for the local arch:
 #   docker build -t kea-prom-exporter:dev .
 #
-# Build multi-arch (requires `docker buildx` + a builder):
+# Build multi-arch (requires `docker buildx` + a builder). Pass the build args
+# or the image reports version=dev revision=unknown, which is the problem
+# kea_exporter_build_info exists to solve:
 #   docker buildx build --platform linux/amd64,linux/arm64 \
+#     --build-arg VERSION=<tag> --build-arg REVISION=$(git rev-parse HEAD) \
 #     -t dimidur/kea-prom-exporter:<tag> --push .
 
 FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine AS build
 ARG TARGETOS
 ARG TARGETARCH
+# Passed in rather than read from the repo: .dockerignore keeps .git out of the
+# build context, so Go cannot stamp the VCS revision itself here.
+ARG VERSION=dev
+ARG REVISION=
 # Fail loudly if the builder tag and go.mod's toolchain line drift apart,
 # rather than silently downloading a toolchain mid-build -- which is a slow,
 # obscure failure behind an egress proxy.
@@ -28,8 +35,14 @@ COPY go.mod go.sum* ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -trimpath -ldflags="-s -w" -o /out/kea-prom-exporter .
+# $VERSION and $REVISION are expanded by the shell from the build-arg
+# environment, NOT interpolated by BuildKit into the command text: a tag
+# containing a quote would otherwise close the -ldflags string and let the
+# rest of the tag run as shell.
+RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
+    go build -trimpath \
+      -ldflags="-s -w -X main.version=$VERSION -X main.revision=$REVISION" \
+      -o /out/kea-prom-exporter .
 
 # The :nonroot tag runs as uid 65532, a dedicated identity with its own
 # /etc/passwd entry — not 65534/nobody, which is the shared NFS-anonymous uid

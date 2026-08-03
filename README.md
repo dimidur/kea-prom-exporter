@@ -24,12 +24,27 @@ statistic dimension introduced in 3.x.
 | `kea_dhcp4_addresses_capacity` | `subnet` | pool size |
 | `kea_dhcp4_packets_received_total` | `type` | DHCPv4 packets in, by op |
 | `kea_dhcp4_packets_sent_total` | `type` | DHCPv4 packets out, by op |
-| `kea_dhcp4_ha_local_state_info` | `state`, `role` | HA state of this peer |
-| `kea_dhcp4_ha_partner_last_contact_seconds` | — | seconds since last partner heartbeat |
+| `kea_dhcp4_ha_enabled` | — | 1 when Kea reports an HA relationship, 0 when the hook is not loaded |
+| `kea_dhcp4_ha_local_state_info` | `state`, `role`, `mode` | HA state of this peer |
+| `kea_dhcp4_ha_partner_in_touch` | — | 1 once the partner has been contacted |
+| `kea_dhcp4_ha_partner_last_contact_seconds` | — | seconds since last partner heartbeat; **absent until in touch** |
 | `kea_dhcp4_ha_communication_interrupted` | — | 1 when HA communication is broken |
 | `kea_up` | — | 1 only when **every** control command succeeded |
 | `kea_command_up` | `command` | 1 when that specific command succeeded |
 | `kea_scrape_errors_total` | `command` | cumulative failures, per command |
+| `kea_scrape_duration_seconds` | — | time spent collecting from Kea, emitted even when the scrape failed |
+| `kea_exporter_unhandled_statistics` | — | count of Kea statistics with no mapping here |
+| `kea_exporter_build_info` | `version`, `revision`, `goversion` | build identity (value always 1) |
+
+`kea_dhcp4_ha_partner_last_contact_seconds` is deliberately **absent** rather
+than 0 before first contact — Kea reports age 0 in that state, which reads on a
+dashboard as "contacted 0 seconds ago". Pair it with
+`kea_dhcp4_ha_partner_in_touch`.
+
+`--version` prints the same identity as `kea_exporter_build_info`. For a
+released image both come from the build; for a local `go build` the version
+reads `dev` and the revision comes from Go's VCS stamping, suffixed `-dirty`
+when the working tree had uncommitted changes.
 
 On each `/metrics` request the exporter POSTs `statistic-get-all` and
 `status-get` to the `kea-dhcp4` HTTP control socket and translates the replies.
@@ -86,6 +101,7 @@ default is kept, rather than being applied silently or zeroed.
 | `--kea-service` | `KEA_SERVICE` | `dhcp4` | only `dhcp4` is implemented |
 | `--log-level` | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `--log-format` | `LOG_FORMAT` | `text` | `text` or `json` |
+| `--version` | — | — | prints build identity and exits; deliberately has no env form |
 
 `--log-level=debug` additionally names each Kea statistic the exporter has no
 mapping for. The count is always exported as
@@ -120,8 +136,13 @@ Multi-arch build:
 
 ```bash
 docker buildx build --platform linux/amd64,linux/arm64 \
+  --build-arg VERSION=0.1.0 --build-arg REVISION="$(git rev-parse HEAD)" \
   -t dimidur/kea-prom-exporter:0.1.0 --push .
 ```
+
+Without those build args the image reports `version=dev revision=unknown` —
+`.dockerignore` keeps `.git` out of the build context, so Go cannot stamp the
+revision itself. The release workflow supplies both automatically.
 
 ## Scraping it
 

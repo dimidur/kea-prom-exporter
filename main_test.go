@@ -60,6 +60,7 @@ func keaStub(t *testing.T, statistics, status []byte) *httptest.Server {
 }
 
 func TestCollectAgainstRealKeaOutput(t *testing.T) {
+	// Arrange
 	srv := keaStub(t, fixture(t, "statistic-get-all.json"), fixture(t, "status-get.json"))
 	defer srv.Close()
 
@@ -69,6 +70,7 @@ func TestCollectAgainstRealKeaOutput(t *testing.T) {
 	// this test asserted only presence, which let a mislabelled aggregate
 	// counter through (pkt4-sent emitted as type="sent" beside the real
 	// types, doubling any sum()).
+	// Act
 	expected := `
 # HELP kea_dhcp4_addresses_assigned Currently assigned IPv4 addresses in the pool.
 # TYPE kea_dhcp4_addresses_assigned gauge
@@ -77,6 +79,7 @@ kea_dhcp4_addresses_assigned{subnet="1"} 23
 # TYPE kea_dhcp4_addresses_capacity gauge
 kea_dhcp4_addresses_capacity{subnet="1"} 121
 `
+	// Assert
 	if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
 		"kea_dhcp4_addresses_assigned", "kea_dhcp4_addresses_capacity"); err != nil {
 		t.Errorf("subnet metrics: %v", err)
@@ -110,6 +113,7 @@ kea_dhcp4_ha_partner_last_contact_seconds 2
 func TestPacketTypesDoNotIncludeTheAggregate(t *testing.T) {
 	// Kea reports pkt4-sent as the grand total alongside pkt4-offer-sent and
 	// pkt4-ack-sent. Emitting it as type="sent" makes sum() return double.
+	// Arrange
 	raw := fixture(t, "statistic-get-all.json")
 	var resp []struct {
 		Arguments map[string]json.RawMessage `json:"arguments"`
@@ -129,11 +133,13 @@ func TestPacketTypesDoNotIncludeTheAggregate(t *testing.T) {
 	if err := reg.Register(c); err != nil {
 		t.Fatalf("register: %v", err)
 	}
+	// Act
 	mfs, err := reg.Gather()
 	if err != nil {
 		t.Fatalf("gather: %v", err)
 	}
 
+	// Assert
 	var sum float64
 	for _, mf := range mfs {
 		if mf.GetName() != "kea_dhcp4_packets_sent_total" {
@@ -156,13 +162,16 @@ func TestPacketTypesDoNotIncludeTheAggregate(t *testing.T) {
 func TestMetricNamesSatisfyPromlint(t *testing.T) {
 	// Catches convention breaches automatically -- e.g. a gauge carrying the
 	// _total suffix, which is reserved for counters.
+	// Arrange
 	srv := keaStub(t, fixture(t, "statistic-get-all.json"), fixture(t, "status-get.json"))
 	defer srv.Close()
 	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	// Act
 	problems, err := testutil.CollectAndLint(c)
 	if err != nil {
 		t.Fatalf("lint: %v", err)
 	}
+	// Assert
 	for _, p := range problems {
 		t.Errorf("promlint: %s: %s", p.Metric, p.Text)
 	}
@@ -172,6 +181,7 @@ func TestPartialFailureIsVisible(t *testing.T) {
 	// statistic-get-all fails, status-get succeeds. kea_up must be 0 -- the
 	// alternative is reporting healthy while every lease metric is missing --
 	// and the per-command series must say which half broke.
+	// Arrange
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		if strings.Contains(string(body), "statistic-get-all") {
@@ -188,6 +198,7 @@ func TestPartialFailureIsVisible(t *testing.T) {
 	if err := reg.Register(c); err != nil {
 		t.Fatalf("register: %v", err)
 	}
+	// Act
 	mfs, err := reg.Gather()
 	if err != nil {
 		t.Fatalf("gather: %v", err)
@@ -207,6 +218,7 @@ func TestPartialFailureIsVisible(t *testing.T) {
 			}
 		}
 	}
+	// Assert
 	if got["kea_up"] != 0 {
 		t.Errorf("kea_up = %v on partial failure, want 0", got["kea_up"])
 	}
@@ -219,10 +231,12 @@ func TestPartialFailureIsVisible(t *testing.T) {
 }
 
 func TestScrapeSucceedsAgainstRealOutput(t *testing.T) {
+	// Arrange
 	srv := keaStub(t, fixture(t, "statistic-get-all.json"), fixture(t, "status-get.json"))
 	defer srv.Close()
 
 	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	// Assert
 	if got := testutil.ToFloat64(upOnly{c}); got != 1 {
 		t.Errorf("kea_up = %v, want 1 when both commands succeed", got)
 	}
@@ -264,12 +278,14 @@ func (u upOnly) Collect(ch chan<- prometheus.Metric) {
 func TestUnreachableKeaReportsDownRatherThanFailing(t *testing.T) {
 	// A dead control socket must produce kea_up 0, not a panic and not an
 	// empty scrape: "down" has to be observable.
+	// Arrange
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "nope", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 
 	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	// Assert
 	if got := testutil.ToFloat64(upOnly{c}); got != 0 {
 		t.Errorf("kea_up = %v, want 0 when the control socket errors", got)
 	}
@@ -279,6 +295,7 @@ func TestPerPoolStatisticsAreNotDoubleCounted(t *testing.T) {
 	// Kea 3.x reports both subnet[N].assigned-addresses and
 	// subnet[N].pool[M].assigned-addresses. Counting both would inflate
 	// utilisation; the per-pool keys must be skipped.
+	// Arrange
 	raw := fixture(t, "statistic-get-all.json")
 	var resp []struct {
 		Arguments map[string]json.RawMessage `json:"arguments"`
@@ -303,12 +320,14 @@ func TestPerPoolStatisticsAreNotDoubleCounted(t *testing.T) {
 	if err := reg.Register(c); err != nil {
 		t.Fatalf("register: %v", err)
 	}
+	// Act
 	mfs, err := reg.Gather()
 	if err != nil {
 		t.Fatalf("gather: %v", err)
 	}
 
 	// One assigned-addresses series per subnet, never per pool.
+	// Assert
 	subnets := map[string]struct{}{}
 	for k := range resp[0].Arguments {
 		if strings.HasPrefix(k, "subnet[") && strings.HasSuffix(k, "].assigned-addresses") {
@@ -330,12 +349,14 @@ func TestConcurrentScrapesAreRaceFree(t *testing.T) {
 	// Prometheus may call Collect concurrently when scrapes overlap. The
 	// scrape-error counter used to be a package-level uint64 incremented
 	// without synchronisation, which `go test -race` flags here.
+	// Arrange
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "down", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 
 	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	// Act
 	const scrapes = 8
 	var wg sync.WaitGroup
 	for range scrapes {
@@ -347,12 +368,14 @@ func TestConcurrentScrapesAreRaceFree(t *testing.T) {
 	}
 	wg.Wait()
 
+	// Assert
 	if got := c.statErrorCount.Load(); got != scrapes {
 		t.Errorf("statErrorCount = %d after %d failing scrapes, want %d", got, scrapes, scrapes)
 	}
 }
 
 func TestMostRecentValue(t *testing.T) {
+	// Arrange
 	cases := []struct {
 		name string
 		in   string
@@ -367,7 +390,9 @@ func TestMostRecentValue(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Act
 			got, ok := mostRecentValue(json.RawMessage(tc.in))
+			// Assert
 			if ok != tc.ok || (ok && got != tc.want) {
 				t.Errorf("mostRecentValue(%s) = (%v, %v), want (%v, %v)", tc.in, got, ok, tc.want, tc.ok)
 			}
@@ -379,6 +404,7 @@ func TestNullSampleIsSkippedRatherThanReportedAsZero(t *testing.T) {
 	// Kea emits `[[null, "<ts>"]]` for a statistic it has no value for yet.
 	// json.Unmarshal of null into a float64 succeeds and leaves 0, so without
 	// an explicit guard the exporter reports a confident zero.
+	// Act
 	if got, ok := mostRecentValue(json.RawMessage(`[[null, "2026-08-02 20:04:57"]]`)); ok {
 		t.Errorf("mostRecentValue(null sample) = (%v, true), want ok=false", got)
 	}
@@ -387,6 +413,7 @@ func TestNullSampleIsSkippedRatherThanReportedAsZero(t *testing.T) {
 func TestCommandIsValidJSONWhateverTheServiceName(t *testing.T) {
 	// The service name reaches the wire from a flag. Built with fmt.Sprintf it
 	// was possible to inject a quote and change the command actually sent.
+	// Arrange
 	var got keaCommand
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -399,9 +426,11 @@ func TestCommandIsValidJSONWhateverTheServiceName(t *testing.T) {
 	defer srv.Close()
 
 	k := &keaClient{url: srv.URL, service: `dhcp4","injected":"`, client: srv.Client()}
+	// Act
 	if _, err := k.call(t.Context(), "status-get"); err != nil {
 		t.Fatalf("call: %v", err)
 	}
+	// Assert
 	if got.Command != "status-get" {
 		t.Errorf("command = %q, want status-get", got.Command)
 	}
@@ -414,6 +443,7 @@ func TestHTTPErrorBodyIsReportedAndBounded(t *testing.T) {
 	// Kea explains 401/403 in the body. "HTTP 401" alone is the least useful
 	// possible message for the most common misconfiguration -- but an
 	// unbounded body would let a proxy's HTML error page into the logs.
+	// Arrange
 	long := strings.Repeat("x", errBodyLimit*4)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, long, http.StatusUnauthorized)
@@ -421,7 +451,9 @@ func TestHTTPErrorBodyIsReportedAndBounded(t *testing.T) {
 	defer srv.Close()
 
 	k := &keaClient{url: srv.URL, client: srv.Client()}
+	// Act
 	_, err := k.call(t.Context(), "status-get")
+	// Assert
 	if err == nil {
 		t.Fatal("call succeeded against a 401")
 	}
@@ -440,6 +472,7 @@ func TestNon200SuccessStatusIsAccepted(t *testing.T) {
 	// Kea itself answers 200, but a reverse proxy in front of the control
 	// socket may legitimately answer 204/206 or similar. Rejecting anything
 	// but exactly 200 turned a working deployment into kea_up 0.
+	// Arrange
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
@@ -448,6 +481,7 @@ func TestNon200SuccessStatusIsAccepted(t *testing.T) {
 	defer srv.Close()
 
 	k := &keaClient{url: srv.URL, client: srv.Client()}
+	// Act
 	if _, err := k.call(t.Context(), "status-get"); err != nil {
 		t.Errorf("call on HTTP 202: %v", err)
 	}
@@ -456,6 +490,7 @@ func TestNon200SuccessStatusIsAccepted(t *testing.T) {
 func TestKeaResultErrorIsSurfaced(t *testing.T) {
 	// A non-zero `result` is HTTP 200 with a failure inside. Kea returns 1 for
 	// an error and 2 for an unsupported command; both must fail the scrape.
+	// Arrange
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[{"result":2,"text":"'status-get' command not supported"}]`))
@@ -463,7 +498,9 @@ func TestKeaResultErrorIsSurfaced(t *testing.T) {
 	defer srv.Close()
 
 	k := &keaClient{url: srv.URL, client: srv.Client()}
+	// Act
 	_, err := k.call(t.Context(), "status-get")
+	// Assert
 	if err == nil {
 		t.Fatal("call succeeded against result=2")
 	}
@@ -476,16 +513,19 @@ func TestHAHookAbsentIsDistinguishableFromScrapeFailure(t *testing.T) {
 	// No `high-availability` key means the hook is not loaded. That must be
 	// an explicit 0, not silence -- otherwise it is indistinguishable from
 	// status-get having failed.
+	// Arrange
 	status := []byte(`[{"result":0,"arguments":{"pid":1,"uptime":10}}]`)
 	srv := keaStub(t, fixture(t, "statistic-get-all.json"), status)
 	defer srv.Close()
 
 	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	// Act
 	expected := `
 # HELP kea_dhcp4_ha_enabled 1 when Kea reports an HA relationship, 0 when the HA hook is not loaded.
 # TYPE kea_dhcp4_ha_enabled gauge
 kea_dhcp4_ha_enabled 0
 `
+	// Assert
 	if err := testutil.CollectAndCompare(c, strings.NewReader(expected), "kea_dhcp4_ha_enabled"); err != nil {
 		t.Errorf("ha_enabled: %v", err)
 	}
@@ -499,6 +539,7 @@ func TestPartnerAgeIsAbsentUntilInTouch(t *testing.T) {
 	// Kea reports age 0 when it has never reached the partner. Exported
 	// unconditionally that reads as "contacted 0 seconds ago" -- the inverse
 	// of the truth -- so the gauge is withheld until in-touch is true.
+	// Arrange
 	status := []byte(`[{"result":0,"arguments":{"high-availability":[{"ha-mode":"hot-standby",
 	  "ha-servers":{"local":{"role":"primary","state":"waiting"},
 	  "remote":{"age":0,"communication-interrupted":true,"in-touch":false}}}]}}]`)
@@ -506,11 +547,13 @@ func TestPartnerAgeIsAbsentUntilInTouch(t *testing.T) {
 	defer srv.Close()
 
 	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	// Act
 	expected := `
 # HELP kea_dhcp4_ha_partner_in_touch 1 once this peer has been in contact with its HA partner, else 0.
 # TYPE kea_dhcp4_ha_partner_in_touch gauge
 kea_dhcp4_ha_partner_in_touch 0
 `
+	// Assert
 	if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
 		"kea_dhcp4_ha_partner_in_touch", "kea_dhcp4_ha_partner_last_contact_seconds"); err != nil {
 		t.Errorf("partner contact metrics: %v", err)
@@ -529,6 +572,7 @@ func TestBasicAuthIsSentOnlyWhenAUserIsConfigured(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Arrange
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				user, password, ok := r.BasicAuth()
 				if ok != tc.wantAuth {
@@ -543,6 +587,7 @@ func TestBasicAuthIsSentOnlyWhenAUserIsConfigured(t *testing.T) {
 			defer srv.Close()
 
 			k := &keaClient{url: srv.URL, user: tc.user, password: tc.password, client: srv.Client()}
+			// Act
 			if _, err := k.call(t.Context(), "status-get"); err != nil {
 				t.Fatalf("call: %v", err)
 			}
@@ -558,6 +603,7 @@ func TestPerRequestTimeoutBoundsEachCallSeparately(t *testing.T) {
 	// released explicitly. Waiting on r.Context() instead would deadlock:
 	// net/http only starts watching for a client disconnect once the request
 	// body has been consumed, and this handler never reads it.
+	// Arrange
 	release := make(chan struct{})
 	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -578,15 +624,18 @@ func TestPerRequestTimeoutBoundsEachCallSeparately(t *testing.T) {
 
 	k := &keaClient{url: srv.URL, timeout: 50 * time.Millisecond, client: srv.Client()}
 	ctx := t.Context()
+	// Act
 	if _, err := k.call(ctx, "statistic-get-all"); err == nil {
 		t.Fatal("first call succeeded, expected it to time out")
 	}
+	// Assert
 	if _, err := k.call(ctx, "status-get"); err != nil {
 		t.Errorf("second call inherited the first call's exhausted deadline: %v", err)
 	}
 }
 
 func TestLoadPassword(t *testing.T) {
+	// Arrange
 	dir := t.TempDir()
 	file := dir + "/secret"
 	// Trailing newline is what an editor or `echo` leaves behind; sending it
@@ -610,7 +659,9 @@ func TestLoadPassword(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Act
 			got, err := loadPassword(tc.file, tc.inline)
+			// Assert
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("loadPassword(%q, %q) error = %v, wantErr %v", tc.file, tc.inline, err, tc.wantErr)
 			}
@@ -625,6 +676,7 @@ func TestUnparseableStatisticIsLoggedOnceNotDroppedSilently(t *testing.T) {
 	// Kea also reports string- and duration-typed statistics. They cannot
 	// become a float, but an absent metric with nothing explaining why is a
 	// worse outcome than a one-line log.
+	// Arrange
 	stats := []byte(`[{"result":0,"arguments":{
 	  "pkt4-ack-sent":[[1,"2026-08-02 20:04:57"]],
 	  "some-string-stat":[["not-a-number","2026-08-02 20:04:57"]]}}]`)
@@ -632,8 +684,10 @@ func TestUnparseableStatisticIsLoggedOnceNotDroppedSilently(t *testing.T) {
 	defer srv.Close()
 
 	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	// Act
 	collectAll(c)
 
+	// Assert
 	c.unhandledMu.Lock()
 	defer c.unhandledMu.Unlock()
 	if _, ok := c.unhandled["some-string-stat"]; !ok {
@@ -645,6 +699,7 @@ func TestNewLoggerReportsRatherThanSilentlyIgnoring(t *testing.T) {
 	// slog rejects "warning" -- the syslog and Python spelling, and a very
 	// likely operator typo. Falling back to info is fine; doing it silently is
 	// not, because the operator then never learns their setting was ignored.
+	// Arrange
 	cases := []struct {
 		level, format string
 		wantDebug     bool
@@ -659,7 +714,9 @@ func TestNewLoggerReportsRatherThanSilentlyIgnoring(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.level+"/"+tc.format, func(t *testing.T) {
+			// Act
 			l, problems := newLogger(tc.level, tc.format)
+			// Assert
 			if l == nil {
 				t.Fatal("newLogger returned nil")
 			}
@@ -751,6 +808,7 @@ func TestApplyEnvFillsUnsetFlagsOnly(t *testing.T) {
 func TestServeUntilSignalDrainsInFlightRequests(t *testing.T) {
 	// The point of the grace period: a request already being served must
 	// finish, and shutting down must not be reported as a failure.
+	// Arrange
 	started := make(chan struct{})
 	mux := http.NewServeMux()
 	mux.HandleFunc("/slow", func(w http.ResponseWriter, _ *http.Request) {
@@ -790,9 +848,11 @@ func TestServeUntilSignalDrainsInFlightRequests(t *testing.T) {
 		body <- "never connected"
 	}()
 
+	// Act
 	<-started
 	cancel() // signal arrives mid-request
 
+	// Assert
 	if got := <-body; got != "done" {
 		t.Errorf("in-flight request returned %q, want it to complete with \"done\"", got)
 	}
@@ -806,6 +866,7 @@ func TestServeUntilSignalGraceExpiryIsNotAFailure(t *testing.T) {
 	// grace period, not a process failure -- returning an error here made
 	// every `docker stop` of a busy exporter exit non-zero and look like a
 	// crash to Kubernetes and to alerting.
+	// Arrange
 	mux := http.NewServeMux()
 	release := make(chan struct{})
 	started := make(chan struct{})
@@ -835,9 +896,11 @@ func TestServeUntilSignalGraceExpiryIsNotAFailure(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}()
+	// Act
 	<-started
 	cancel()
 
+	// Assert
 	if err := <-done; err != nil {
 		t.Errorf("serveUntilSignal returned %v, want nil when only the grace expired", err)
 	}
@@ -847,6 +910,7 @@ func TestServeUntilSignalGraceExpiryIsNotAFailure(t *testing.T) {
 func TestServeUntilSignalReportsABindFailure(t *testing.T) {
 	// A port already in use must surface as an error, not as a "listening"
 	// line followed by silence.
+	// Arrange
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -854,6 +918,7 @@ func TestServeUntilSignalReportsABindFailure(t *testing.T) {
 	defer ln.Close()
 
 	srv := &http.Server{Addr: ln.Addr().String(), ReadHeaderTimeout: time.Second}
+	// Assert
 	if err := serveUntilSignal(t.Context(), srv, time.Second, nil); err == nil {
 		t.Error("serveUntilSignal returned nil for an address already in use")
 	}
@@ -863,6 +928,7 @@ func TestUnhandledStatisticsAreCounted(t *testing.T) {
 	// The names only reach the debug log, so the count has to be a metric --
 	// otherwise drift after a Kea upgrade needs a restart at a higher log
 	// level to discover.
+	// Arrange
 	srv := keaStub(t, fixture(t, "statistic-get-all.json"), fixture(t, "status-get.json"))
 	defer srv.Close()
 
@@ -871,11 +937,13 @@ func TestUnhandledStatisticsAreCounted(t *testing.T) {
 	if err := reg.Register(c); err != nil {
 		t.Fatalf("register: %v", err)
 	}
+	// Act
 	mfs, err := reg.Gather()
 	if err != nil {
 		t.Fatalf("gather: %v", err)
 	}
 
+	// Assert
 	var got float64
 	var found bool
 	for _, mf := range mfs {
@@ -904,6 +972,7 @@ func TestEmptyResponseArrayIsAnError(t *testing.T) {
 	// Kea wraps every response in an array with one entry per service the
 	// command reached. A zero-length list therefore carries no result at all
 	// and must not be read as "succeeded with nothing to report".
+	// Arrange
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[]`))
@@ -911,7 +980,9 @@ func TestEmptyResponseArrayIsAnError(t *testing.T) {
 	defer srv.Close()
 
 	k := &keaClient{url: srv.URL, client: srv.Client()}
+	// Act
 	_, err := k.call(t.Context(), "status-get")
+	// Assert
 	if err == nil {
 		t.Fatal("call succeeded against an empty response array")
 	}
@@ -926,6 +997,7 @@ func TestCollectDoesNotDependOnAChannelBuffer(t *testing.T) {
 	// property is that Collect completes against an UNBUFFERED channel, which
 	// is what a registry Gather does and what the old fixed-size buffers only
 	// approximated.
+	// Arrange
 	srv := keaStub(t, fixture(t, "statistic-get-all.json"), fixture(t, "status-get.json"))
 	defer srv.Close()
 	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
@@ -939,6 +1011,7 @@ func TestCollectDoesNotDependOnAChannelBuffer(t *testing.T) {
 		}
 		done <- n
 	}()
+	// Act
 	c.Collect(ch)
 	close(ch)
 
@@ -950,9 +1023,132 @@ func TestCollectDoesNotDependOnAChannelBuffer(t *testing.T) {
 	}
 
 	// A floor, not an equality: adding metrics is expected, losing them is a
-	// regression. 29 is what the real fixture produces today.
-	const emittedToday = 29
+	// regression. 31 is what the real fixture produces today.
+	// Assert
+	const emittedToday = 31
 	if n < emittedToday {
 		t.Errorf("collector emitted %d metrics, want at least %d", n, emittedToday)
+	}
+}
+
+func TestResolveIdentity(t *testing.T) {
+	// Takes its inputs as parameters, so no test has to mutate the package
+	// variables -- doing that is a data race the moment any test runs with
+	// t.Parallel().
+	t.Run("injected values win over VCS data", func(t *testing.T) {
+		// Act
+		id := resolveIdentity("v9.9.9", "deadbeef")
+		// Assert
+		if id.version != "v9.9.9" || id.revision != "deadbeef" {
+			t.Errorf("resolveIdentity = %+v, want the injected values", id)
+		}
+		if id.goVersion == "" {
+			t.Error("goVersion is empty")
+		}
+	})
+
+	t.Run("empty values become placeholders, never empty labels", func(t *testing.T) {
+		// An empty VERSION build-arg is reachable, so an empty label is not a
+		// hypothetical: it reads as "not built yet" rather than "not recorded".
+		id := resolveIdentity("", "")
+		if id.version != "dev" {
+			t.Errorf("version = %q, want the dev placeholder", id.version)
+		}
+		if id.revision == "" {
+			t.Error("revision is empty; want a SHA from the VCS data or the unknown placeholder")
+		}
+	})
+
+	t.Run("an injected revision is not second-guessed", func(t *testing.T) {
+		// The image build has no .git, so it cannot know whether the tree was
+		// dirty; it must not invent a suffix either way.
+		id := resolveIdentity("v1", "abc123")
+		if id.revision != "abc123" {
+			t.Errorf("revision = %q, want it passed through unchanged", id.revision)
+		}
+	})
+}
+
+func TestBuildInfoAndScrapeDurationAreExported(t *testing.T) {
+	// Arrange
+	srv := keaStub(t, fixture(t, "statistic-get-all.json"), fixture(t, "status-get.json"))
+	defer srv.Close()
+
+	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	// Per-collector, not a package global: nothing here is shared with any
+	// other test.
+	c.build = buildID{version: "v1.2.3", revision: "cafebabe", goVersion: "go1.2.3"}
+
+	reg := prometheus.NewPedanticRegistry()
+	if err := reg.Register(c); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	// Act
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+
+	// Assert
+	var sawBuild, sawDuration bool
+	for _, mf := range mfs {
+		metrics := mf.GetMetric()
+		if len(metrics) == 0 {
+			t.Errorf("%s has no samples", mf.GetName())
+			continue
+		}
+		switch mf.GetName() {
+		case "kea_exporter_build_info":
+			sawBuild = true
+			labels := map[string]string{}
+			for _, label := range metrics[0].GetLabel() {
+				labels[label.GetName()] = label.GetValue()
+			}
+			want := map[string]string{"version": "v1.2.3", "revision": "cafebabe", "goversion": "go1.2.3"}
+			for k, v := range want {
+				if labels[k] != v {
+					t.Errorf("build_info %s = %q, want %q", k, labels[k], v)
+				}
+			}
+			if got := metrics[0].GetGauge().GetValue(); got != 1 {
+				t.Errorf("build_info value = %v, want 1 (info-metric convention)", got)
+			}
+		case "kea_scrape_duration_seconds":
+			sawDuration = true
+			// Only that it is a real, non-negative measurement; an upper bound
+			// would make this flaky on a loaded machine.
+			if got := metrics[0].GetGauge().GetValue(); got < 0 {
+				t.Errorf("scrape duration = %v, want >= 0", got)
+			}
+		}
+	}
+	if !sawBuild {
+		t.Error("kea_exporter_build_info was not exported")
+	}
+	if !sawDuration {
+		t.Error("kea_scrape_duration_seconds was not exported")
+	}
+}
+
+func TestScrapeDurationIsEmittedEvenWhenKeaIsDown(t *testing.T) {
+	// A scrape that failed or timed out is exactly the one worth timing, so
+	// the measurement must not be conditional on success.
+	// Arrange
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "down", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	// Act
+	var found bool
+	for _, m := range collectAll(c) {
+		if strings.Contains(m.Desc().String(), "kea_scrape_duration_seconds") {
+			found = true
+		}
+	}
+	// Assert
+	if !found {
+		t.Error("no scrape duration emitted when every command failed")
 	}
 }
