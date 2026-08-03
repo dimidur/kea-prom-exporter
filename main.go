@@ -8,7 +8,9 @@
 // counters, and HA peer state -- not full statistic coverage. Forward-compatible
 // by design — an unknown statistic key is logged once and ignored
 // rather than failing the scrape, so a Kea release that adds new
-// statistics degrades to missing metrics instead of no metrics.
+// statistics degrades to missing metrics instead of no metrics. The names go
+// to the debug log; the count is always exported as
+// kea_exporter_unhandled_statistics.
 package main
 
 import (
@@ -19,12 +21,16 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -33,20 +39,97 @@ import (
 )
 
 var (
-	listenAddr    = flag.String("listen", envOr("LISTEN", ":9547"), "Prometheus metrics listen address (also LISTEN env).")
-	keaURL        = flag.String("kea-url", envOr("KEA_URL", "http://127.0.0.1:8001/"), "Kea HTTP control socket URL (also KEA_URL env).")
-	keaUser       = flag.String("kea-user", envOr("KEA_USER", ""), "Kea HTTP basic auth user (also KEA_USER env). Empty disables auth.")
-	keaPassFile   = flag.String("kea-password-file", envOr("KEA_PASSWORD_FILE", ""), "Path to file containing Kea HTTP basic auth password (also KEA_PASSWORD_FILE env). Precedence over --kea-password.")
-	keaPass       = flag.String("kea-password", envOr("KEA_PASSWORD", ""), "Kea HTTP basic auth password (also KEA_PASSWORD env). Prefer --kea-password-file for production.")
-	httpTimeout   = flag.Duration("kea-timeout", 5*time.Second, "Kea API request timeout.")
-	scrapeService = flag.String("kea-service", "dhcp4", "Kea service name to scrape (currently only dhcp4 is implemented).")
+	listenAddr    = flag.String("listen", ":9547", "Prometheus metrics listen address.")
+	keaURL        = flag.String("kea-url", "http://127.0.0.1:8001/", "Kea HTTP control socket URL.")
+	keaUser       = flag.String("kea-user", "", "Kea HTTP basic auth user. Empty disables auth.")
+	keaPassFile   = flag.String("kea-password-file", "", "Path to a file containing the Kea HTTP basic auth password. Takes precedence over --kea-password.")
+	keaPass       = flag.String("kea-password", "", "Kea HTTP basic auth password. Prefer --kea-password-file for production.")
+	httpTimeout   = flag.Duration("kea-timeout", 5*time.Second, "Per-request Kea API timeout. Each control command is bounded separately, so budget two of these under Prometheus's scrape_timeout.")
+	scrapeService = flag.String("kea-service", "dhcp4", "Kea service name to scrape. Only dhcp4 is implemented.")
+	logLevel      = flag.String("log-level", "info", "Log level: debug, info, warn or error.")
+	logFormat     = flag.String("log-format", "text", "Log format: text or json.")
 )
 
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+// envForFlag maps each flag to the environment variable that can set it.
+// Every flag is settable from the environment; the container documentation
+// leans on that, and two of them previously had no equivalent.
+var envForFlag = map[string]string{
+	"listen":            "LISTEN",
+	"kea-url":           "KEA_URL",
+	"kea-user":          "KEA_USER",
+	"kea-password-file": "KEA_PASSWORD_FILE",
+	"kea-password":      "KEA_PASSWORD",
+	"kea-timeout":       "KEA_TIMEOUT",
+	"kea-service":       "KEA_SERVICE",
+	"log-level":         "LOG_LEVEL",
+	"log-format":        "LOG_FORMAT",
+}
+
+// applyEnv fills in flags the command line did not set, from the environment.
+// It runs after flag.Parse rather than seeding flag defaults, so an explicit
+// flag still wins, and so a rejected value is an ordinary error returned to a
+// caller that already has a logger -- flag defaults are evaluated during
+// package initialisation, before anything exists to report a problem to.
+func applyEnv(fs *flag.FlagSet, lookup func(string) (string, bool)) []error {
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+
+	var problems []error
+	// Sorted so the diagnostics are stable rather than map-ordered.
+	names := make([]string, 0, len(envForFlag))
+	for name := range envForFlag {
+		names = append(names, name)
 	}
-	return fallback
+	sort.Strings(names)
+
+	for _, name := range names {
+		if explicit[name] {
+			continue
+		}
+		env := envForFlag[name]
+		v, ok := lookup(env)
+		if !ok || v == "" {
+			continue
+		}
+		// Snapshot first: flag.Value implementations assign before returning a
+		// parse error -- durationValue.Set does `*d = durationValue(v)`
+		// unconditionally -- so a rejected value would leave the flag zeroed
+		// rather than at its default. A zero --kea-timeout in particular
+		// becomes an http.Client with no timeout at all.
+		previous := fs.Lookup(name).Value.String()
+		if err := fs.Set(name, v); err != nil {
+			problems = append(problems, fmt.Errorf("%s=%q is not a valid --%s, keeping %s: %w", env, v, name, previous, err))
+			if restoreErr := fs.Set(name, previous); restoreErr != nil {
+				problems = append(problems, fmt.Errorf("could not restore --%s to %s: %w", name, previous, restoreErr))
+			}
+		}
+	}
+	return problems
+}
+
+// newLogger builds the process logger. An unrecognised level or format falls
+// back to the default rather than refusing to start -- a logging preference is
+// not worth failing an exporter over -- but it is reported, because
+// `--log-level=warning` (the syslog/Python spelling, which slog rejects)
+// otherwise silently gives you info.
+func newLogger(level, format string) (*slog.Logger, []error) {
+	var problems []error
+
+	var lv slog.Level
+	if err := lv.UnmarshalText([]byte(level)); err != nil {
+		problems = append(problems, fmt.Errorf("unrecognised --log-level %q, using info; valid values are debug, info, warn, error", level))
+		lv = slog.LevelInfo
+	}
+
+	opts := &slog.HandlerOptions{Level: lv}
+	switch {
+	case strings.EqualFold(format, "json"):
+		return slog.New(slog.NewJSONHandler(os.Stderr, opts)), problems
+	case strings.EqualFold(format, "text"):
+	default:
+		problems = append(problems, fmt.Errorf("unrecognised --log-format %q, using text; valid values are text and json", format))
+	}
+	return slog.New(slog.NewTextHandler(os.Stderr, opts)), problems
 }
 
 // keaResponse is the shape of a single element in Kea's response array.
@@ -169,6 +252,11 @@ type collector struct {
 	haPartnerInTouch *prometheus.Desc
 	haCommBroken     *prometheus.Desc
 
+	// Count of statistics Kea reports that this exporter has no mapping for.
+	// The names are only logged, and only at debug -- a gauge makes drift
+	// after a Kea upgrade alertable without restarting at a higher log level.
+	unhandledStats *prometheus.Desc
+
 	// Cumulative scrape failures per command. Atomic and per-collector, not
 	// package globals: Prometheus may call Collect concurrently for
 	// overlapping scrapes, and a plain counter increment there is a data race.
@@ -179,6 +267,10 @@ type collector struct {
 	// once each — keeps scrape noise low while still surfacing drift.
 	unhandledMu sync.Mutex
 	unhandled   map[string]struct{}
+
+	// Injected rather than taken from slog.Default() at each call site, so a
+	// test can assert on what the collector logs without mutating a global.
+	log *slog.Logger
 }
 
 func newCollector(k *keaClient) *collector {
@@ -186,6 +278,7 @@ func newCollector(k *keaClient) *collector {
 	return &collector{
 		kea:       k,
 		unhandled: make(map[string]struct{}),
+		log:       slog.Default(),
 
 		up: prometheus.NewDesc(
 			"kea_up", "1 if the last scrape of the Kea control socket succeeded, else 0.",
@@ -227,6 +320,11 @@ func newCollector(k *keaClient) *collector {
 		haCommBroken: prometheus.NewDesc(
 			ns+"_ha_communication_interrupted", "1 if HA communication with the partner is interrupted, else 0.",
 			nil, nil),
+
+		unhandledStats: prometheus.NewDesc(
+			"kea_exporter_unhandled_statistics",
+			"Number of distinct Kea statistics seen that this exporter has no mapping for.",
+			nil, nil),
 	}
 }
 
@@ -243,6 +341,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.haPartnerAge
 	ch <- c.haPartnerInTouch
 	ch <- c.haCommBroken
+	ch <- c.unhandledStats
 }
 
 func (c *collector) Collect(ch chan<- prometheus.Metric) {
@@ -254,10 +353,10 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	haErr := c.collectHA(ctx, ch)
 
 	if statErr != nil {
-		log.Printf("statistic-get-all failed: %v", statErr)
+		c.log.Error("control command failed", "command", "statistic-get-all", "err", statErr)
 	}
 	if haErr != nil {
-		log.Printf("status-get failed: %v", haErr)
+		c.log.Error("control command failed", "command", "status-get", "err", haErr)
 	}
 
 	// kea_up is 0 if ANY command failed. Reporting 1 while half the metric
@@ -273,6 +372,11 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	// distinguishable without reading logs.
 	c.emitCommandHealth(ch, "statistic-get-all", statErr, &c.statErrorCount)
 	c.emitCommandHealth(ch, "status-get", haErr, &c.haErrorCount)
+
+	c.unhandledMu.Lock()
+	unhandled := float64(len(c.unhandled))
+	c.unhandledMu.Unlock()
+	ch <- prometheus.MustNewConstMetric(c.unhandledStats, prometheus.GaugeValue, unhandled)
 }
 
 func (c *collector) emitCommandHealth(
@@ -398,7 +502,10 @@ func (c *collector) noteUnhandled(key string) {
 		return
 	}
 	c.unhandled[key] = struct{}{}
-	log.Printf("unhandled statistic %q (logged once; extend collector to map it)", key)
+	// Debug, not info: a stock Kea reports ~19 statistics this exporter does
+	// not map, and printing all of them on the first scrape buries anything
+	// that matters.
+	c.log.Debug("unhandled statistic; extend the collector to map it", "statistic", key)
 }
 
 // haStatus is the trimmed status-get response we care about. The full
@@ -439,8 +546,8 @@ func (c *collector) collectHA(ctx context.Context, ch chan<- prometheus.Metric) 
 	ch <- prometheus.MustNewConstMetric(c.haEnabled, prometheus.GaugeValue, 1)
 
 	if len(s.HighAvailability) > 1 {
-		log.Printf("status-get reported %d HA relationships; only the first is exported",
-			len(s.HighAvailability))
+		c.log.Warn("only the first HA relationship is exported",
+			"relationships", len(s.HighAvailability))
 	}
 	ha := s.HighAvailability[0]
 	ch <- prometheus.MustNewConstMetric(
@@ -483,19 +590,28 @@ func loadPassword(file, inline string) (string, error) {
 
 func main() {
 	flag.Parse()
+	envProblems := applyEnv(flag.CommandLine, os.LookupEnv)
+
+	logger, logProblems := newLogger(*logLevel, *logFormat)
+	slog.SetDefault(logger)
+	// Deferred until the logger exists, and every problem is reported rather
+	// than only the last one.
+	for _, err := range append(envProblems, logProblems...) {
+		slog.Warn("configuration problem", "err", err)
+	}
 
 	secret, err := loadPassword(*keaPassFile, *keaPass)
 	if err != nil {
-		log.Fatal(err)
+		fatal("could not load the Kea password", "err", err)
 	}
 	if *keaUser != "" && secret == "" {
-		log.Fatal("kea-user set but no password provided (use --kea-password-file or --kea-password)")
+		fatal("kea-user is set but no password was provided; use --kea-password-file or --kea-password")
 	}
 	// Only dhcp4 is mapped. Without this, --kea-service=dhcp6 returns a valid
 	// response whose every key is unmapped: an empty metric set under a
 	// kea_dhcp4_ namespace, reported as kea_up 1.
 	if *scrapeService != "dhcp4" {
-		log.Fatalf("--kea-service=%q is not supported; only dhcp4 is implemented", *scrapeService)
+		fatal("unsupported --kea-service; only dhcp4 is implemented", "service", *scrapeService)
 	}
 
 	k := &keaClient{
@@ -519,7 +635,25 @@ func main() {
 	)
 
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{Registry: reg}))
+	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{
+		Registry: reg,
+		// Overlapping scrapes -- two Prometheus servers, a readiness probe, a
+		// human with curl -- would each drive their own pair of control-socket
+		// requests at a daemon that is also answering DHCP. CoalesceGather
+		// makes concurrent scrapes share one collection instead, so the socket
+		// sees one round trip per cycle no matter how many scrapers there are.
+		// MaxRequestsInFlight was the wrong instrument: it counts /metrics
+		// requests rather than Kea requests, and it answers the excess with 503
+		// -- which reaches Prometheus as up=0, indistinguishable from Kea
+		// actually being down, and drops the per-command diagnostics with it.
+		//
+		// Joined scrapers observe the same snapshot and timestamp. At a scrape
+		// interval measured in tens of seconds that is not observable.
+		CoalesceGather: true,
+		// Surfaces the reason behind promhttp_metric_handler_errors_total,
+		// which otherwise counts failures without ever saying why.
+		ErrorLog: slog.NewLogLogger(slog.Default().Handler(), slog.LevelError),
+	}))
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintln(w, "kea-prom-exporter — see /metrics")
 	})
@@ -529,8 +663,72 @@ func main() {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	log.Printf("kea-prom-exporter listening on %s, target=%s", *listenAddr, *keaURL)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
+
+	// A scrape runs the two control commands sequentially, each bounded by
+	// --kea-timeout, so the slowest legitimate in-flight request takes twice
+	// that. A grace shorter than the work it is waiting for cuts the response
+	// off anyway -- which is the thing graceful shutdown exists to prevent.
+	grace := 2**httpTimeout + time.Second
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := serveUntilSignal(ctx, srv, grace, stop); err != nil {
+		fatal("http server failed", "err", err)
 	}
+}
+
+// serveUntilSignal runs srv until ctx is cancelled, then drains it within
+// grace. Split out of main so the shutdown path is reachable from a test.
+//
+// releaseSignals restores default signal handling once shutdown has begun, so
+// an impatient second SIGTERM kills the process immediately instead of being
+// swallowed. It may be nil.
+func serveUntilSignal(ctx context.Context, srv *http.Server, grace time.Duration, releaseSignals func()) error {
+	// Listen before announcing: srv.ListenAndServe binds inside the goroutine,
+	// so logging there prints a success line even when the bind fails.
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		return err
+	}
+	slog.Info("listening", "addr", ln.Addr().String())
+
+	serveErr := make(chan error, 1)
+	go func() {
+		err := srv.Serve(ln)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		serveErr <- err
+	}()
+
+	select {
+	case err := <-serveErr:
+		return err
+	case <-ctx.Done():
+		if releaseSignals != nil {
+			releaseSignals()
+		}
+		slog.Info("shutting down", "grace", grace)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), grace)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			// The grace expiring is the designed outcome of a grace period,
+			// not a process failure: exiting non-zero here would make every
+			// `docker stop` of a busy exporter look like a crash.
+			if errors.Is(err, context.DeadlineExceeded) {
+				slog.Warn("shutdown grace expired with requests still in flight", "grace", grace)
+				return nil
+			}
+			return err
+		}
+		return nil
+	}
+}
+
+// fatal logs at error level and exits non-zero. slog has no Fatal, and
+// log.Fatal would write outside the configured handler.
+func fatal(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
 }

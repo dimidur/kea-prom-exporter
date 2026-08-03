@@ -70,10 +70,41 @@ KEA_PASSWORD_FILE=/etc/kea/control-password \
 ./kea-prom-exporter
 ```
 
+Every flag has an environment equivalent, and an explicit flag always wins over
+the environment. A value the environment cannot supply — an unparseable
+`KEA_TIMEOUT`, an unrecognised `LOG_LEVEL` — is reported at `WARN` and the
+default is kept, rather than being applied silently or zeroed.
+
+| Flag | Env | Default | Notes |
+|---|---|---|---|
+| `--listen` | `LISTEN` | `:9547` | |
+| `--kea-url` | `KEA_URL` | `http://127.0.0.1:8001/` | |
+| `--kea-user` | `KEA_USER` | *(empty)* | empty disables basic auth |
+| `--kea-password-file` | `KEA_PASSWORD_FILE` | *(empty)* | preferred over the inline form |
+| `--kea-password` | `KEA_PASSWORD` | *(empty)* | visible in `docker inspect` |
+| `--kea-timeout` | `KEA_TIMEOUT` | `5s` | **per control command**, and a scrape issues two |
+| `--kea-service` | `KEA_SERVICE` | `dhcp4` | only `dhcp4` is implemented |
+| `--log-level` | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `--log-format` | `LOG_FORMAT` | `text` | `text` or `json` |
+
+`--log-level=debug` additionally names each Kea statistic the exporter has no
+mapping for. The count is always exported as
+`kea_exporter_unhandled_statistics`, so drift after a Kea upgrade is visible
+without turning debug logging on.
+
+On `SIGTERM` or `SIGINT` the exporter stops accepting connections and lets
+in-flight scrapes finish before exiting, within a grace period of
+`2 × --kea-timeout + 1s` — the longest a legitimate scrape can take. It exits 0
+even if that grace expires; a slow shutdown is not a crash.
+
 ## Docker
+
+The image runs as **uid 65532** (`nonroot`), so a mounted password file must be
+readable by that user — a `0600` file owned by your account is not.
 
 ```bash
 docker build -t kea-prom-exporter:dev .
+chmod 0644 kea-password        # or: chown 65532 kea-password
 docker run --rm -p 9547:9547 \
   -e KEA_URL=http://host.docker.internal:8001/ \
   -e KEA_USER=kea-ops \
@@ -81,6 +112,9 @@ docker run --rm -p 9547:9547 \
   -v ./kea-password:/run/secrets/kea-password:ro \
   kea-prom-exporter:dev
 ```
+
+Under Kubernetes `PodSecurity: restricted` no `securityContext` override is
+needed; the image already declares a non-root user.
 
 Multi-arch build:
 
