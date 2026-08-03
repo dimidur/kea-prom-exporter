@@ -1,6 +1,12 @@
 module github.com/dimidur/kea-prom-exporter
 
-go 1.25.12
+go 1.26
+
+// Pinned separately from the `go` directive on purpose: the directive is the
+// minimum language version, the toolchain line selects the build toolchain.
+// Bumping only this keeps GOTOOLCHAIN=local users (distro Go, Nix, air-gapped)
+// building, while CI and the image still get the exact patch.
+toolchain go1.26.5
 
 require github.com/prometheus/client_golang v1.24.1
 

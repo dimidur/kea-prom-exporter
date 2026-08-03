@@ -21,8 +21,13 @@ the log will say so.
 
 ## Development
 
+The required Go version is the `go` directive in `go.mod`, and it names a full
+patch version rather than a minor one — the patch gets pinned when a Go release
+fixes a stdlib advisory. An older toolchain downloads the pinned one rather
+than failing, so expect a toolchain download on your first build.
+
 ```bash
-go mod tidy
+go mod tidy   # CI runs this and fails if it produces a diff
 go vet ./...
 go test -race ./...
 go build -o kea-prom-exporter .
@@ -32,7 +37,8 @@ CI additionally runs `gofmt`, `staticcheck`, `govulncheck` and `gosec`. All four
 are expected to be silent — please keep them that way rather than adding
 suppressions, unless the finding is genuinely a false positive, in which case
 annotate it with the reason (there is one `#nosec` in the tree, and it explains
-itself).
+itself). Their versions are pinned in `ci.yml`; when reproducing a CI failure
+locally, run the pinned version rather than `@latest`.
 
 ## Tests without a Kea instance
 

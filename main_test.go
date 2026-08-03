@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"flag"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -621,5 +625,264 @@ func TestUnparseableStatisticIsLoggedOnceNotDroppedSilently(t *testing.T) {
 	defer c.unhandledMu.Unlock()
 	if _, ok := c.unhandled["some-string-stat"]; !ok {
 		t.Errorf("unparseable statistic not recorded as unhandled: %v", c.unhandled)
+	}
+}
+
+func TestNewLoggerReportsRatherThanSilentlyIgnoring(t *testing.T) {
+	// slog rejects "warning" -- the syslog and Python spelling, and a very
+	// likely operator typo. Falling back to info is fine; doing it silently is
+	// not, because the operator then never learns their setting was ignored.
+	cases := []struct {
+		level, format string
+		wantDebug     bool
+		wantProblems  int
+	}{
+		{"debug", "text", true, 0},
+		{"DEBUG", "json", true, 0},
+		{"info", "text", false, 0},
+		{"warning", "text", false, 1},
+		{"info", "yaml", false, 1},
+		{"nope", "nope", false, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.level+"/"+tc.format, func(t *testing.T) {
+			l, problems := newLogger(tc.level, tc.format)
+			if l == nil {
+				t.Fatal("newLogger returned nil")
+			}
+			if got := l.Enabled(t.Context(), slog.LevelDebug); got != tc.wantDebug {
+				t.Errorf("debug enabled = %v, want %v", got, tc.wantDebug)
+			}
+			if len(problems) != tc.wantProblems {
+				t.Errorf("problems = %v, want %d", problems, tc.wantProblems)
+			}
+		})
+	}
+}
+
+func TestApplyEnvFillsUnsetFlagsOnly(t *testing.T) {
+	// An explicit flag must beat the environment, every flag must be settable
+	// from it, and a bad value must be reported rather than swallowed.
+	newFS := func() (*flag.FlagSet, *string, *time.Duration) {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		url := fs.String("kea-url", "http://default/", "")
+		timeout := fs.Duration("kea-timeout", 5*time.Second, "")
+		fs.String("listen", ":9547", "")
+		fs.String("kea-user", "", "")
+		fs.String("kea-password-file", "", "")
+		fs.String("kea-password", "", "")
+		fs.String("kea-service", "dhcp4", "")
+		fs.String("log-level", "info", "")
+		fs.String("log-format", "text", "")
+		return fs, url, timeout
+	}
+	env := func(m map[string]string) func(string) (string, bool) {
+		return func(k string) (string, bool) { v, ok := m[k]; return v, ok }
+	}
+
+	t.Run("env fills an unset flag", func(t *testing.T) {
+		fs, url, timeout := newFS()
+		if err := fs.Parse(nil); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		problems := applyEnv(fs, env(map[string]string{"KEA_URL": "http://from-env/", "KEA_TIMEOUT": "12s"}))
+		if len(problems) != 0 {
+			t.Errorf("problems = %v, want none", problems)
+		}
+		if *url != "http://from-env/" {
+			t.Errorf("kea-url = %q, want the env value", *url)
+		}
+		if *timeout != 12*time.Second {
+			t.Errorf("kea-timeout = %v, want 12s", *timeout)
+		}
+	})
+
+	t.Run("an explicit flag beats the environment", func(t *testing.T) {
+		fs, url, _ := newFS()
+		if err := fs.Parse([]string{"-kea-url", "http://from-flag/"}); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		applyEnv(fs, env(map[string]string{"KEA_URL": "http://from-env/"}))
+		if *url != "http://from-flag/" {
+			t.Errorf("kea-url = %q, want the flag value", *url)
+		}
+	})
+
+	t.Run("every bad value is reported, not just the last", func(t *testing.T) {
+		fs, _, timeout := newFS()
+		if err := fs.Parse(nil); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		problems := applyEnv(fs, env(map[string]string{"KEA_TIMEOUT": "twelve", "LOG_LEVEL": ""}))
+		if len(problems) != 1 {
+			t.Fatalf("problems = %v, want exactly 1", problems)
+		}
+		if !strings.Contains(problems[0].Error(), "KEA_TIMEOUT") {
+			t.Errorf("problem does not name the variable: %v", problems[0])
+		}
+		if *timeout != 5*time.Second {
+			t.Errorf("kea-timeout = %v, want the default kept after a bad value", *timeout)
+		}
+	})
+
+	t.Run("every flag has an env equivalent", func(t *testing.T) {
+		fs, _, _ := newFS()
+		fs.VisitAll(func(f *flag.Flag) {
+			if _, ok := envForFlag[f.Name]; !ok {
+				t.Errorf("flag --%s has no entry in envForFlag", f.Name)
+			}
+		})
+	})
+}
+
+func TestServeUntilSignalDrainsInFlightRequests(t *testing.T) {
+	// The point of the grace period: a request already being served must
+	// finish, and shutting down must not be reported as a failure.
+	started := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		time.Sleep(150 * time.Millisecond)
+		_, _ = w.Write([]byte("done"))
+	})
+	srv := &http.Server{Addr: "127.0.0.1:0", Handler: mux, ReadHeaderTimeout: time.Second}
+
+	// Bind first so the test knows the port, then hand the server the address.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	srv.Addr = addr
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- serveUntilSignal(ctx, srv, 5*time.Second, nil) }()
+
+	body := make(chan string, 1)
+	go func() {
+		// Retry briefly: serveUntilSignal binds asynchronously to this goroutine.
+		for range 50 {
+			resp, err := http.Get("http://" + addr + "/slow")
+			if err != nil {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
+			body <- string(b)
+			return
+		}
+		body <- "never connected"
+	}()
+
+	<-started
+	cancel() // signal arrives mid-request
+
+	if got := <-body; got != "done" {
+		t.Errorf("in-flight request returned %q, want it to complete with \"done\"", got)
+	}
+	if err := <-done; err != nil {
+		t.Errorf("serveUntilSignal returned %v, want nil on a clean shutdown", err)
+	}
+}
+
+func TestServeUntilSignalGraceExpiryIsNotAFailure(t *testing.T) {
+	// A grace shorter than the in-flight work is the designed outcome of a
+	// grace period, not a process failure -- returning an error here made
+	// every `docker stop` of a busy exporter exit non-zero and look like a
+	// crash to Kubernetes and to alerting.
+	mux := http.NewServeMux()
+	release := make(chan struct{})
+	started := make(chan struct{})
+	mux.HandleFunc("/hang", func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: time.Second}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- serveUntilSignal(ctx, srv, 50*time.Millisecond, nil) }()
+
+	go func() {
+		for range 50 {
+			if resp, err := http.Get("http://" + addr + "/hang"); err == nil {
+				defer resp.Body.Close()
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	<-started
+	cancel()
+
+	if err := <-done; err != nil {
+		t.Errorf("serveUntilSignal returned %v, want nil when only the grace expired", err)
+	}
+	close(release)
+}
+
+func TestServeUntilSignalReportsABindFailure(t *testing.T) {
+	// A port already in use must surface as an error, not as a "listening"
+	// line followed by silence.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	srv := &http.Server{Addr: ln.Addr().String(), ReadHeaderTimeout: time.Second}
+	if err := serveUntilSignal(t.Context(), srv, time.Second, nil); err == nil {
+		t.Error("serveUntilSignal returned nil for an address already in use")
+	}
+}
+
+func TestUnhandledStatisticsAreCounted(t *testing.T) {
+	// The names only reach the debug log, so the count has to be a metric --
+	// otherwise drift after a Kea upgrade needs a restart at a higher log
+	// level to discover.
+	srv := keaStub(t, fixture(t, "statistic-get-all.json"), fixture(t, "status-get.json"))
+	defer srv.Close()
+
+	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	reg := prometheus.NewPedanticRegistry()
+	if err := reg.Register(c); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+
+	var got float64
+	var found bool
+	for _, mf := range mfs {
+		if mf.GetName() == "kea_exporter_unhandled_statistics" {
+			found = true
+			got = mf.GetMetric()[0].GetGauge().GetValue()
+		}
+	}
+	if !found {
+		t.Fatal("kea_exporter_unhandled_statistics was not exported")
+	}
+	// The real fixture contains statistics this exporter does not map; the
+	// exact count is not the contract, being non-zero and observable is.
+	if got == 0 {
+		t.Errorf("unhandled statistics = 0, but the fixture contains unmapped keys")
+	}
+	c.unhandledMu.Lock()
+	want := float64(len(c.unhandled))
+	c.unhandledMu.Unlock()
+	if got != want {
+		t.Errorf("gauge = %v, collector tracked %v", got, want)
 	}
 }

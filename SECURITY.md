@@ -31,11 +31,22 @@ internal address and let your scraper reach it there rather than publishing it.
 
 ## Hardening in the shipped image
 
-- Static binary on `scratch` — no shell, no package manager, no libc.
+- Static binary on distroless `static` — no shell, no package manager, no libc.
+  It carries only a CA bundle, a `/etc/passwd` entry, `/tmp` and tzdata.
+- **Runs as uid 65532 (`nonroot`)**, a dedicated identity with its own passwd
+  entry rather than the shared `nobody`. Kubernetes `runAsNonRoot` and
+  PodSecurity `restricted` accept it without a `securityContext` override.
+  A bind-mounted password file must be readable by that uid.
 - No capabilities required; the process makes one outbound HTTP connection and
   binds one port.
 - CI runs `govulncheck` and `gosec` on every push, so a dependency advisory or a
   new unsafe pattern fails the build rather than shipping.
+
+Images up to and including **v0.2.0** were built `FROM scratch` and carried no
+CA certificates, so an HTTPS control socket could not be verified at all
+(`x509: certificate signed by unknown authority`). Images built after v0.2.0
+ship a CA bundle. If you are pinned to v0.2.0 or earlier and need
+`socket-type: https`, upgrade rather than mounting certificates into the image.
 
 ## Supported versions
 
