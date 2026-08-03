@@ -228,15 +228,33 @@ func TestScrapeSucceedsAgainstRealOutput(t *testing.T) {
 	}
 }
 
+// collectAll runs c.Collect with a reader already draining the channel, and
+// returns everything it emitted. Collect writes synchronously, so a buffered
+// channel with no concurrent reader deadlocks the moment the metric count
+// exceeds the buffer -- and the failure is a hung test with no output, not an
+// assertion. Sizing a buffer "big enough" only moves the cliff.
+func collectAll(c prometheus.Collector) []prometheus.Metric {
+	ch := make(chan prometheus.Metric)
+	var collected []prometheus.Metric
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for m := range ch {
+			collected = append(collected, m)
+		}
+	}()
+	c.Collect(ch)
+	close(ch)
+	<-done
+	return collected
+}
+
 // upOnly narrows the collector to kea_up so ToFloat64 sees a single metric.
 type upOnly struct{ c *collector }
 
 func (u upOnly) Describe(ch chan<- *prometheus.Desc) { ch <- u.c.up }
 func (u upOnly) Collect(ch chan<- prometheus.Metric) {
-	tmp := make(chan prometheus.Metric, 256)
-	u.c.Collect(tmp)
-	close(tmp)
-	for m := range tmp {
+	for _, m := range collectAll(u.c) {
 		if strings.Contains(m.Desc().String(), `"kea_up"`) {
 			ch <- m
 		}
@@ -324,8 +342,7 @@ func TestConcurrentScrapesAreRaceFree(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ch := make(chan prometheus.Metric, 64)
-			c.Collect(ch)
+			collectAll(c)
 		}()
 	}
 	wg.Wait()
@@ -615,11 +632,7 @@ func TestUnparseableStatisticIsLoggedOnceNotDroppedSilently(t *testing.T) {
 	defer srv.Close()
 
 	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
-	ch := make(chan prometheus.Metric, 64)
-	c.Collect(ch)
-	close(ch)
-	for range ch { //nolint:revive // draining; the assertion is on c.unhandled
-	}
+	collectAll(c)
 
 	c.unhandledMu.Lock()
 	defer c.unhandledMu.Unlock()
@@ -884,5 +897,62 @@ func TestUnhandledStatisticsAreCounted(t *testing.T) {
 	c.unhandledMu.Unlock()
 	if got != want {
 		t.Errorf("gauge = %v, collector tracked %v", got, want)
+	}
+}
+
+func TestEmptyResponseArrayIsAnError(t *testing.T) {
+	// Kea wraps every response in an array with one entry per service the
+	// command reached. A zero-length list therefore carries no result at all
+	// and must not be read as "succeeded with nothing to report".
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	k := &keaClient{url: srv.URL, client: srv.Client()}
+	_, err := k.call(t.Context(), "status-get")
+	if err == nil {
+		t.Fatal("call succeeded against an empty response array")
+	}
+	if !strings.Contains(err.Error(), "empty response array") {
+		t.Errorf("error does not explain the empty array: %v", err)
+	}
+}
+
+func TestCollectDoesNotDependOnAChannelBuffer(t *testing.T) {
+	// Builds the channel here rather than calling collectAll: routing through
+	// the helper under test cannot demonstrate anything about the helper. The
+	// property is that Collect completes against an UNBUFFERED channel, which
+	// is what a registry Gather does and what the old fixed-size buffers only
+	// approximated.
+	srv := keaStub(t, fixture(t, "statistic-get-all.json"), fixture(t, "status-get.json"))
+	defer srv.Close()
+	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+
+	ch := make(chan prometheus.Metric)
+	done := make(chan int, 1)
+	go func() {
+		n := 0
+		for range ch {
+			n++
+		}
+		done <- n
+	}()
+	c.Collect(ch)
+	close(ch)
+
+	var n int
+	select {
+	case n = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Collect did not complete against an unbuffered channel")
+	}
+
+	// A floor, not an equality: adding metrics is expected, losing them is a
+	// regression. 29 is what the real fixture produces today.
+	const emittedToday = 29
+	if n < emittedToday {
+		t.Errorf("collector emitted %d metrics, want at least %d", n, emittedToday)
 	}
 }
