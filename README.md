@@ -22,8 +22,13 @@ statistic dimension introduced in 3.x.
 | --- | --- | --- |
 | `kea_dhcp4_addresses_assigned` | `subnet` | leases currently issued |
 | `kea_dhcp4_addresses_capacity` | `subnet` | pool size |
+| `kea_dhcp4_addresses_declined` | `subnet` | addresses withdrawn by a DHCPDECLINE |
 | `kea_dhcp4_packets_received_total` | `type` | DHCPv4 packets in, by op |
 | `kea_dhcp4_packets_sent_total` | `type` | DHCPv4 packets out, by op |
+| `kea_dhcp4_packets_dropped_total` | — | inbound packets dropped, **total** |
+| `kea_dhcp4_packets_dropped_by_reason_total` | `reason` | the same drops, by reason — see the warning below |
+| `kea_dhcp4_allocation_failures_by_scope_total` | `scope` | server-wide allocation failures, partitioned by lookup scope |
+| `kea_dhcp4_allocation_failures_by_cause_total` | `cause` | the **same** failures, partitioned by cause |
 | `kea_dhcp4_ha_enabled` | — | 1 when Kea reports an HA relationship, 0 when the hook is not loaded |
 | `kea_dhcp4_ha_local_state_info` | `state`, `role`, `mode` | HA state of this peer |
 | `kea_dhcp4_ha_partner_in_touch` | — | 1 once the partner has been contacted |
@@ -36,15 +41,73 @@ statistic dimension introduced in 3.x.
 | `kea_exporter_unhandled_statistics` | — | count of Kea statistics with no mapping here |
 | `kea_exporter_build_info` | `version`, `revision`, `goversion` | build identity (value always 1) |
 
+### Counting failures without double-counting them
+
+Kea records one event in several statistics at once, so some of these metrics
+deliberately do **not** share a label. Reading them as if they did doubles the
+numbers.
+
+**Allocation failures.** Kea counts a single failure in two independent
+branches ([`alloc_engine.cc:5203-5264`](https://github.com/isc-projects/kea/blob/Kea-3.2.0/src/lib/dhcpsrv/alloc_engine.cc#L5203-L5264)):
+`shared-network` **xor** `subnet`, then `no-pools` **xor** `attempts-exhausted`.
+Scope and cause are therefore two *different* partitions of the same events, and
+each sums to the real total on its own:
+
+```promql
+# Either of these is the real failure rate. Adding them together is not.
+sum(rate(kea_dhcp4_allocation_failures_by_scope_total[5m]))
+sum(rate(kea_dhcp4_allocation_failures_by_cause_total[5m]))
+
+# Why did allocation fail?
+sum by (cause) (rate(kea_dhcp4_allocation_failures_by_cause_total[5m]))
+```
+
+`attempts-exhausted` is this exporter's label for Kea's `v4-allocation-fail`.
+Note Kea's own ARM calls that statistic the *"number of total address allocation
+failures"*, which the source contradicts — it is the `else` branch of
+`total_attempts == 0`, i.e. a peer of `no-pools`, not their sum. The label name
+says what it actually counts.
+
+Several statistics are deliberately **not** exported, each because exporting it
+would double something already counted: the `pkt4-received` / `pkt4-sent` grand
+totals, the server-wide `assigned-addresses` and `declined-addresses` (sums of
+their per-subnet forms), and two allocation-failure cases.
+`v4-allocation-fail-classes` counts failures where the client belonged to any
+class — but Kea adds the `ALL` class to every packet
+([`dhcp4_srv.cc:642`](https://github.com/isc-projects/kea/blob/Kea-3.2.0/src/bin/dhcp4/dhcp4_srv.cc#L642)),
+so it tracks the by-cause total rather than isolating anything. And the
+per-subnet `subnet[N].v4-allocation-fail*` keys duplicate the globals shown
+here; the globals are used because Kea does not create the per-subnet ones
+until the first failure, so a healthy server would otherwise export no series
+at all.
+
+**Dropped packets.** The reasons *are* an exact partition of the total: Kea
+records a reason, then its caller bumps the drop
+([`dhcp4_srv.cc:1496-1499`](https://github.com/isc-projects/kea/blob/Kea-3.2.0/src/bin/dhcp4/dhcp4_srv.cc#L1496-L1499)).
+So `sum(kea_dhcp4_packets_dropped_by_reason_total) == kea_dhcp4_packets_dropped_total` —
+use one or the other, never their sum. The total exists separately because it
+stays correct when a Kea release adds a reason this exporter does not yet know.
+
+**Declined addresses.** `kea_dhcp4_addresses_declined` is a subset of
+`kea_dhcp4_addresses_assigned`, not a sibling of it. Kea deliberately keeps
+declined leases counted as assigned so that pool utilisation stays meaningful,
+so `assigned / capacity` is already right and `assigned + declined` is not.
+
+### HA
+
 `kea_dhcp4_ha_partner_last_contact_seconds` is deliberately **absent** rather
 than 0 before first contact — Kea reports age 0 in that state, which reads on a
 dashboard as "contacted 0 seconds ago". Pair it with
 `kea_dhcp4_ha_partner_in_touch`.
 
+### Build identity
+
 `--version` prints the same identity as `kea_exporter_build_info`. For a
 released image both come from the build; for a local `go build` the version
 reads `dev` and the revision comes from Go's VCS stamping, suffixed `-dirty`
 when the working tree had uncommitted changes.
+
+### Where the numbers come from
 
 On each `/metrics` request the exporter POSTs `statistic-get-all` and
 `status-get` to the `kea-dhcp4` HTTP control socket and translates the replies.

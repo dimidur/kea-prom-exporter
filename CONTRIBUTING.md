@@ -51,6 +51,18 @@ daemon's behaviour.
 If you add support for statistics that the existing fixtures don't contain,
 please add a fixture captured from a real Kea rather than composing one by hand.
 
+There is one carve-out, and it is narrow. Some statistics only appear once
+something has gone wrong — Kea does not create the per-subnet
+`v4-allocation-fail*` observations until a lease request actually fails — and
+inducing that on a production DHCP server to take a capture is not reasonable.
+`testdata/statistic-get-all-with-failures.json` covers those. It is *derived
+from* the real capture rather than written from scratch: the same keys, the
+same sample shape and history, with the failure counters raised to values that
+satisfy the relationships Kea's source guarantees. If you need to extend it,
+derive it the same way; do not hand-write a fresh document, because the failure
+mode is exactly the one this section warns about — a fixture that encodes what
+you believe instead of what the daemon does.
+
 ## Test style
 
 Every test opens with a comment stating the behaviour under test and why it is

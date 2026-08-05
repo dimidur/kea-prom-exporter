@@ -36,10 +36,17 @@ type collector struct {
 	// dhcp4 lease metrics, subnet-scoped.
 	addressesAssigned *prometheus.Desc
 	addressesCapacity *prometheus.Desc
+	addressesDeclined *prometheus.Desc
 
 	// dhcp4 packet counters.
-	pkt4Received *prometheus.Desc
-	pkt4Sent     *prometheus.Desc
+	pkt4Received    *prometheus.Desc
+	pkt4Sent        *prometheus.Desc
+	pkt4Dropped     *prometheus.Desc
+	pkt4DropReasons *prometheus.Desc
+
+	// Allocation failures, split the way Kea actually counts them.
+	allocFailScope *prometheus.Desc
+	allocFailCause *prometheus.Desc
 
 	// HA state.
 	haEnabled        *prometheus.Desc
@@ -74,11 +81,15 @@ type collector struct {
 	// Injected rather than taken from slog.Default() at each call site, so a
 	// test can assert on what the collector logs without mutating a global.
 	log *slog.Logger
+
+	// Built once. It was rebuilt per statistic per scrape, which is ~33 map
+	// constructions a scrape for a value that never changes.
+	stats map[statID]statMetric
 }
 
 func newCollector(k *keaClient) *collector {
 	const ns = "kea_dhcp4"
-	return &collector{
+	c := &collector{
 		kea:       k,
 		build:     buildIdentity(),
 		unhandled: make(map[string]struct{}),
@@ -95,10 +106,13 @@ func newCollector(k *keaClient) *collector {
 			[]string{"command"}, nil),
 
 		addressesAssigned: prometheus.NewDesc(
-			ns+"_addresses_assigned", "Currently assigned IPv4 addresses in the pool.",
+			ns+"_addresses_assigned", "Currently assigned IPv4 addresses in the pool. Includes declined addresses (dhcp4_srv.cc:4455-4458 at Kea-3.2.0): Kea keeps them assigned so pool-utilisation stays meaningful, so do not add "+ns+"_addresses_declined to this.",
 			[]string{"subnet"}, nil),
 		addressesCapacity: prometheus.NewDesc(
 			ns+"_addresses_capacity", "Pool size: total IPv4 addresses available in the subnet.",
+			[]string{"subnet"}, nil),
+		addressesDeclined: prometheus.NewDesc(
+			ns+"_addresses_declined", "Addresses currently withdrawn from the pool by a DHCPDECLINE.",
 			[]string{"subnet"}, nil),
 
 		pkt4Received: prometheus.NewDesc(
@@ -107,6 +121,23 @@ func newCollector(k *keaClient) *collector {
 		pkt4Sent: prometheus.NewDesc(
 			ns+"_packets_sent_total", "Total DHCPv4 packets sent by type.",
 			[]string{"type"}, nil),
+		pkt4Dropped: prometheus.NewDesc(
+			ns+"_packets_dropped_total",
+			"Total inbound DHCPv4 packets dropped. Equal to the sum of "+ns+"_packets_dropped_by_reason_total, and stays correct when a Kea release adds a reason this exporter does not know.",
+			nil, nil),
+		pkt4DropReasons: prometheus.NewDesc(
+			ns+"_packets_dropped_by_reason_total",
+			"Inbound DHCPv4 packets dropped, by reason. These sum to "+ns+"_packets_dropped_total, so use one or the other -- adding them together double-counts.",
+			[]string{"reason"}, nil),
+
+		allocFailScope: prometheus.NewDesc(
+			ns+"_allocation_failures_by_scope_total",
+			"Server-wide address allocation failures by where the client was looked up. A true partition: shared-network and subnet sum to the total.",
+			[]string{"scope"}, nil),
+		allocFailCause: prometheus.NewDesc(
+			ns+"_allocation_failures_by_cause_total",
+			"Server-wide address allocation failures by cause. A second true partition of the SAME failures: no-pools and attempts-exhausted also sum to the total, so do not add this to "+ns+"_allocation_failures_by_scope_total.",
+			[]string{"cause"}, nil),
 
 		haEnabled: prometheus.NewDesc(
 			ns+"_ha_enabled", "1 when Kea reports an HA relationship, 0 when the HA hook is not loaded.",
@@ -139,6 +170,8 @@ func newCollector(k *keaClient) *collector {
 			"Number of distinct Kea statistics seen that this exporter has no mapping for.",
 			nil, nil),
 	}
+	c.stats = c.buildStatMetrics()
+	return c
 }
 
 func (c *collector) Describe(ch chan<- *prometheus.Desc) {
@@ -147,8 +180,13 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.scrapeErrors
 	ch <- c.addressesAssigned
 	ch <- c.addressesCapacity
+	ch <- c.addressesDeclined
 	ch <- c.pkt4Received
 	ch <- c.pkt4Sent
+	ch <- c.pkt4Dropped
+	ch <- c.pkt4DropReasons
+	ch <- c.allocFailScope
+	ch <- c.allocFailCause
 	ch <- c.haEnabled
 	ch <- c.haLocalState
 	ch <- c.haPartnerAge
@@ -249,12 +287,17 @@ type statMetric struct {
 	typ  prometheus.ValueType
 }
 
-func (c *collector) statMetrics() map[statID]statMetric {
+func (c *collector) buildStatMetrics() map[statID]statMetric {
 	return map[statID]statMetric{
 		statAddressesAssigned: {c.addressesAssigned, prometheus.GaugeValue},
 		statAddressesCapacity: {c.addressesCapacity, prometheus.GaugeValue},
 		statPacketsReceived:   {c.pkt4Received, prometheus.CounterValue},
 		statPacketsSent:       {c.pkt4Sent, prometheus.CounterValue},
+		statAddressesDeclined: {c.addressesDeclined, prometheus.GaugeValue},
+		statPacketsDropped:    {c.pkt4Dropped, prometheus.CounterValue},
+		statDropReason:        {c.pkt4DropReasons, prometheus.CounterValue},
+		statAllocFailByScope:  {c.allocFailScope, prometheus.CounterValue},
+		statAllocFailByCause:  {c.allocFailCause, prometheus.CounterValue},
 	}
 }
 
@@ -270,7 +313,7 @@ func (c *collector) emitStat(ch chan<- prometheus.Metric, key string, value floa
 		return
 	}
 
-	m, ok := c.statMetrics()[id]
+	m, ok := c.stats[id]
 	if !ok {
 		// classifyStat named an ID with no descriptor behind it. That is a bug
 		// in this package, not drift in Kea, so it must not be counted as an
@@ -291,7 +334,7 @@ func (c *collector) noteUnhandled(key string) {
 		return
 	}
 	c.unhandled[key] = struct{}{}
-	// Debug, not info: a stock Kea reports ~19 statistics this exporter does
+	// Debug, not info: a stock Kea reports statistics this exporter does
 	// not map, and printing all of them on the first scrape buries anything
 	// that matters.
 	c.log.Debug("unhandled statistic; extend the collector to map it", "statistic", key)

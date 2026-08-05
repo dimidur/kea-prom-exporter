@@ -5,9 +5,9 @@
 // auth) and translates the responses into Prometheus metrics.
 //
 // Scope: a headline metric set covering lease pool utilisation, packet
-// counters, and HA peer state -- not full statistic coverage. Forward-compatible
-// by design — an unknown statistic key is logged once and ignored
-// rather than failing the scrape, so a Kea release that adds new
+// counters, and HA peer state -- not full statistic coverage.
+// Forward-compatible by design: an unknown statistic key is logged once and
+// ignored rather than failing the scrape, so a Kea release that adds new
 // statistics degrades to missing metrics instead of no metrics. The names go
 // to the debug log; the count is always exported as
 // kea_exporter_unhandled_statistics.
