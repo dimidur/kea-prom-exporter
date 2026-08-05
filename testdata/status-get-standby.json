@@ -1,0 +1,60 @@
+[
+    {
+        "arguments": {
+            "csv-lease-file": "/kea/leases/dhcp4.csv",
+            "dhcp-state": {
+                "disabled-by-db-connection": [],
+                "disabled-by-local-command": [],
+                "disabled-by-remote-command": [],
+                "disabled-by-user": false,
+                "globally-disabled": false
+            },
+            "high-availability": [
+                {
+                    "ha-mode": "hot-standby",
+                    "ha-servers": {
+                        "local": {
+                            "role": "standby",
+                            "scopes": [],
+                            "server-name": "kea-standby",
+                            "state": "hot-standby",
+                            "system-time": "2026-08-05 17:25:59"
+                        },
+                        "remote": {
+                            "age": 0,
+                            "analyzed-packets": 0,
+                            "clock-skew": 0,
+                            "communication-interrupted": false,
+                            "connecting-clients": 0,
+                            "in-touch": true,
+                            "last-scopes": [
+                                "kea-primary"
+                            ],
+                            "last-state": "hot-standby",
+                            "role": "primary",
+                            "server-name": "kea-primary",
+                            "system-time": "2026-08-05 17:25:59",
+                            "unacked-clients": 0,
+                            "unacked-clients-left": 0
+                        }
+                    }
+                }
+            ],
+            "multi-threading-enabled": true,
+            "packet-queue-size": 28,
+            "packet-queue-statistics": [
+                1.0,
+                1.0,
+                1.0
+            ],
+            "pid": 1,
+            "reload": 940669,
+            "sockets": {
+                "status": "ready"
+            },
+            "thread-pool-size": 4,
+            "uptime": 1107848
+        },
+        "result": 0
+    }
+]

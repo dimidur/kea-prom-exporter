@@ -7,6 +7,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -18,6 +19,13 @@ import (
 // `--log-level=warning` (the syslog/Python spelling, which slog rejects)
 // otherwise silently gives you info.
 func newLogger(level, format string) (*slog.Logger, []error) {
+	return newLoggerTo(os.Stderr, level, format)
+}
+
+// newLoggerTo takes the sink so a test can read what was actually written.
+// Without it the json branch was unobservable: both handlers report the same
+// level, so deleting the json return changed nothing any assertion could see.
+func newLoggerTo(w io.Writer, level, format string) (*slog.Logger, []error) {
 	var problems []error
 
 	var lv slog.Level
@@ -29,12 +37,12 @@ func newLogger(level, format string) (*slog.Logger, []error) {
 	opts := &slog.HandlerOptions{Level: lv}
 	switch {
 	case strings.EqualFold(format, "json"):
-		return slog.New(slog.NewJSONHandler(os.Stderr, opts)), problems
+		return slog.New(slog.NewJSONHandler(w, opts)), problems
 	case strings.EqualFold(format, "text"):
 	default:
 		problems = append(problems, fmt.Errorf("unrecognised --log-format %q, using text; valid values are text and json", format))
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, opts)), problems
+	return slog.New(slog.NewTextHandler(w, opts)), problems
 }
 
 // fatal logs at error level and exits non-zero. slog has no Fatal, and

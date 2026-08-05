@@ -23,10 +23,27 @@ var (
 // re-derived per scrape.
 type buildID struct{ version, revision, goVersion string }
 
+// readBuildInfo is a seam, not indirection for its own sake. Extracting
+// resolveFrom made the logic testable but left this adapter as the only
+// production path and invisible to a test: replacing its body with
+// `resolveFrom(ver, rev, nil, false)` -- which deletes VCS stamping outright --
+// kept the whole suite green. Swapping the function is what closes that.
+var readBuildInfo = debug.ReadBuildInfo
+
 // resolveIdentity takes the injected values as parameters rather than reading
 // the package variables, so it is exercisable from a test without mutating
 // global state -- which is a data race the moment any test runs in parallel.
 func resolveIdentity(ver, rev string) buildID {
+	info, ok := readBuildInfo()
+	return resolveFrom(ver, rev, info, ok)
+}
+
+// resolveFrom is the whole of the logic, with the build info passed in.
+// debug.ReadBuildInfo reports whatever stamped *this* binary, and `go test`
+// does not stamp VCS data into a test binary -- so a test calling
+// resolveIdentity could only skip, which is how the -dirty suffix and the
+// revision lookup were both deletable with the suite still green.
+func resolveFrom(ver, rev string, info *debug.BuildInfo, ok bool) buildID {
 	id := buildID{version: ver, revision: rev, goVersion: runtime.Version()}
 
 	// Both fields get a placeholder rather than being left empty: an empty
@@ -37,7 +54,6 @@ func resolveIdentity(ver, rev string) buildID {
 		id.version = "dev"
 	}
 
-	info, ok := debug.ReadBuildInfo()
 	if ok && info.GoVersion != "" {
 		id.goVersion = info.GoVersion
 	}
