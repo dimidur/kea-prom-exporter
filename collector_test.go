@@ -65,13 +65,12 @@ func TestCollectAgainstRealKeaOutput(t *testing.T) {
 
 	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
 
-	// Exact values, not "the family is non-empty". The previous version of
-	// this test asserted only presence, which let a mislabelled aggregate
-	// counter through (pkt4-sent emitted as type="sent" beside the real
-	// types, doubling any sum()).
+	// Exact values, not "the family is non-empty": a presence check passes
+	// for a mislabelled aggregate, such as pkt4-sent emitted as type="sent"
+	// beside the real types, which doubles any sum().
 	// Act
 	expected := `
-# HELP kea_dhcp4_addresses_assigned Currently assigned IPv4 addresses in the pool. Includes declined addresses (dhcp4_srv.cc:4455-4458 at Kea-3.2.0): Kea keeps them assigned so pool-utilisation stays meaningful, so do not add kea_dhcp4_addresses_declined to this.
+# HELP kea_dhcp4_addresses_assigned Currently assigned IPv4 addresses in the pool. Includes declined addresses: Kea keeps them assigned so pool-utilisation stays meaningful, so do not add kea_dhcp4_addresses_declined to this.
 # TYPE kea_dhcp4_addresses_assigned gauge
 kea_dhcp4_addresses_assigned{subnet="1"} 23
 # HELP kea_dhcp4_addresses_capacity Pool size: total IPv4 addresses available in the subnet.
@@ -87,19 +86,19 @@ kea_dhcp4_addresses_capacity{subnet="1"} 121
 	haExpected := `
 # HELP kea_dhcp4_ha_communication_interrupted 1 if HA communication with the partner is interrupted, else 0.
 # TYPE kea_dhcp4_ha_communication_interrupted gauge
-kea_dhcp4_ha_communication_interrupted 0
+kea_dhcp4_ha_communication_interrupted{peer="kea-standby",relationship="kea-primary"} 0
 # HELP kea_dhcp4_ha_enabled 1 when Kea reports an HA relationship, 0 when the HA hook is not loaded.
 # TYPE kea_dhcp4_ha_enabled gauge
 kea_dhcp4_ha_enabled 1
 # HELP kea_dhcp4_ha_local_state_info HA state of this peer (info-metric; value always 1; state in label).
 # TYPE kea_dhcp4_ha_local_state_info gauge
-kea_dhcp4_ha_local_state_info{mode="hot-standby",role="primary",state="hot-standby"} 1
+kea_dhcp4_ha_local_state_info{mode="hot-standby",peer="kea-standby",relationship="kea-primary",role="primary",state="hot-standby"} 1
 # HELP kea_dhcp4_ha_partner_in_touch 1 once this peer has been in contact with its HA partner, else 0.
 # TYPE kea_dhcp4_ha_partner_in_touch gauge
-kea_dhcp4_ha_partner_in_touch 1
+kea_dhcp4_ha_partner_in_touch{peer="kea-standby",relationship="kea-primary"} 1
 # HELP kea_dhcp4_ha_partner_last_contact_seconds Seconds since the last successful heartbeat from the HA partner. Absent until the partner has been contacted at least once.
 # TYPE kea_dhcp4_ha_partner_last_contact_seconds gauge
-kea_dhcp4_ha_partner_last_contact_seconds 2
+kea_dhcp4_ha_partner_last_contact_seconds{peer="kea-standby",relationship="kea-primary"} 2
 `
 	if err := testutil.CollectAndCompare(c, strings.NewReader(haExpected),
 		"kea_dhcp4_ha_local_state_info", "kea_dhcp4_ha_communication_interrupted",
@@ -347,9 +346,9 @@ func TestPerPoolStatisticsAreNotDoubleCounted(t *testing.T) {
 }
 
 func TestConcurrentScrapesAreRaceFree(t *testing.T) {
-	// Prometheus may call Collect concurrently when scrapes overlap. The
-	// scrape-error counter used to be a package-level uint64 incremented
-	// without synchronisation, which `go test -race` flags here.
+	// Prometheus may call Collect concurrently when scrapes overlap, so
+	// per-collector state must be safe under that. An unsynchronised
+	// scrape-error counter is what `go test -race` flags here.
 	// Arrange
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "down", http.StatusInternalServerError)
@@ -569,8 +568,8 @@ func TestScrapeDurationIsEmittedEvenWhenKeaIsDown(t *testing.T) {
 
 func TestKeaUpIsZeroWhenOnlyTheHACommandFails(t *testing.T) {
 	// The mirror of TestPartialFailureIsVisible. kea_up is documented as 0 if
-	// ANY command failed, but only the statistic-get-all direction was
-	// covered, so dropping the haErr term from the condition went unnoticed.
+	// ANY command failed; this covers the status-get direction, so dropping
+	// the haErr term from the condition is caught.
 
 	// Arrange
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -615,11 +614,12 @@ func TestExportedMetricSetIsExactlyTheContract(t *testing.T) {
 		"kea_dhcp4_addresses_declined":                 {"subnet"},
 		"kea_dhcp4_allocation_failures_by_cause_total": {"cause"},
 		"kea_dhcp4_allocation_failures_by_scope_total": {"scope"},
-		"kea_dhcp4_ha_communication_interrupted":       {},
+		"kea_dhcp4_ha_communication_interrupted":       {"peer", "relationship"},
 		"kea_dhcp4_ha_enabled":                         {},
-		"kea_dhcp4_ha_local_state_info":                {"mode", "role", "state"},
-		"kea_dhcp4_ha_partner_in_touch":                {},
-		"kea_dhcp4_ha_partner_last_contact_seconds":    {},
+		"kea_dhcp4_ha_local_state_info":                {"mode", "peer", "relationship", "role", "state"},
+		"kea_dhcp4_ha_partner_in_touch":                {"peer", "relationship"},
+		"kea_dhcp4_ha_partner_last_contact_seconds":    {"peer", "relationship"},
+		"kea_dhcp4_ha_partner_state_info":              {"peer", "relationship", "role", "state"},
 		"kea_dhcp4_packets_dropped_by_reason_total":    {"reason"},
 		"kea_dhcp4_packets_dropped_total":              {},
 		"kea_dhcp4_packets_received_total":             {"type"},

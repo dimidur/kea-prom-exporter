@@ -5,6 +5,10 @@ package main
 // One reason to change: Kea renamed, added, or removed a statistic.
 // The metric descriptors themselves live in collector.go, which changes for a
 // different reason -- the exported contract.
+//
+// Why a given statistic is exported, ignored, or split across two metrics is
+// in docs/kea-behaviour.md. The comments below say only what is needed to
+// edit a row correctly.
 
 import (
 	"slices"
@@ -55,53 +59,35 @@ type statTarget struct {
 // descriptor field and NewDesc in collector.go, a line in Describe, and a
 // statMetrics row. The tables remove the branching, not the wiring.
 var exactStats = map[string]statTarget{
-	// Kea's grand totals, not a packet type: pkt4-sent equals
-	// pkt4-offer-sent + pkt4-ack-sent exactly. Exporting them beside the
-	// per-type series made sum(kea_dhcp4_packets_sent_total) return double.
+	// Grand totals, not packet types; exporting them beside the per-type
+	// series doubles sum().
 	"pkt4-received": {id: statIgnored},
 	"pkt4-sent":     {id: statIgnored},
 
-	// Server-wide lease counters. Kea increments these and their
-	// subnet[N] equivalents for the same event, so the global one is the sum
-	// across subnets; exporting both would double any sum(). The per-subnet
-	// form is exported instead, being strictly more informative.
+	// Duplicates of the subnet[N] equivalents, which are exported instead.
 	"assigned-addresses": {id: statIgnored},
 	"declined-addresses": {id: statIgnored},
 
-	// Allocation failures are taken from the GLOBAL keys, unlike the lease
-	// gauges above. Kea pre-creates the per-subnet lease observations at
-	// startup, but not the per-subnet allocation-fail ones: those spring into
-	// existence on the first failure. Exporting only the subnet form would
-	// mean a healthy server exports no series at all, so an alert could not
-	// tell "no failures" from "exporter broken". The globals are always
-	// present and are the cross-subnet sum.
-	//
-	// Kea counts ONE failure in two independent branches
-	// (alloc_engine.cc:5203-5264 at Kea-3.2.0): shared-network XOR subnet,
-	// then no-pools XOR attempts-exhausted. Scope and cause are therefore two
-	// different partitions of the same events, which is why they are two
-	// metrics -- under one `reason` label, sum() would report double.
+	// The GLOBAL keys, unlike the lease gauges above: Kea does not create the
+	// per-subnet ones until the first failure. Two metrics, not one labelled
+	// metric, because scope and cause are separate partitions of the same
+	// events and would double-count under a single label.
 	"v4-allocation-fail-shared-network": {id: statAllocFailByScope, extra: []string{"shared-network"}},
 	"v4-allocation-fail-subnet":         {id: statAllocFailByScope, extra: []string{"subnet"}},
 	"v4-allocation-fail-no-pools":       {id: statAllocFailByCause, extra: []string{"no-pools"}},
 	"v4-allocation-fail":                {id: statAllocFailByCause, extra: []string{"attempts-exhausted"}},
 
-	// Not exported. Kea adds the ALL class to every packet
-	// (dhcp4_srv.cc:642 at Kea-3.2.0), so `classes` is never empty by the
-	// time allocation runs, and this counter tracks the by-cause total
-	// rather than isolating a classification-driven subset.
+	// Tracks the by-cause total rather than a class-driven subset, because
+	// Kea classes every packet as ALL.
 	"v4-allocation-fail-classes": {id: statIgnored},
 
-	// Total inbound packets dropped. Kea bumps this in the caller once a
-	// reason has been recorded (dhcp4_srv.cc:1496-1499 at Kea-3.2.0,
-	// "Specific drop cause stat was increased by accept* methods"), so the
-	// reasons below are an exact partition of it: sum(reasons) == total.
+	// The total. Kea records a reason alongside it, so the reasons below are
+	// an exact partition: sum(reasons) == total.
 	"pkt4-receive-drop": {id: statPacketsDropped},
 
-	// The reasons. A separate metric from the total rather than a label on it,
-	// because the total stays meaningful when a Kea release adds a reason this
-	// exporter does not know about yet -- and because adding the two together
-	// would double-count.
+	// The reasons, as their own metric rather than a label on the total: the
+	// total stays correct when a Kea release adds a reason this exporter does
+	// not know, and adding the two together double-counts.
 	"pkt4-queue-full":        {id: statDropReason, extra: []string{"queue-full"}},
 	"pkt4-parse-failed":      {id: statDropReason, extra: []string{"parse-failed"}},
 	"pkt4-processing-failed": {id: statDropReason, extra: []string{"processing-failed"}},
@@ -114,9 +100,8 @@ var exactStats = map[string]statTarget{
 }
 
 // subnetStats covers the suffix of a `subnet[N].<suffix>` key. The subnet ID
-// is the only label; rows here do not use `extra`, and classifySubnetStat
-// does not consult it -- a test enforces that, because a silently dropped
-// label is worse than a missing feature.
+// is the only label; rows do not use `extra` and classifySubnetStat does not
+// consult it, which a test enforces.
 //
 // Allocation failures are handled on the global keys instead; see exactStats.
 var subnetStats = map[string]statTarget{
@@ -134,32 +119,27 @@ var subnetStats = map[string]statTarget{
 }
 
 // packetStats covers the suffix of a `pkt4-<op>-<suffix>` key; the label is
-// the operation. A table rather than a switch so that every mapped statID is
-// reachable from the tables, which is what lets the tests derive the mapped
-// set instead of restating it.
+// the operation. A table rather than a switch so the tests can derive the
+// mapped set instead of restating it.
 //
-// Rows here support neither `extra` nor statIgnored: classifyPacketStat
-// implements neither, because nothing needs them and an untested branch is
-// worse than a missing one. Add the handling with the row that needs it.
+// Rows support neither `extra` nor statIgnored -- classifyPacketStat
+// implements neither. Add the handling with the row that needs it.
 var packetStats = map[string]statTarget{
 	"-received": {id: statPacketsReceived},
 	"-sent":     {id: statPacketsSent},
 }
 
 // classifyStat resolves a Kea statistic name to what it maps onto and the
-// label values that accompany it -- nil for an unlabelled metric. Returning
-// the labels as a slice rather than a string plus a "has a label" flag keeps
-// the arity in one place: a mismatch between the descriptor and the number of
-// values passed panics inside MustNewConstMetric, and Registry.Gather runs
-// collectors without recovering, so that panic kills the process on a scrape.
+// label values that accompany it -- nil for an unlabelled metric. Labels are
+// a slice so the arity has one source; getting it wrong kills the process
+// rather than failing a scrape (docs/kea-behaviour.md).
 //
 // It never returns an error: an unrecognised key is statUnmapped, which the
 // caller logs once and counts.
 func classifyStat(key string) (statID, []string) {
 	if target, ok := exactStats[key]; ok {
-		// Cloned rather than returned directly: target.extra is the package-level
-		// table's backing array, and one `labels = append(labels, ...)` at a
-		// call site would corrupt it for the rest of the process.
+		// Cloned: the table's slice is shared, and one append at a call site
+		// would corrupt it process-wide.
 		return target.id, slices.Clone(target.extra)
 	}
 	if strings.HasPrefix(key, "subnet[") {
@@ -184,27 +164,21 @@ func classifySubnetStat(key string) (statID, []string) {
 	subnetID := key[len("subnet["):end]
 	rest := key[end+2:]
 
-	// Per-pool statistics coexist with their per-subnet equivalents on 3.x.
-	// Counting both would inflate reported utilisation, so the pool-scoped
-	// ones are dropped deliberately. Note this swallows unrecognised per-pool
-	// suffixes too, which is the one place statIgnored is broader than a
+	// Per-pool keys coexist with their per-subnet equivalents on 3.x and are
+	// dropped to avoid double-counting. This also swallows unrecognised
+	// per-pool suffixes, the one place statIgnored is broader than a
 	// considered omission.
 	if strings.HasPrefix(rest, "pool[") {
 		return statIgnored, nil
 	}
 	if target, ok := subnetStats[rest]; ok {
-		// Labels accompany a metric, so an ignored statistic carries none --
-		// otherwise a caller could read a label set for something that is
-		// never emitted.
+		// An ignored statistic carries no labels; otherwise a caller could
+		// read a label set for something never emitted.
 		if target.id == statIgnored {
 			return statIgnored, nil
 		}
 		// subnetID may be empty for a malformed `subnet[]` key. The label is
 		// still emitted, because the descriptor has one either way.
-		//
-		// target.extra is deliberately not consulted: no row here carries one,
-		// so honouring it would be an untestable branch. Only exactStats needs
-		// per-key label values.
 		return target.id, []string{subnetID}
 	}
 	return statUnmapped, nil
@@ -216,8 +190,6 @@ func classifyPacketStat(key string) (statID, []string) {
 	op := strings.TrimPrefix(key, "pkt4-")
 	for suffix, target := range packetStats {
 		if strings.HasSuffix(op, suffix) {
-			// As in classifySubnetStat, target.extra is not consulted: the
-			// operation is the only label and no row here carries more.
 			return target.id, []string{strings.TrimSuffix(op, suffix)}
 		}
 	}

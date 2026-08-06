@@ -48,6 +48,11 @@ real output is what this exporter gets wrong if it gets anything wrong, and
 hand-written JSON tends to encode the author's assumptions rather than the
 daemon's behaviour.
 
+Before constructing or editing one, read
+[docs/kea-behaviour.md](docs/kea-behaviour.md). It records what Kea actually
+guarantees — including the constraints that make a plausible-looking payload
+one the daemon would refuse to start with.
+
 If you add support for statistics that the existing fixtures don't contain,
 please add a fixture captured from a real Kea rather than composing one by hand.
 
@@ -62,6 +67,23 @@ satisfy the relationships Kea's source guarantees. If you need to extend it,
 derive it the same way; do not hand-write a fresh document, because the failure
 mode is exactly the one this section warns about — a fixture that encodes what
 you believe instead of what the daemon does.
+
+The same carve-out covers the inline `status-get` payloads in `ha_test.go`, for
+HA topologies that cannot be captured either: a downed partner, a backup
+server, and a hub with several relationships. **Check them against the Kea
+source before trusting them** — a payload the daemon would reject makes a test
+that passes while proving nothing. Two constraints are easy to violate and are
+enforced at config time, not in the `status-get` response:
+
+- Server names must be unique across *all* relationships
+  (`HAConfigParser::parseOne`, `HARelationshipMapper::map`).
+- More than one relationship requires *every* one to be hot-standby
+  (`HAConfigParser::validateRelationships`).
+
+Shape a new HA payload on the ARM's hub-and-spoke example and satisfy yourself
+the daemon would accept it. Cite Kea by symbol name rather than line number:
+line numbers rot silently and a stale-but-precise-looking citation is worse
+than none.
 
 ## Test style
 
