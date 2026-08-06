@@ -8,11 +8,11 @@ rather than a public issue.
 
 ## What this exporter touches
 
-It holds a credential for Kea's **control socket**, which is worth being explicit
-about: that socket is an administrative interface. This exporter only ever issues two
-read commands -- `statistic-get-all` and `status-get` -- but the credential
-it holds is not inherently read-only — anything else able to read that
-credential can drive the control socket fully.
+It holds a credential for Kea's **control socket**, which is worth being
+explicit about: that socket is an administrative interface. This exporter only
+ever issues two read commands -- `statistic-get-all` and `status-get` -- but
+the credential it holds is not inherently read-only — anything else able to
+read that credential can drive the control socket fully.
 
 - **Prefer `--kea-password-file` / `KEA_PASSWORD_FILE`** over the inline password
   flag or env var. An environment variable is visible to anything that can run

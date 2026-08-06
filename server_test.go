@@ -76,7 +76,7 @@ func TestGraceIsActuallyWaitedOut(t *testing.T) {
 func TestSignalHandlingIsReleasedOnShutdown(t *testing.T) {
 	// Restoring default signal handling is what makes an impatient second
 	// SIGTERM kill the process instead of being swallowed. Every other test
-	// passes nil for the callback, so dropping the call went unnoticed.
+	// passes nil for the callback, so this is the only place it is observed.
 
 	// Arrange
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

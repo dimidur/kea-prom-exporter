@@ -1,0 +1,15 @@
+// Prose is hard-wrapped at 80 columns. All rules on by default.
+{
+  "config": {
+    "MD013": {
+      "line_length": 80,
+      // A table row is one line by definition, and code cannot be rewrapped
+      // without breaking it. Long URLs need no exemption -- MD013 already
+      // ignores a line with no space past the limit.
+      "tables": false,
+      "code_blocks": false
+    }
+  },
+  "globs": ["**/*.md"],
+  "ignores": ["node_modules/**"]
+}

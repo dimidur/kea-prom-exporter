@@ -75,6 +75,13 @@ jobs:
       - name: build (host arch)
         run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/kea-prom-exporter .
 
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: markdownlint
+        uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24.2.0
+
   security:
     runs-on: ubuntu-latest
     steps:

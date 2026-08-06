@@ -16,10 +16,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
+// Tests for statmap.go: the statistic-name mapping.
+//
+// Kea symbols named below hold across the supported Kea releases; the
+// supported set is in README.md.
+
 // classifyStat is a pure function of the key, so the mapping can be pinned
-// exhaustively without constructing a collector or a fake Kea. That is the
-// point of separating it: the old form was a branch chain inside an emitter,
-// reachable only through a full scrape.
+// exhaustively without constructing a collector or a fake Kea, which a branch
+// chain inside an emitter cannot be.
 
 func TestClassifyStat(t *testing.T) {
 	// Arrange
@@ -492,8 +496,9 @@ func TestDropReasonsSumToTheDropTotal(t *testing.T) {
 
 func assertDropReasonsSumToTotal(t *testing.T, fixtureName string) {
 	t.Helper()
-	// Kea records a reason and then its caller bumps the drop
-	// (dhcp4_srv.cc:1496-1499 at Kea-3.2.0), so the two must agree exactly. If
+	// Kea records a reason and bumps the drop alongside it, as in
+	// Dhcpv4Srv::processPacket, so the two must agree exactly. Several sites
+	// bump the total and each records a reason at the same time. If they
 	// diverge, either Kea changed or a reason is mapped onto the wrong metric.
 
 	// Arrange -- both fixtures: the real capture is the evidence about Kea,
@@ -537,10 +542,10 @@ func TestDropMetricsAgainstRealKeaOutput(t *testing.T) {
 	// The evidence about Kea has to come from Kea. The real capture carries a
 	// live instance of the invariant -- pkt4-service-disabled 4 alongside
 	// pkt4-receive-drop 4 -- and every one of the nine drop reasons, because
-	// Kea pre-registers them all at startup (dhcp4_srv.cc:169-204 at
-	// Kea-3.2.0). Pinning
-	// the whole family here is what catches a reason mapped to the wrong
-	// metric or spelled wrong, which a fixture built to satisfy a sum cannot.
+	// Kea initialises every name in its dhcp4_statistics set to 0 at startup.
+	// Pinning the whole family here is what catches a reason mapped to the
+	// wrong metric or spelled wrong, which a fixture built to satisfy a sum
+	// cannot.
 
 	// Arrange
 	srv := keaStub(t, fixture(t, "statistic-get-all.json"), fixture(t, "status-get.json"))
@@ -774,16 +779,13 @@ func TestDropReasonsPartitionTheDropTotalOnRealCaptures(t *testing.T) {
 	// so the reasons sum to the total. Verified on all three real captures,
 	// including a hot-standby standby whose HA hook drops every packet.
 	//
-	// An earlier version also asserted that the gap between pkt4-received and
-	// the typed counters equals the drops occurring before typing. That is not
-	// modellable and was wrong twice, first as an equality then as a band. The
-	// live standby proved why: 98836 pkt4-not-for-us with every typed counter
-	// at zero, because HAImpl::buffer4Receive (ha_impl.cc:127 at Kea-3.2.0)
-	// drops in the buffer4_receive callout, which runs at dhcp4_srv.cc:1398 at
-	// Kea-3.2.0 -- before typing, which happens at dhcp4_srv.cc:1476 at
-	// Kea-3.2.0. The same statistic is also bumped after typing by
-	// acceptServerId (dhcp4_srv.cc:5001 at Kea-3.2.0), so a hook can drop on
-	// either side and no fixed "pre-typing" set exists.
+	// No relation is asserted between pkt4-received and the typed counters.
+	// The gap between them is not the set of drops occurring before typing,
+	// and no fixed "pre-typing" set exists: HAImpl::buffer4Receive drops
+	// not-for-us in the buffer4_receive callout, which Dhcpv4Srv::processPacket
+	// runs before it types the packet, while Dhcpv4Srv::acceptServerId bumps
+	// the same statistic after typing. The live standby capture shows the
+	// consequence -- 98836 pkt4-not-for-us with every typed counter at zero.
 
 	// Arrange
 	reasons := []string{
@@ -859,13 +861,13 @@ func TestStandbyPeerFromALiveCapture(t *testing.T) {
 kea_dhcp4_ha_enabled 1
 # HELP kea_dhcp4_ha_local_state_info HA state of this peer (info-metric; value always 1; state in label).
 # TYPE kea_dhcp4_ha_local_state_info gauge
-kea_dhcp4_ha_local_state_info{mode="hot-standby",role="standby",state="hot-standby"} 1
+kea_dhcp4_ha_local_state_info{mode="hot-standby",peer="kea-primary",relationship="kea-primary",role="standby",state="hot-standby"} 1
 # HELP kea_dhcp4_ha_partner_in_touch 1 once this peer has been in contact with its HA partner, else 0.
 # TYPE kea_dhcp4_ha_partner_in_touch gauge
-kea_dhcp4_ha_partner_in_touch 1
+kea_dhcp4_ha_partner_in_touch{peer="kea-primary",relationship="kea-primary"} 1
 # HELP kea_dhcp4_ha_partner_last_contact_seconds Seconds since the last successful heartbeat from the HA partner. Absent until the partner has been contacted at least once.
 # TYPE kea_dhcp4_ha_partner_last_contact_seconds gauge
-kea_dhcp4_ha_partner_last_contact_seconds 0
+kea_dhcp4_ha_partner_last_contact_seconds{peer="kea-primary",relationship="kea-primary"} 0
 `
 
 	// Act + Assert -- age 0 with in-touch true must be exported, not withheld:

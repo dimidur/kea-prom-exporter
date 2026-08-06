@@ -6,6 +6,9 @@ package main
 // One reason to change: the exported metric contract -- a metric added,
 // renamed, or relabelled. Which Kea statistic feeds which metric is
 // statmap.go.
+//
+// Kea symbols named below hold across the supported Kea releases; the
+// supported set is in README.md.
 
 import (
 	"context"
@@ -51,6 +54,7 @@ type collector struct {
 	// HA state.
 	haEnabled        *prometheus.Desc
 	haLocalState     *prometheus.Desc
+	haPartnerState   *prometheus.Desc
 	haPartnerAge     *prometheus.Desc
 	haPartnerInTouch *prometheus.Desc
 	haCommBroken     *prometheus.Desc
@@ -105,8 +109,13 @@ func newCollector(k *keaClient) *collector {
 			"kea_scrape_errors_total", "Cumulative scrape errors since exporter start, by command.",
 			[]string{"command"}, nil),
 
+		// Dhcpv4Srv::declineLease leaves a declined lease counted in
+		// assigned-addresses so that pool utilisation stays meaningful, which
+		// is why assigned/capacity is already correct and assigned+declined
+		// over-counts. The HELP text carries the consequence; the citation
+		// stays here rather than in it, since HELP ships on every scrape.
 		addressesAssigned: prometheus.NewDesc(
-			ns+"_addresses_assigned", "Currently assigned IPv4 addresses in the pool. Includes declined addresses (dhcp4_srv.cc:4455-4458 at Kea-3.2.0): Kea keeps them assigned so pool-utilisation stays meaningful, so do not add "+ns+"_addresses_declined to this.",
+			ns+"_addresses_assigned", "Currently assigned IPv4 addresses in the pool. Includes declined addresses: Kea keeps them assigned so pool-utilisation stays meaningful, so do not add "+ns+"_addresses_declined to this.",
 			[]string{"subnet"}, nil),
 		addressesCapacity: prometheus.NewDesc(
 			ns+"_addresses_capacity", "Pool size: total IPv4 addresses available in the subnet.",
@@ -139,22 +148,30 @@ func newCollector(k *keaClient) *collector {
 			"Server-wide address allocation failures by cause. A second true partition of the SAME failures: no-pools and attempts-exhausted also sum to the total, so do not add this to "+ns+"_allocation_failures_by_scope_total.",
 			[]string{"cause"}, nil),
 
+		// ha_enabled describes the daemon, not any one relationship: it
+		// answers "is the HA hook loaded", which is still meaningful when
+		// there are no relationships to name. It is deliberately the only
+		// unlabelled HA metric.
 		haEnabled: prometheus.NewDesc(
 			ns+"_ha_enabled", "1 when Kea reports an HA relationship, 0 when the HA hook is not loaded.",
 			nil, nil),
 		haLocalState: prometheus.NewDesc(
 			ns+"_ha_local_state_info", "HA state of this peer (info-metric; value always 1; state in label).",
-			[]string{"state", "role", "mode"}, nil),
+			haLabels("state", "role", "mode"), nil),
+		haPartnerState: prometheus.NewDesc(
+			ns+"_ha_partner_state_info",
+			"HA state of the partner as last reported to this peer (info-metric; value always 1). Absent until the partner has been contacted at least once, because Kea reports an empty state until then.",
+			haLabels("state", "role"), nil),
 		haPartnerAge: prometheus.NewDesc(
 			ns+"_ha_partner_last_contact_seconds",
 			"Seconds since the last successful heartbeat from the HA partner. Absent until the partner has been contacted at least once.",
-			nil, nil),
+			haLabels(), nil),
 		haPartnerInTouch: prometheus.NewDesc(
 			ns+"_ha_partner_in_touch", "1 once this peer has been in contact with its HA partner, else 0.",
-			nil, nil),
+			haLabels(), nil),
 		haCommBroken: prometheus.NewDesc(
 			ns+"_ha_communication_interrupted", "1 if HA communication with the partner is interrupted, else 0.",
-			nil, nil),
+			haLabels(), nil),
 
 		buildInfo: prometheus.NewDesc(
 			"kea_exporter_build_info",
@@ -189,6 +206,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.allocFailCause
 	ch <- c.haEnabled
 	ch <- c.haLocalState
+	ch <- c.haPartnerState
 	ch <- c.haPartnerAge
 	ch <- c.haPartnerInTouch
 	ch <- c.haCommBroken
