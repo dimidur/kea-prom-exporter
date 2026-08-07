@@ -34,6 +34,47 @@ func TestEmptyEnvValueDoesNotOverrideAFlagDefault(t *testing.T) {
 	}
 }
 
+func TestEnvIsConsultedInAStableOrder(t *testing.T) {
+	// applyEnv sorts the flag names before walking them, because ranging a map
+	// is randomised and the diagnostics would otherwise reorder between runs.
+	//
+	// The ordering is not observable through the returned problems: only
+	// --kea-timeout is typed, so at most one problem can ever be produced. It
+	// is observable through the injected lookup, which is called once per flag
+	// in exactly the order the sort establishes.
+
+	// Arrange
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	for name := range envForFlag {
+		fs.String(name, "", "")
+	}
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var queried []string
+
+	// Act
+	applyEnv(fs, func(env string) (string, bool) {
+		queried = append(queried, env)
+		return "", false
+	})
+
+	// Assert -- env var names in the order their FLAG names sort, which is
+	// neither the map literal's order nor the env names' own order.
+	names := make([]string, 0, len(envForFlag))
+	for name := range envForFlag {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	want := make([]string, 0, len(names))
+	for _, n := range names {
+		want = append(want, envForFlag[n])
+	}
+	if !slices.Equal(queried, want) {
+		t.Errorf("env consulted in order\n got %v\nwant %v", queried, want)
+	}
+}
+
 func TestApplyEnvFillsUnsetFlagsOnly(t *testing.T) {
 	// Arrange -- a local FlagSet mirroring the real one, so a subtest can
 	// parse arguments without disturbing flag.CommandLine.

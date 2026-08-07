@@ -5,10 +5,48 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 )
+
+func TestNewLoggerWritesToTheProcessSink(t *testing.T) {
+	// newLoggerTo is exercised thoroughly below, but newLogger -- the only
+	// path production takes -- was not. It is the adapter that supplies the
+	// sink, and pointing it at io.Discard left every other test green while
+	// the process logged nowhere. Swapping the seam is what observes it.
+
+	// Arrange
+	var buf bytes.Buffer
+	original := logSink
+	logSink = &buf
+	t.Cleanup(func() { logSink = original })
+
+	// Act
+	log, problems := newLogger("info", "text")
+	log.Info("hello from the process logger")
+
+	// Assert
+	if len(problems) != 0 {
+		t.Errorf("problems = %v, want none for a valid level and format", problems)
+	}
+	if !strings.Contains(buf.String(), "hello from the process logger") {
+		t.Errorf("newLogger did not write to the process sink; got %q", buf.String())
+	}
+}
+
+func TestProcessSinkIsStderr(t *testing.T) {
+	// The seam above is satisfied by any writer, so this pins which one
+	// production gets. Logs on stdout would interleave with what the process
+	// prints there, breaking --version for anything parsing it.
+
+	// Act + Assert
+	if logSink != io.Writer(os.Stderr) {
+		t.Errorf("logSink = %v, want os.Stderr", logSink)
+	}
+}
 
 func TestLogFormatSelectsTheHandler(t *testing.T) {
 	// Both handlers report the same level, so a test that only checks levels

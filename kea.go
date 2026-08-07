@@ -35,6 +35,21 @@ type keaClient struct {
 	client   *http.Client
 }
 
+// defaultKeaTimeout applies when a client is constructed without one. A zero
+// duration on context.WithTimeout is a deadline already past, and a negative
+// one likewise, so this is not a "no limit" fallback -- it is what stops an
+// unset field turning every call into an instant failure.
+const defaultKeaTimeout = 5 * time.Second
+
+// effectiveTimeout exists so the fallback is assertable without a test that
+// waits for it to elapse.
+func effectiveTimeout(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultKeaTimeout
+	}
+	return d
+}
+
 // keaCommand is marshalled rather than formatted into a string. The service
 // name is operator-supplied, and hand-built JSON would let a stray quote
 // change the command actually sent.
@@ -61,11 +76,7 @@ func (k *keaClient) call(ctx context.Context, command string) (*keaResponse, err
 	// Per-request deadline. One deadline shared across the whole scrape let a
 	// slow first command starve the second, whose failure was then reported
 	// as if the second command were at fault.
-	timeout := k.timeout
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := context.WithTimeout(ctx, effectiveTimeout(k.timeout))
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, k.url, bytes.NewReader(body))

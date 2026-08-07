@@ -13,13 +13,19 @@ import (
 	"strings"
 )
 
+// logSink is a seam, not indirection for its own sake. Extracting newLoggerTo
+// made the level and format logic testable but left newLogger as the only
+// production path and invisible to a test: replacing its body with io.Discard
+// kept the whole suite green, so nothing pinned that logs reach stderr at all.
+var logSink io.Writer = os.Stderr
+
 // newLogger builds the process logger. An unrecognised level or format falls
 // back to the default rather than refusing to start -- a logging preference is
 // not worth failing an exporter over -- but it is reported, because
 // `--log-level=warning` (the syslog/Python spelling, which slog rejects)
 // otherwise silently gives you info.
 func newLogger(level, format string) (*slog.Logger, []error) {
-	return newLoggerTo(os.Stderr, level, format)
+	return newLoggerTo(logSink, level, format)
 }
 
 // newLoggerTo takes the sink so a test can read what was actually written.
