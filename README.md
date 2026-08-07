@@ -364,7 +364,7 @@ Grouped by milestone rather than date.
   every declared metric returns real data.
 - [x] Unit tests over captured `statistic-get-all` + `status-get` fixtures, so
   regressions surface in CI without a live Kea.
-- [ ] Tagged `v0.1.0` with a multi-arch image published from CI.
+- [x] Tagged `v0.1.0` with a multi-arch image published from CI.
 
 ### v0.5 — feature completeness
 
