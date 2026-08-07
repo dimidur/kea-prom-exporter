@@ -162,6 +162,78 @@ func TestNon200SuccessStatusIsAccepted(t *testing.T) {
 	}
 }
 
+func TestRedirectStatusIsRejectedRatherThanDecoded(t *testing.T) {
+	// The mirror of the test above, and the reason the accepted range has an
+	// upper bound. A 3xx from an auth proxy in front of the control socket is
+	// not a Kea response: widening the check to accept it means a login page
+	// gets decoded as statistics, and a scrape that should have failed loudly
+	// reports whatever happened to parse.
+	//
+	// CheckRedirect is set not to follow, so the 302 is what call() sees
+	// rather than whatever it points at.
+
+	// Arrange
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "https://sso.example/login")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	client := srv.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	k := &keaClient{url: srv.URL, client: client}
+
+	// Act
+	_, err := k.call(t.Context(), "status-get")
+
+	// Assert
+	if err == nil {
+		t.Fatal("call on HTTP 302 returned no error; a redirect was treated as a Kea response")
+	}
+	if !strings.Contains(err.Error(), "302") {
+		t.Errorf("error %q does not name the status code", err)
+	}
+}
+
+func TestTimeoutFallsBackRatherThanExpiringImmediately(t *testing.T) {
+	// A zero timeout is not "no limit": context.WithTimeout(ctx, 0) is a
+	// deadline already past, so every call would fail before being sent. The
+	// fallback is what stops an unset field doing that, and naming the
+	// constant lets this pin the value rather than the presence of a branch.
+
+	// Arrange
+	cases := []struct {
+		name string
+		in   time.Duration
+		want time.Duration
+	}{
+		{"unset", 0, defaultKeaTimeout},
+		{"negative", -time.Second, defaultKeaTimeout},
+		{"configured", 2 * time.Second, 2 * time.Second},
+		// The boundary: one nanosecond is a real setting, however useless.
+		{"smallest positive", time.Nanosecond, time.Nanosecond},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Act
+			got := effectiveTimeout(tc.in)
+
+			// Assert
+			if got != tc.want {
+				t.Errorf("effectiveTimeout(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+
+	// And it is the documented 5s, not merely something positive.
+	if defaultKeaTimeout != 5*time.Second {
+		t.Errorf("defaultKeaTimeout = %v, want 5s -- the --kea-timeout help says 5s", defaultKeaTimeout)
+	}
+}
+
 func TestKeaResultErrorIsSurfaced(t *testing.T) {
 	// A non-zero `result` is HTTP 200 with a failure inside. Kea returns 1 for
 	// an error and 2 for an unsupported command; both must fail the scrape.
