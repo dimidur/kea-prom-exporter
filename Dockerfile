@@ -17,7 +17,7 @@
 #     --build-arg VERSION=<tag> --build-arg REVISION=$(git rev-parse HEAD) \
 #     -t dimidur/kea-prom-exporter:<tag> --push .
 
-FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.7-alpine AS build
 ARG TARGETOS
 ARG TARGETARCH
 # Passed in rather than read from the repo: .dockerignore keeps .git out of the
