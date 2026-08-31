@@ -6,7 +6,7 @@ go 1.26
 // minimum language version, the toolchain line selects the build toolchain.
 // Bumping only this keeps GOTOOLCHAIN=local users (distro Go, Nix, air-gapped)
 // building, while CI and the image still get the exact patch.
-toolchain go1.26.5
+toolchain go1.26.7
 
 require github.com/prometheus/client_golang v1.24.1
 
