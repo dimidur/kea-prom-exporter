@@ -2,6 +2,7 @@
 # and sources. .git and any local build output are pure upload cost.
 .git
 .github
+docs
 *.md
 !README.md
 testdata
@@ -12,4 +13,6 @@ kea-prom-exporter-*
 *.prof
 .dockerignore
 .gitignore
+.markdownlint-cli2.jsonc
+cspell.json
 LICENSE
