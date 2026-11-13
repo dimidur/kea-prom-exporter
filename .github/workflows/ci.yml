@@ -30,9 +30,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          # Read the version from go.mod so a toolchain bump happens in one
-          # place. Pinning it here separately is how CI ended up unable to
-          # build its own module.
+          # go.mod's `go` line is the only place the Go version is set; CI
+          # never pins one of its own.
           go-version-file: go.mod
           cache: true
 
@@ -41,9 +40,8 @@ jobs:
           go mod tidy
           git diff --exit-code go.mod go.sum
 
-      # Formatting was not checked before, which is how unformatted code
-      # reached main. `gofmt -l` prints offending files but still exits 0,
-      # so the output has to be tested explicitly.
+      # `gofmt -l` prints offending files but still exits 0, so the output has
+      # to be tested explicitly.
       - name: gofmt
         run: |
           unformatted=$(gofmt -l .)
@@ -60,15 +58,15 @@ jobs:
       # Pinned rather than @latest: an unpinned tool turns main red without a
       # code change, and re-running an old commit's CI no longer reproduces
       # what that commit passed. Dependabot does not track `go run pkg@ver` in
-      # a workflow, so these are bumped by hand -- a `go.mod` tool directive
+      # a workflow, so these are bumped by hand; a `go.mod` tool directive
       # would automate it at the cost of ~50 indirect deps in a single-file
       # binary's module graph.
       - name: staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
 
       # -race matters specifically here: Prometheus calls Collect
       # concurrently when scrapes overlap, which is exactly where a race in
-      # this exporter lives (and did).
+      # this exporter would live.
       - name: test
         run: go test -race -v ./...
 
@@ -122,6 +120,21 @@ jobs:
           context: .
           load: true
           tags: kea-prom-exporter:scan
+
+      # The Dockerfile compiles with go.mod's version through GOTOOLCHAIN;
+      # this checks the image binary actually carries it.
+      - name: image Go matches go.mod
+        run: |
+          want="go$(awk '$1 == "go" {print $2}' go.mod)"
+          got=$(docker run --rm kea-prom-exporter:scan --version)
+          echo "$got"
+          case "$got" in
+            *", $want)") ;;
+            *)
+              echo "::error file=Dockerfile::image binary was not built with $want from go.mod"
+              exit 1
+              ;;
+          esac
 
       # Trivy rather than Docker Scout: it needs no registry credentials, so
       # this gate also runs on pull requests from forks.

@@ -1,0 +1,28 @@
+{
+  "version": "0.2",
+  "language": "en-GB,en",
+  "ignorePaths": ["go.mod", "go.sum"],
+  "words": [
+    "buildx",
+    "dimidur",
+    "distroless",
+    "esac",
+    "GOARCH",
+    "gofmt",
+    "gosec",
+    "GOTOOLCHAIN",
+    "govulncheck",
+    "honnef",
+    "hostnames",
+    "ldflags",
+    "libc",
+    "mweinelt",
+    "nonroot",
+    "nosec",
+    "securego",
+    "staticcheck",
+    "subtest",
+    "testdata",
+    "trimpath"
+  ]
+}
