@@ -11,18 +11,64 @@ name: renovate
   schedule:
     - cron: "17 4 * * *"
   workflow_dispatch:
+  # Renovate acts on a ticked checkbox (Dashboard or pull request) or the
+  # `rebase` label only when it runs; these start that run instead of waiting
+  # for the schedule. `pull_request_target` runs the base branch's copy of this
+  # workflow; no step checks out or runs the pull request's code.
+  issues:
+    types: [edited]
+  pull_request_target:
+    types: [edited, labeled]
 
 # Renovate acts through the GitHub App's token, not GITHUB_TOKEN: pull requests
 # opened with GITHUB_TOKEN need their CI approved by hand, and GITHUB_TOKEN
 # cannot be granted the `workflows` permission that updating these files needs.
 permissions: {}
 
+# Only one run may wait in a group, and a newer one replaces it. A run whose job
+# will be skipped gets a group of its own, so it cannot replace a waiting run
+# that a person started. The condition here must match the job's `if`.
 concurrency:
-  group: renovate
+  group: >-
+    ${{ (
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.sender.type != 'Bot' && (
+        (github.event_name == 'issues' &&
+         github.event.issue.user.login == 'dimidur-renovate[bot]' &&
+         github.event.issue.title == 'Dependency Dashboard') ||
+        (github.event_name == 'pull_request_target' &&
+         (github.event.action != 'labeled' || github.event.label.name == 'rebase') &&
+         github.event.pull_request.state == 'open' &&
+         github.event.pull_request.base.ref == github.event.repository.default_branch &&
+         github.event.pull_request.head.repo.full_name == github.repository &&
+         startsWith(github.event.pull_request.head.ref, 'renovate/'))))
+    ) && 'renovate' || format('renovate-skip-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
   renovate:
+    # Renovate edits its own pull requests and the Dependency Dashboard as it
+    # runs, clearing a box it has acted on, so an edit by a bot must not start
+    # another run. Only the Dashboard that the App opened counts, as anyone can
+    # open an issue: the login is the App's name and the title is Renovate's
+    # default, so renaming the App or setting `dependencyDashboardTitle` means
+    # changing them here. Only an open pull request from a `renovate/` branch
+    # in this repository counts, as anyone can open one from a fork. Same
+    # condition as the concurrency group.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.sender.type != 'Bot' && (
+        (github.event_name == 'issues' &&
+         github.event.issue.user.login == 'dimidur-renovate[bot]' &&
+         github.event.issue.title == 'Dependency Dashboard') ||
+        (github.event_name == 'pull_request_target' &&
+         (github.event.action != 'labeled' || github.event.label.name == 'rebase') &&
+         github.event.pull_request.state == 'open' &&
+         github.event.pull_request.base.ref == github.event.repository.default_branch &&
+         github.event.pull_request.head.repo.full_name == github.repository &&
+         startsWith(github.event.pull_request.head.ref, 'renovate/'))))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
