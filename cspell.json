@@ -1,14 +1,17 @@
 {
   "version": "0.2",
   "language": "en-GB,en",
-  "ignorePaths": ["go.mod", "go.sum"],
+  "ignorePaths": ["go.mod", "go.sum", ".github/yamllint-requirements.txt"],
   "words": [
+    "aquasecurity",
     "buildx",
     "dimidur",
     "distroless",
+    "DOCKERHUB",
     "esac",
     "GOARCH",
     "gofmt",
+    "gomod",
     "gosec",
     "GOTOOLCHAIN",
     "govulncheck",
@@ -19,10 +22,12 @@
     "mweinelt",
     "nonroot",
     "nosec",
+    "renovatebot",
     "securego",
     "staticcheck",
     "subtest",
     "testdata",
-    "trimpath"
+    "trimpath",
+    "venv"
   ]
 }

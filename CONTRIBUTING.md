@@ -40,8 +40,8 @@ CI additionally runs formatting, lint and security checks, listed in `ci.yml`.
 Every one is expected to be silent; please keep them that way rather than
 adding suppressions, unless the finding is genuinely a false positive, in which
 case annotate it with the reason (each `#nosec` in the tree states its own).
-Their versions are pinned in `ci.yml`; when reproducing a CI failure locally,
-run the pinned version rather than `@latest`.
+Their versions are pinned under `.github/`; when reproducing a CI failure
+locally, run the pinned version rather than `@latest`.
 
 ## Tests without a Kea instance
 

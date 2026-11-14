@@ -1,6 +1,7 @@
+---
 name: ci
 
-on:
+"on":
   push:
     branches: [main]
   pull_request:
@@ -21,14 +22,14 @@ permissions:
 # Actions are pinned to commit SHAs, not tags: `@v4` is mutable and its owner
 # can repoint it at any commit, so a tag is a version constraint rather than a
 # pin. The trailing comment records the release each SHA corresponds to, which
-# is also what Dependabot reads when it bumps them.
+# is also what Renovate reads when it bumps them.
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           # go.mod's `go` line is the only place the Go version is set; CI
           # never pins one of its own.
@@ -57,10 +58,10 @@ jobs:
 
       # Pinned rather than @latest: an unpinned tool turns main red without a
       # code change, and re-running an old commit's CI no longer reproduces
-      # what that commit passed. Dependabot does not track `go run pkg@ver` in
-      # a workflow, so these are bumped by hand; a `go.mod` tool directive
-      # would automate it at the cost of ~50 indirect deps in a single-file
-      # binary's module graph.
+      # what that commit passed. Running a tool at a version keeps it out of
+      # the exporter's own module graph; Renovate bumps each
+      # `go run <module>/cmd/...@vX.Y.Z` pin through the custom manager in
+      # .github/renovate.json.
       - name: staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
 
@@ -71,20 +72,37 @@ jobs:
         run: go test -race -v ./...
 
       - name: build (host arch)
-        run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/kea-prom-exporter .
+        run: >-
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"
+          -o /tmp/kea-prom-exporter .
 
   docs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: markdownlint
-        uses: DavidAnson/markdownlint-cli2-action@696eb3f2509270d7b882d2aa68347bc676e7af34 # v25.0.0
+        uses: DavidAnson/markdownlint-cli2-action@696eb3f2509270d7b882d2aa68347bc676e7af34  # v25.0.0
+
+  yaml:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: install yamllint
+        run: |
+          python3 -m venv "$RUNNER_TEMP/yamllint"
+          "$RUNNER_TEMP/yamllint/bin/pip" install --require-hashes \
+            --only-binary :all: -r .github/yamllint-requirements.txt
+      # --strict also fails on warnings: the default config reports some
+      # rules, such as truthy and document-start, as warnings, which otherwise
+      # exit 0.
+      - name: yamllint
+        run: '"$RUNNER_TEMP/yamllint/bin/yamllint" --strict .'
 
   security:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
@@ -100,12 +118,12 @@ jobs:
     # red security one.
     needs: [test, security]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1  # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
 
       - name: build multi-arch image (no push)
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -115,7 +133,7 @@ jobs:
       # Load a single-arch copy so the scanner has something to inspect;
       # the multi-arch build above stays in the buildx cache only.
       - name: build for scanning
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           load: true
@@ -131,7 +149,8 @@ jobs:
           case "$got" in
             *", $want)") ;;
             *)
-              echo "::error file=Dockerfile::image binary was not built with $want from go.mod"
+              msg="image binary was not built with $want from go.mod"
+              echo "::error file=Dockerfile::$msg"
               exit 1
               ;;
           esac
@@ -139,7 +158,7 @@ jobs:
       # Trivy rather than Docker Scout: it needs no registry credentials, so
       # this gate also runs on pull requests from forks.
       - name: scan image
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           image-ref: kea-prom-exporter:scan
           format: table
