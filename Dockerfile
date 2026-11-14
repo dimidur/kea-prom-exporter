@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 #
 # Multi-stage, multi-arch build. The runtime image is distroless `static`:
 # still no shell, no package manager and no libc, but unlike `scratch` it
@@ -22,7 +22,7 @@
 # it, and when that differs from the image's own Go, Go downloads and
 # checksum-verifies it. The image itself sets GOTOOLCHAIN=local, which would
 # compile with whatever Go it carries.
-FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf AS build
 WORKDIR /src
 
 # Cache module downloads, and the toolchain, independently of source edits.
@@ -53,7 +53,7 @@ RUN GOTOOLCHAIN="go$(awk '$1 == "go" {print $2}' go.mod)" \
 # /etc/passwd entry, not 65534/nobody, which is the shared NFS-anonymous uid
 # that a dozen unrelated things already map to. Kubernetes runAsNonRoot and
 # PodSecurity `restricted` reject an image whose user is root.
-FROM gcr.io/distroless/static-debian13:nonroot
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931
 COPY --from=build /out/kea-prom-exporter /kea-prom-exporter
 # Default Prometheus port for Kea exporters (matches the mweinelt
 # heritage). Override with --listen or LISTEN env var.
