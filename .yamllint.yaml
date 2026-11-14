@@ -1,0 +1,11 @@
+---
+extends: default
+
+# Lint what git tracks, so a local run and CI's fresh checkout agree.
+ignore-from-file: .gitignore
+
+rules:
+  # SHA-pinned `uses:` lines run past 80 and cannot be wrapped: Renovate reads
+  # each pin, with its trailing version comment, as one line.
+  line-length:
+    max: 110

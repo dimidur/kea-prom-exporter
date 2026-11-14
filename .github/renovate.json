@@ -1,0 +1,50 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Every dependency is pinned so a build is reproducible; Renovate is what moves the pins, as PRs a human approves.",
+  "extends": [
+    "config:best-practices",
+    ":semanticCommits",
+    ":semanticCommitTypeAll(build)"
+  ],
+  "osvVulnerabilityAlerts": true,
+  "prHourlyLimit": 0,
+  "postUpdateOptions": ["gomodTidy", "gomodUpdateImportPaths"],
+  "pip-compile": {
+    "managerFilePatterns": ["/^\\.github/yamllint-requirements\\.txt$/"]
+  },
+  "pip_requirements": {
+    "description": "pip-compile owns the yamllint lock; this manager would match the same file.",
+    "enabled": false
+  },
+  "lockFileMaintenance": {
+    "description": "Any Monday run; the preset's Monday 00:00-03:59 UTC window never contains the workflow's daily 04:17 UTC start.",
+    "schedule": ["* * * * 1"]
+  },
+  "packageRules": [
+    {
+      "description": "go.mod's go line is the project's only Go version, so it follows every Go release; Renovate leaves it alone by default.",
+      "matchManagers": ["gomod"],
+      "matchDepNames": ["go"],
+      "matchDepTypes": ["golang"],
+      "rangeStrategy": "bump"
+    },
+    {
+      "description": "The renovate-version input of renovatebot/github-action has no place to write a digest, so a digest pin of it can never be applied.",
+      "matchManagers": ["github-actions"],
+      "matchDepTypes": ["uses-with"],
+      "matchPackageNames": ["ghcr.io/renovatebot/renovate"],
+      "pinDigests": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Tools CI runs as `go run <module>/cmd/<tool>@vX.Y.Z`; the dependency is the module, not the package.",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": [
+        "go run (?<depName>[^@\\s]+?)/cmd/[^@\\s]+@(?<currentValue>v\\d+\\.\\d+\\.\\d+)"
+      ],
+      "datasourceTemplate": "go"
+    }
+  ]
+}
