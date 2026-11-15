@@ -3,8 +3,11 @@
   "language": "en-GB,en",
   "ignorePaths": ["go.mod", "go.sum", ".github/yamllint-requirements.txt"],
   "words": [
+    "alertable",
     "aquasecurity",
     "buildx",
+    "DHCPDECLINE",
+    "Dhcpv",
     "dimidur",
     "distroless",
     "DOCKERHUB",
@@ -22,12 +25,17 @@
     "mweinelt",
     "nonroot",
     "nosec",
+    "promhttp",
+    "promlint",
     "renovatebot",
     "securego",
     "staticcheck",
+    "statmap",
     "subtest",
     "testdata",
+    "testutil",
     "trimpath",
+    "unparseable",
     "venv"
   ]
 }

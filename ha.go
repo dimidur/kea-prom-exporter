@@ -3,7 +3,7 @@ package main
 // Decoding of the HA hook's status-get payload.
 //
 // One reason to change: the HA hook's response shape, which Kea versions
-// separately from the core statistics -- hence its own file.
+// separately from the core statistics, hence its own file.
 //
 // Why the labels are derived the way they are, and what Kea guarantees about
 // them, is in docs/kea-behaviour.md.
@@ -66,7 +66,7 @@ type haStatus struct {
 // identity derives the two labels every relationship-scoped HA metric
 // carries: relationship, the lower of the two server names, and peer, the
 // partner's. Kea's uniqueness rule is what makes min() a stable, unique key
-// that both nodes of a pair agree on -- see docs/kea-behaviour.md.
+// that both nodes of a pair agree on; see docs/kea-behaviour.md.
 //
 // With no remote half there is no pair to choose from and both fall back to
 // the local name; haIdentities keeps those distinct.
@@ -90,13 +90,13 @@ func (r haRelationship) identity() (relationship, peer string) {
 func haIdentities(relationships []haRelationship) [][2]string {
 	out := make([][2]string, len(relationships))
 	seen := make(map[[2]string]bool, len(relationships))
-	for i, r := range relationships {
-		relationship, peer := r.identity()
+	for i, entry := range relationships {
+		relationship, peer := entry.identity()
 		id := [2]string{relationship, peer}
 		// Suffixing the relationship separates the label sets; the loop
 		// covers a suffix that collides in turn.
-		for n := i; seen[id]; n++ {
-			id[0] = relationship + "#" + strconv.Itoa(n)
+		for suffix := i; seen[id]; suffix++ {
+			id[0] = relationship + "#" + strconv.Itoa(suffix)
 		}
 		seen[id] = true
 		out[i] = id
@@ -105,29 +105,29 @@ func haIdentities(relationships []haRelationship) [][2]string {
 }
 
 func (c *collector) collectHA(ctx context.Context, ch chan<- prometheus.Metric) error {
-	resp, err := c.kea.call(ctx, "status-get")
+	resp, err := c.kea.call(ctx, cmdStatusGet)
 	if err != nil {
 		return err
 	}
-	var s haStatus
-	if err := json.Unmarshal(resp.Arguments, &s); err != nil {
-		return fmt.Errorf("decode status-get arguments: %w", err)
+	var status haStatus
+	if err := json.Unmarshal(resp.Arguments, &status); err != nil {
+		return fmt.Errorf("decode %s arguments: %w", cmdStatusGet, err)
 	}
 	// An absent HA hook and a failed status-get would both show up as missing
 	// HA metrics. An explicit 0 distinguishes them without reading logs.
-	if len(s.HighAvailability) == 0 {
+	if len(status.HighAvailability) == 0 {
 		ch <- prometheus.MustNewConstMetric(c.haEnabled, prometheus.GaugeValue, 0)
 		return nil
 	}
 	ch <- prometheus.MustNewConstMetric(c.haEnabled, prometheus.GaugeValue, 1)
 
-	identities := haIdentities(s.HighAvailability)
-	for i, ha := range s.HighAvailability {
+	identities := haIdentities(status.HighAvailability)
+	for i, ha := range status.HighAvailability {
 		relationship, peer := identities[i][0], identities[i][1]
 
 		// ha-mode is the FIRST relationship's mode on every entry, which is
 		// harmless only because Kea requires them all to match. Latent, not
-		// live -- see docs/kea-behaviour.md.
+		// live; see docs/kea-behaviour.md.
 		ch <- prometheus.MustNewConstMetric(
 			c.haLocalState, prometheus.GaugeValue, 1,
 			relationship, peer, ha.HAServers.Local.State, ha.HAServers.Local.Role, ha.HAMode)
@@ -141,7 +141,7 @@ func (c *collector) collectHA(ctx context.Context, ch chan<- prometheus.Metric) 
 		}
 
 		// Kea reports age 0 when it has never reached the partner, which
-		// exported unconditionally reads as "contacted 0 seconds ago" -- the
+		// exported unconditionally reads as "contacted 0 seconds ago", the
 		// inverse of the truth. The gauge is emitted only when it means
 		// something, alongside an explicit in-touch signal.
 		inTouch := 0.0
@@ -156,7 +156,7 @@ func (c *collector) collectHA(ctx context.Context, ch chan<- prometheus.Metric) 
 		// Kea reports last-state as "" until the partner is first contacted,
 		// and state="" is the same falsehood as the age 0 above. Gate on the
 		// field this metric reads rather than on in-touch; the two are
-		// equivalent. Note "unavailable" is a real state, not an absence --
+		// equivalent. Note "unavailable" is a real state, not an absence;
 		// see docs/kea-behaviour.md.
 		if remote.LastState != "" {
 			ch <- prometheus.MustNewConstMetric(

@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -38,10 +39,8 @@ func TestEnvIsConsultedInAStableOrder(t *testing.T) {
 	// applyEnv sorts the flag names before walking them, because ranging a map
 	// is randomised and the diagnostics would otherwise reorder between runs.
 	//
-	// The ordering is not observable through the returned problems: only
-	// --kea-timeout is typed, so at most one problem can ever be produced. It
-	// is observable through the injected lookup, which is called once per flag
-	// in exactly the order the sort establishes.
+	// The order is read through the injected lookup, which is called once per
+	// flag in exactly the order the sort establishes.
 
 	// Arrange
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -59,49 +58,61 @@ func TestEnvIsConsultedInAStableOrder(t *testing.T) {
 		return "", false
 	})
 
-	// Assert -- env var names in the order their FLAG names sort, which is
-	// neither the map literal's order nor the env names' own order.
+	// Assert
+	// Env var names in the order their FLAG names sort, which is neither the
+	// map literal's order nor the env names' own order.
 	names := make([]string, 0, len(envForFlag))
 	for name := range envForFlag {
 		names = append(names, name)
 	}
 	slices.Sort(names)
 	want := make([]string, 0, len(names))
-	for _, n := range names {
-		want = append(want, envForFlag[n])
+	for _, name := range names {
+		want = append(want, envForFlag[name])
 	}
 	if !slices.Equal(queried, want) {
 		t.Errorf("env consulted in order\n got %v\nwant %v", queried, want)
 	}
 }
 
-func TestApplyEnvFillsUnsetFlagsOnly(t *testing.T) {
-	// Arrange -- a local FlagSet mirroring the real one, so a subtest can
-	// parse arguments without disturbing flag.CommandLine.
-	// An explicit flag must beat the environment, every flag must be settable
-	// from it, and a bad value must be reported rather than swallowed.
+func TestApplyEnvFillsUnsetFlagsAndReportsBadValues(t *testing.T) {
+	// The environment fills a flag the command line left unset, an explicit
+	// flag beats it, and a bad value is reported rather than swallowed.
+
+	// newFS builds a local FlagSet with every flag envForFlag maps, so a
+	// subtest can parse arguments without disturbing flag.CommandLine. Only
+	// --kea-url and --kea-timeout are read back, and --kea-timeout keeps its
+	// real type, since it is the only flag whose Set can fail.
 	newFS := func() (*flag.FlagSet, *string, *time.Duration) {
 		fs := flag.NewFlagSet("test", flag.ContinueOnError)
-		url := fs.String("kea-url", "http://default/", "")
-		timeout := fs.Duration("kea-timeout", 5*time.Second, "")
-		fs.String("listen", ":9547", "")
-		fs.String("kea-user", "", "")
-		fs.String("kea-password-file", "", "")
-		fs.String("kea-password", "", "")
-		fs.String("kea-service", "dhcp4", "")
-		fs.String("log-level", "info", "")
-		fs.String("log-format", "text", "")
+		var url *string
+		var timeout *time.Duration
+		for name := range envForFlag {
+			switch name {
+			case "kea-url":
+				url = fs.String(name, "http://default/", "")
+			case "kea-timeout":
+				timeout = fs.Duration(name, 5*time.Second, "")
+			default:
+				fs.String(name, "", "")
+			}
+		}
 		return fs, url, timeout
 	}
-	env := func(m map[string]string) func(string) (string, bool) {
-		return func(k string) (string, bool) { v, ok := m[k]; return v, ok }
+	env := func(vars map[string]string) func(string) (string, bool) {
+		return func(name string) (string, bool) {
+			value, ok := vars[name]
+			return value, ok
+		}
 	}
 
 	t.Run("env fills an unset flag", func(t *testing.T) {
+		// Arrange
 		fs, url, timeout := newFS()
 		if err := fs.Parse(nil); err != nil {
 			t.Fatalf("parse: %v", err)
 		}
+
 		// Act
 		problems := applyEnv(fs, env(map[string]string{"KEA_URL": "http://from-env/", "KEA_TIMEOUT": "12s"}))
 
@@ -118,10 +129,12 @@ func TestApplyEnvFillsUnsetFlagsOnly(t *testing.T) {
 	})
 
 	t.Run("an explicit flag beats the environment", func(t *testing.T) {
+		// Arrange
 		fs, url, _ := newFS()
 		if err := fs.Parse([]string{"-kea-url", "http://from-flag/"}); err != nil {
 			t.Fatalf("parse: %v", err)
 		}
+
 		// Act
 		applyEnv(fs, env(map[string]string{"KEA_URL": "http://from-env/"}))
 
@@ -132,11 +145,7 @@ func TestApplyEnvFillsUnsetFlagsOnly(t *testing.T) {
 	})
 
 	t.Run("a rejected value is reported and the default kept", func(t *testing.T) {
-		// Arrange -- only --kea-timeout is typed, so it is the only flag whose
-		// Set can fail. applyEnv collects problems into a slice rather than
-		// keeping the last one, but with a single failable flag that
-		// difference is not observable; naming this "every bad value" would
-		// claim coverage the flag set cannot provide.
+		// Arrange
 		fs, _, timeout := newFS()
 		if err := fs.Parse(nil); err != nil {
 			t.Fatalf("parse: %v", err)
@@ -156,46 +165,162 @@ func TestApplyEnvFillsUnsetFlagsOnly(t *testing.T) {
 			t.Errorf("kea-timeout = %v, want the default kept after a bad value", *timeout)
 		}
 	})
+}
 
-	t.Run("every real flag has an env equivalent", func(t *testing.T) {
-		// Arrange -- flag.CommandLine, not the local FlagSet above. Walking a
-		// hand-written copy made this assert a property of the test's own
-		// fixture: adding a flag to config.go with no envForFlag row left it
-		// green, which is the one thing it exists to catch.
-		//
-		// --version is deliberately absent from envForFlag (config.go says so):
-		// it exits immediately and configures nothing. That exemption is
-		// asserted rather than skipped, so silently dropping another flag into
-		// it is not possible.
-		exempt := map[string]bool{"version": true}
+func TestEveryFlagHasAnEnvEquivalent(t *testing.T) {
+	// The container documentation tells people to configure the exporter
+	// through the environment, so a flag with no envForFlag row is a setting
+	// a container cannot reach.
 
-		// Act
-		var real []string
-		flag.CommandLine.VisitAll(func(f *flag.Flag) {
-			// The test binary injects its own -test.* flags.
-			if strings.HasPrefix(f.Name, "test.") {
-				return
-			}
-			real = append(real, f.Name)
-		})
+	// Arrange
+	// flag.CommandLine, not a hand-written FlagSet: walking a copy would
+	// assert a property of the test's own fixture, and a flag added to
+	// config.go with no envForFlag row would leave it green, which is the one
+	// thing it exists to catch.
+	//
+	// --version is deliberately absent from envForFlag (config.go says so):
+	// it exits immediately and configures nothing. That exemption is asserted
+	// rather than skipped, so silently dropping another flag into it is not
+	// possible.
+	exempt := map[string]bool{"version": true}
 
-		// Assert
-		if len(real) < 5 {
-			t.Fatalf("found only %d real flags (%v); this guard would be vacuous", len(real), real)
+	// Act
+	var registered []string
+	flag.CommandLine.VisitAll(func(defined *flag.Flag) {
+		// The test binary injects its own -test.* flags.
+		if strings.HasPrefix(defined.Name, "test.") {
+			return
 		}
-		for _, name := range real {
-			_, mapped := envForFlag[name]
-			switch {
-			case exempt[name] && mapped:
-				t.Errorf("--%s is documented as having no env form but appears in envForFlag", name)
-			case !exempt[name] && !mapped:
-				t.Errorf("flag --%s has no entry in envForFlag", name)
-			}
-		}
-		for name := range envForFlag {
-			if !slices.Contains(real, name) {
-				t.Errorf("envForFlag maps %q, which is not a flag", name)
-			}
-		}
+		registered = append(registered, defined.Name)
 	})
+
+	// Assert
+	if len(registered) < 5 {
+		t.Fatalf("found only %d registered flags (%v); this guard would be vacuous", len(registered), registered)
+	}
+	for _, name := range registered {
+		_, mapped := envForFlag[name]
+		switch {
+		case exempt[name] && mapped:
+			t.Errorf("--%s is documented as having no env form but appears in envForFlag", name)
+		case !exempt[name] && !mapped:
+			t.Errorf("flag --%s has no entry in envForFlag", name)
+		}
+	}
+	for name := range envForFlag {
+		if !slices.Contains(registered, name) {
+			t.Errorf("envForFlag maps %q, which is not a flag", name)
+		}
+	}
+}
+
+func TestKeaTimeoutDefaultIsTheDocumentedFiveSeconds(t *testing.T) {
+	// README and --help both state 5s, and --help prints the flag's DefValue.
+	// The fallback for a zero or negative timeout is the same constant, so
+	// this also fails if the two stop agreeing.
+
+	// Arrange
+	const documented = "5s"
+
+	// Act
+	defined := flag.CommandLine.Lookup("kea-timeout")
+
+	// Assert
+	if defined == nil {
+		t.Fatal("--kea-timeout is not registered")
+	}
+	if defined.DefValue != documented {
+		t.Errorf("--kea-timeout default = %s, want the documented %s", defined.DefValue, documented)
+	}
+	if defined.DefValue != defaultKeaTimeout.String() {
+		t.Errorf("--kea-timeout default = %s, but a zero timeout falls back to %v", defined.DefValue, defaultKeaTimeout)
+	}
+}
+
+func TestKeaServiceDefaultPassesValidation(t *testing.T) {
+	// Started with no flags, the exporter must run: a --kea-service default
+	// that validateConfig refuses would stop every deployment that does not
+	// set it.
+
+	// Arrange
+	defined := flag.CommandLine.Lookup("kea-service")
+	if defined == nil {
+		t.Fatal("--kea-service is not registered")
+	}
+
+	// Act
+	err := validateConfig(keaClient{service: defined.DefValue})
+
+	// Assert
+	if err != nil {
+		t.Errorf("the default --kea-service=%s is refused: %v", defined.DefValue, err)
+	}
+}
+
+func TestFlagHelpStatesWhatTheCodeUses(t *testing.T) {
+	// --help is where a deployment learns how many commands share the scrape
+	// budget and which service is implemented, so the help must follow the
+	// code.
+	tests := []struct {
+		flag string
+		want string
+	}{
+		{"kea-timeout", fmt.Sprintf("budget %d of these", len(scrapeCommands))},
+		{"kea-service", "Only " + supportedService + " is implemented"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.flag, func(t *testing.T) {
+			// Arrange
+			defined := flag.CommandLine.Lookup(tc.flag)
+			if defined == nil {
+				t.Fatalf("--%s is not registered", tc.flag)
+			}
+
+			// Act
+			usage := defined.Usage
+
+			// Assert
+			if !strings.Contains(usage, tc.want) {
+				t.Errorf("--%s help = %q, want it to say %q", tc.flag, usage, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateConfigRefusesSettingsTheExporterCannotRunWith(t *testing.T) {
+	// Settings the exporter cannot run with must stop the process at start,
+	// where the error names the flag, rather than surface later as failed or
+	// empty scrapes. The rows name the settings validateConfig refuses.
+	tests := []struct {
+		name     string
+		user     string
+		password string
+		service  string
+		wantFlag string // empty when the settings are accepted
+	}{
+		{"no auth", "", "", supportedService, ""},
+		{"user and password", "exporter", "kea-password", supportedService, ""},
+		{"user without a password", "exporter", "", supportedService, "--kea-user"},
+		{"dhcp6 service", "", "", "dhcp6", "--kea-service"},
+		{"empty service", "", "", "", "--kea-service"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange
+			settings := keaClient{user: tc.user, password: tc.password, service: tc.service}
+
+			// Act
+			err := validateConfig(settings)
+
+			// Assert
+			switch {
+			case tc.wantFlag == "" && err != nil:
+				t.Errorf("validateConfig refused valid settings: %v", err)
+			case tc.wantFlag != "" && err == nil:
+				t.Error("validateConfig accepted the settings, want an error")
+			case tc.wantFlag != "" && !strings.Contains(err.Error(), tc.wantFlag):
+				t.Errorf("error %q does not name %s", err, tc.wantFlag)
+			}
+		})
+	}
 }

@@ -1,70 +1,304 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // Tests for server.go: serving /metrics and draining on a signal.
 
-func TestGraceIsActuallyWaitedOut(t *testing.T) {
-	// The grace duration was untestable through the drain test, because
-	// http.Server.Shutdown never aborts in-flight connections -- so replacing
-	// grace with a nanosecond changed nothing observable. Timing the shutdown
-	// is what distinguishes "waited" from "the parameter is ignored".
+// quietLogger discards everything, for tests that do not look at the log.
+var quietLogger = slog.New(slog.DiscardHandler)
 
-	// Arrange
-	// Released via Cleanup, not after the wait: releasing afterwards means
-	// a shutdown that ignores the grace hangs until the package timeout
-	// instead of failing in milliseconds.
-	release := make(chan struct{})
-	var releaseOnce sync.Once
-	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
-	started := make(chan struct{})
-	mux := http.NewServeMux()
-	mux.HandleFunc("/hang", func(w http.ResponseWriter, _ *http.Request) {
-		close(started)
-		<-release
-	})
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+// testClient bounds every request a test makes, so a handler that never
+// answers fails the test instead of hanging it.
+var testClient = &http.Client{Timeout: 5 * time.Second}
+
+// httpGet fetches url and returns the status and body. It reports a failure
+// through t.Errorf rather than t.Fatalf, so it is safe to call from a
+// goroutine.
+func httpGet(t *testing.T, url string) (int, string) {
+	t.Helper()
+	resp, err := testClient.Get(url)
+	if err != nil {
+		t.Errorf("GET %s: %v", url, err)
+		return 0, ""
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Errorf("read %s: %v", url, err)
+	}
+	return resp.StatusCode, string(body)
+}
+
+// serve runs one request through handler and returns the recorded response.
+func serve(handler http.Handler, path string) *httptest.ResponseRecorder {
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+	return recorder
+}
+
+// freeAddr returns a loopback address that nothing is listening on, for a
+// server under test to bind itself.
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: time.Second}
+	addr := listener.Addr().String()
+	_ = listener.Close()
+	return addr
+}
 
-	const grace = 300 * time.Millisecond
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan time.Duration, 1)
-	go func() {
-		start := time.Now()
-		_ = serveUntilSignal(ctx, srv, grace, nil)
-		done <- time.Since(start)
-	}()
+// releaseOnCleanup returns a channel for a handler to block on and a function
+// that closes it. Cleanup closes it as well, so a failing test does not leave
+// the handler and its server blocked behind it.
+func releaseOnCleanup(t *testing.T) (<-chan struct{}, func()) {
+	t.Helper()
+	release := make(chan struct{})
+	var once sync.Once
+	closeRelease := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(closeRelease)
+	return release, closeRelease
+}
+
+// holdRequest GETs path from addr in the background, retrying until the
+// server under test has bound. The request stays in flight for as long as the
+// handler holds it.
+func holdRequest(addr, path string) {
 	go func() {
 		for range 50 {
-			if resp, err := http.Get("http://" + addr + "/hang"); err == nil {
+			if resp, err := testClient.Get("http://" + addr + path); err == nil {
 				defer resp.Body.Close()
 				return
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
 	}()
-	<-started
+}
+
+func TestBuildServerServesTheRegistry(t *testing.T) {
+	// /metrics is the whole product, and / is what a person opening the port
+	// in a browser sees; it has to say where the metrics are.
+
+	// Arrange
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(prometheus.NewCounter(prometheus.CounterOpts{Name: "marker_total", Help: "Marker."}))
+	handler := buildServer("127.0.0.1:0", reg, quietLogger).Handler
+
+	// Act
+	metrics := serve(handler, "/metrics")
+	root := serve(handler, "/")
+
+	// Assert
+	if metrics.Code != http.StatusOK || !strings.Contains(metrics.Body.String(), "marker_total 0") {
+		t.Errorf("/metrics = %d %q, want 200 with the registry's metrics", metrics.Code, metrics.Body)
+	}
+	if root.Code != http.StatusOK || root.Body.String() != "kea-prom-exporter: see /metrics\n" {
+		t.Errorf("/ = %d %q, want 200 pointing at /metrics", root.Code, root.Body)
+	}
+}
+
+func TestBuildServerListensWhereToldAndBoundsHeaderReads(t *testing.T) {
+	// --listen must reach the server unchanged, and without a header timeout
+	// a client can hold a connection open by never finishing its headers.
+
+	// Arrange
+	const addr = "127.0.0.1:9547"
+
+	// Act
+	server := buildServer(addr, prometheus.NewRegistry(), quietLogger)
+
+	// Assert
+	if server.Addr != addr {
+		t.Errorf("Addr = %q, want %q", server.Addr, addr)
+	}
+	if server.ReadHeaderTimeout != 5*time.Second {
+		t.Errorf("ReadHeaderTimeout = %v, want 5s", server.ReadHeaderTimeout)
+	}
+}
+
+// blockingCollector counts its collections and holds each one until release
+// is closed.
+type blockingCollector struct {
+	desc    *prometheus.Desc
+	calls   atomic.Int32
+	entered chan struct{}
+	release <-chan struct{}
+}
+
+func (b *blockingCollector) Describe(ch chan<- *prometheus.Desc) { ch <- b.desc }
+
+func (b *blockingCollector) Collect(ch chan<- prometheus.Metric) {
+	if b.calls.Add(1) == 1 {
+		close(b.entered)
+	}
+	<-b.release
+	ch <- prometheus.MustNewConstMetric(b.desc, prometheus.GaugeValue, 1)
+}
+
+func TestBuildServerSharesOneCollectionBetweenConcurrentScrapes(t *testing.T) {
+	// Every collection is a round of scrapeCommands to a daemon that is also
+	// answering DHCP, so overlapping scrapers must share one collection
+	// rather than each driving their own.
+
+	// Arrange
+	collector := &blockingCollector{
+		desc:    prometheus.NewDesc("blocking", "Held until released.", nil, nil),
+		entered: make(chan struct{}),
+	}
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(collector)
+	handler := buildServer("127.0.0.1:0", reg, quietLogger).Handler
+	arrived := make(chan struct{}, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrived <- struct{}{}
+		handler.ServeHTTP(w, r)
+	}))
+	// Registered before the release, because cleanups run last-registered
+	// first: the collection is released before Close waits for the handlers
+	// blocked on it.
+	t.Cleanup(server.Close)
+	var release func()
+	collector.release, release = releaseOnCleanup(t)
+	bodies := make(chan string, 2)
+	scrape := func() {
+		_, body := httpGet(t, server.URL+"/metrics")
+		bodies <- body
+	}
+
+	// Act
+	go scrape()
+	receive(t, arrived, "the first scrape to reach the handler")
+	receive(t, collector.entered, "the first collection to start")
+	go scrape()
+	receive(t, arrived, "the second scrape to reach the handler")
+	// The second request has reached the handler but not necessarily joined
+	// the collection yet. If it has not by the time the first is released, it
+	// starts a second collection and the test fails; it cannot pass wrongly.
+	time.Sleep(100 * time.Millisecond)
+	release()
+	first := receive(t, bodies, "the first scrape to finish")
+	second := receive(t, bodies, "the second scrape to finish")
+
+	// Assert
+	for _, body := range []string{first, second} {
+		if !strings.Contains(body, "blocking 1") {
+			t.Errorf("scrape returned %q, want the shared collection's metrics", body)
+		}
+	}
+	if got := collector.calls.Load(); got != 1 {
+		t.Errorf("collector ran %d times for two concurrent scrapes, want 1", got)
+	}
+}
+
+// failingCollector reports a collection error for its only metric.
+type failingCollector struct{ desc *prometheus.Desc }
+
+func (f failingCollector) Describe(ch chan<- *prometheus.Desc) { ch <- f.desc }
+
+func (f failingCollector) Collect(ch chan<- prometheus.Metric) {
+	ch <- prometheus.NewInvalidMetric(f.desc, errors.New("collector exploded"))
+}
+
+func TestBuildServerLogsWhyAScrapeFailed(t *testing.T) {
+	// promhttp_metric_handler_errors_total counts failed scrapes but never
+	// says why; the log is the only place the reason appears.
+
+	// Arrange
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(failingCollector{prometheus.NewDesc("failing", "Always fails.", nil, nil)})
+	var logs bytes.Buffer
+	handler := buildServer("127.0.0.1:0", reg, slog.New(slog.NewTextHandler(&logs, nil))).Handler
+
+	// Act
+	response := serve(handler, "/metrics")
+
+	// Assert
+	if response.Code != http.StatusInternalServerError {
+		t.Errorf("/metrics = %d, want 500 when gathering fails", response.Code)
+	}
+	if got := logs.String(); !strings.Contains(got, "collector exploded") || !strings.Contains(got, "level=ERROR") {
+		t.Errorf("log = %q, want the gather error at level ERROR", got)
+	}
+}
+
+func TestShutdownGraceOutlastsTheSlowestScrape(t *testing.T) {
+	// A grace shorter than the slowest scrape cuts off the very response that
+	// graceful shutdown exists to deliver; the extra second is for writing the
+	// response out.
+	tests := []struct {
+		slowest time.Duration
+		want    time.Duration
+	}{
+		{0, time.Second},
+		{time.Second, 2 * time.Second},
+		{10 * time.Second, 11 * time.Second},
+		{time.Minute, 61 * time.Second},
+	}
+	for _, tc := range tests {
+		t.Run(tc.slowest.String(), func(t *testing.T) {
+			// Arrange
+			scrape := tc.slowest
+
+			// Act
+			grace := shutdownGrace(scrape)
+
+			// Assert
+			if grace != tc.want {
+				t.Errorf("shutdownGrace(%v) = %v, want %v", scrape, grace, tc.want)
+			}
+		})
+	}
+}
+
+func TestGraceIsActuallyWaitedOut(t *testing.T) {
+	// http.Server.Shutdown never aborts in-flight connections, so the drain
+	// test cannot tell a grace of five seconds from one of a nanosecond.
+	// Timing the shutdown is what distinguishes "waited" from "the parameter
+	// is ignored".
+
+	// Arrange
+	release, _ := releaseOnCleanup(t)
+	started := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hang", func(_ http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+	})
+	srv := &http.Server{Addr: freeAddr(t), Handler: mux, ReadHeaderTimeout: time.Second}
+	const grace = 300 * time.Millisecond
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		_ = serveUntilSignal(ctx, srv, grace, quietLogger, nil)
+		done <- time.Since(start)
+	}()
+	holdRequest(srv.Addr, "/hang")
+	receive(t, started, "the request to reach the handler")
 
 	// Act
 	cancel()
-	elapsed := <-done
-	releaseOnce.Do(func() { close(release) })
+	elapsed := receive(t, done, "the shutdown to finish")
 
-	// Assert -- it must wait out the grace, and not much beyond it.
+	// Assert
+	// It must wait out the grace, and not much beyond it.
 	if elapsed < grace {
 		t.Errorf("shutdown took %v with a %v grace; the grace is being ignored", elapsed, grace)
 	}
@@ -79,27 +313,18 @@ func TestSignalHandlingIsReleasedOnShutdown(t *testing.T) {
 	// passes nil for the callback, so this is the only place it is observed.
 
 	// Arrange
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	srv := &http.Server{Addr: addr, ReadHeaderTimeout: time.Second}
-
+	srv := &http.Server{Addr: freeAddr(t), ReadHeaderTimeout: time.Second}
 	var released atomic.Bool
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = serveUntilSignal(ctx, srv, time.Second, func() { released.Store(true) })
+		_ = serveUntilSignal(ctx, srv, time.Second, quietLogger, func() { released.Store(true) })
 	}()
-	// Give the listener a moment to bind before asking it to stop.
-	time.Sleep(50 * time.Millisecond)
 
 	// Act
 	cancel()
-	<-done
+	receive(t, done, "the shutdown to finish")
 
 	// Assert
 	if !released.Load() {
@@ -110,6 +335,7 @@ func TestSignalHandlingIsReleasedOnShutdown(t *testing.T) {
 func TestServeUntilSignalDrainsInFlightRequests(t *testing.T) {
 	// The point of the grace period: a request already being served must
 	// finish, and shutting down must not be reported as a failure.
+
 	// Arrange
 	started := make(chan struct{})
 	mux := http.NewServeMux()
@@ -118,114 +344,112 @@ func TestServeUntilSignalDrainsInFlightRequests(t *testing.T) {
 		time.Sleep(150 * time.Millisecond)
 		_, _ = w.Write([]byte("done"))
 	})
-
-	// Bind first so the test knows the port, then hand the server the address.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: time.Second}
-
+	srv := &http.Server{Addr: freeAddr(t), Handler: mux, ReadHeaderTimeout: time.Second}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- serveUntilSignal(ctx, srv, 5*time.Second, nil) }()
-
-	body := make(chan string, 1)
+	go func() { done <- serveUntilSignal(ctx, srv, 5*time.Second, quietLogger, nil) }()
+	received := make(chan string, 1)
 	go func() {
-		// Retry briefly: serveUntilSignal binds asynchronously to this goroutine.
+		// Retry briefly: the server binds in the goroutine above.
 		for range 50 {
-			resp, err := http.Get("http://" + addr + "/slow")
+			resp, err := testClient.Get("http://" + srv.Addr + "/slow")
 			if err != nil {
 				time.Sleep(10 * time.Millisecond)
 				continue
 			}
 			defer resp.Body.Close()
-			b, _ := io.ReadAll(resp.Body)
-			body <- string(b)
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				received <- "read failed: " + err.Error()
+				return
+			}
+			received <- string(body)
 			return
 		}
-		body <- "never connected"
+		received <- "never connected"
 	}()
 
 	// Act
-	<-started
+	receive(t, started, "the request to reach the handler")
 	cancel() // signal arrives mid-request
+	got := receive(t, received, "the in-flight response")
+	err := receive(t, done, "the shutdown to finish")
 
 	// Assert
-	if got := <-body; got != "done" {
+	if got != "done" {
 		t.Errorf("in-flight request returned %q, want it to complete with \"done\"", got)
 	}
-	if err := <-done; err != nil {
+	if err != nil {
 		t.Errorf("serveUntilSignal returned %v, want nil on a clean shutdown", err)
 	}
 }
 
 func TestServeUntilSignalGraceExpiryIsNotAFailure(t *testing.T) {
 	// A grace shorter than the in-flight work is the designed outcome of a
-	// grace period, not a process failure -- returning an error here made
-	// every `docker stop` of a busy exporter exit non-zero and look like a
-	// crash to Kubernetes and to alerting.
-	// Arrange -- the handler is released via Cleanup, not after the wait:
-	// releasing afterwards means a shutdown that ignores the grace hangs until
-	// the package timeout instead of failing in milliseconds.
-	mux := http.NewServeMux()
-	release := make(chan struct{})
-	var releaseOnce sync.Once
-	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	// grace period, not a process failure: an error here would make every
+	// `docker stop` of a busy exporter exit non-zero and look like a crash to
+	// Kubernetes and to alerting. The expiry is still worth a warning, and it
+	// and the other lifecycle lines go to the logger the exporter configured
+	// rather than the global default.
+
+	// Arrange
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	release, _ := releaseOnCleanup(t)
 	started := make(chan struct{})
-	mux.HandleFunc("/hang", func(w http.ResponseWriter, _ *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hang", func(_ http.ResponseWriter, _ *http.Request) {
 		close(started)
 		<-release
 	})
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: time.Second}
-
+	srv := &http.Server{Addr: freeAddr(t), Handler: mux, ReadHeaderTimeout: time.Second}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- serveUntilSignal(ctx, srv, 50*time.Millisecond, nil) }()
+	go func() { done <- serveUntilSignal(ctx, srv, 50*time.Millisecond, logger, nil) }()
+	holdRequest(srv.Addr, "/hang")
+	receive(t, started, "the request to reach the handler")
 
-	go func() {
-		for range 50 {
-			if resp, err := http.Get("http://" + addr + "/hang"); err == nil {
-				defer resp.Body.Close()
-				return
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}()
 	// Act
-	<-started
 	cancel()
+	err := receive(t, done, "the shutdown to finish")
 
 	// Assert
-	if err := <-done; err != nil {
+	if err != nil {
 		t.Errorf("serveUntilSignal returned %v, want nil when only the grace expired", err)
 	}
-	releaseOnce.Do(func() { close(release) })
+	for _, line := range []string{
+		`level=INFO msg=listening`,
+		`level=INFO msg="shutting down"`,
+		`level=WARN msg="shutdown grace expired`,
+	} {
+		if !strings.Contains(logs.String(), line) {
+			t.Errorf("log = %q, want %s on the given logger", logs.String(), line)
+		}
+	}
 }
 
 func TestServeUntilSignalReportsABindFailure(t *testing.T) {
 	// A port already in use must surface as an error, not as a "listening"
 	// line followed by silence.
+
 	// Arrange
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer listener.Close()
+	srv := &http.Server{Addr: listener.Addr().String(), ReadHeaderTimeout: time.Second}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
 
-	srv := &http.Server{Addr: ln.Addr().String(), ReadHeaderTimeout: time.Second}
+	// Act
+	err = serveUntilSignal(t.Context(), srv, time.Second, logger, nil)
 
-	// Act + Assert
-	if err := serveUntilSignal(t.Context(), srv, time.Second, nil); err == nil {
+	// Assert
+	if err == nil {
 		t.Error("serveUntilSignal returned nil for an address already in use")
+	}
+	if strings.Contains(logs.String(), "msg=listening") {
+		t.Errorf("log = %q, want no listening line for a bind that failed", logs.String())
 	}
 }

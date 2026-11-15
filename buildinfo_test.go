@@ -9,12 +9,11 @@ import (
 // Tests for buildinfo.go: what --version and kea_exporter_build_info report.
 
 func TestResolveFromBuildInfo(t *testing.T) {
-	// go test does not stamp VCS data into the test binary, so a test that
-	// calls debug.ReadBuildInfo can only skip -- which is why deleting the
-	// -dirty suffix and the vcs.revision lookup both left the suite green.
-	// Passing the build info in makes both reachable.
+	// --version and kea_exporter_build_info are how a deployment tells which
+	// commit it runs, so every shape of build info a binary can carry must
+	// resolve to the right identity.
 
-	// Arrange
+	// buildInfo builds the stamped settings a real build would carry.
 	buildInfo := func(settings map[string]string) *debug.BuildInfo {
 		info := &debug.BuildInfo{GoVersion: "go1.99.0"}
 		for key, value := range settings {
@@ -24,74 +23,75 @@ func TestResolveFromBuildInfo(t *testing.T) {
 	}
 
 	cases := []struct {
-		name          string
-		ver, rev      string
-		info          *debug.BuildInfo
-		ok            bool
-		wantVersion   string
-		wantRevision  string
-		wantGoVersion string
+		name             string
+		injectedVersion  string
+		injectedRevision string
+		info             *debug.BuildInfo
+		ok               bool
+		wantVersion      string
+		wantRevision     string
+		wantGoVersion    string
 	}{
 		{
-			name: "clean tree takes the stamped revision",
-			ver:  "dev", info: buildInfo(map[string]string{"vcs.revision": "abc123", "vcs.modified": "false"}), ok: true,
+			name:            "clean tree takes the stamped revision",
+			injectedVersion: "dev", info: buildInfo(map[string]string{"vcs.revision": "abc123", "vcs.modified": "false"}), ok: true,
 			wantVersion: "dev", wantGoVersion: "go1.99.0", wantRevision: "abc123",
 		},
 		{
-			// The suffix is the whole point: a dirty build is not the commit
-			// it names, and reporting the clean SHA hides that.
-			name: "dirty tree is marked",
-			ver:  "dev", info: buildInfo(map[string]string{"vcs.revision": "abc123", "vcs.modified": "true"}), ok: true,
+			name:            "dirty tree is marked",
+			injectedVersion: "dev", info: buildInfo(map[string]string{"vcs.revision": "abc123", "vcs.modified": "true"}), ok: true,
 			wantVersion: "dev", wantGoVersion: "go1.99.0", wantRevision: "abc123-dirty",
 		},
 		{
-			name: "an injected revision wins and is not second-guessed",
-			ver:  "v1.2.3", rev: "deadbeef",
+			name:            "an injected revision wins and is not second-guessed",
+			injectedVersion: "v1.2.3", injectedRevision: "deadbeef",
 			info: buildInfo(map[string]string{"vcs.revision": "abc123", "vcs.modified": "true"}), ok: true,
 			wantVersion: "v1.2.3", wantGoVersion: "go1.99.0", wantRevision: "deadbeef",
 		},
 		{
-			name: "no build info falls back to the placeholder",
-			ver:  "v1.2.3", ok: false,
+			name:            "no build info falls back to the placeholder",
+			injectedVersion: "v1.2.3", ok: false,
 			wantVersion: "v1.2.3", wantGoVersion: runtime.Version(), wantRevision: "unknown",
 		},
 		{
 			// ok true but no GoVersion: without the `info.GoVersion != ""`
 			// guard this emits an empty goversion label.
-			name: "build info with no Go version falls back to runtime",
-			ver:  "dev", info: &debug.BuildInfo{}, ok: true,
+			name:            "build info with no Go version falls back to runtime",
+			injectedVersion: "dev", info: &debug.BuildInfo{}, ok: true,
 			wantVersion: "dev", wantGoVersion: runtime.Version(), wantRevision: "unknown",
 		},
 		{
-			name: "build info without VCS settings",
-			ver:  "dev", info: buildInfo(nil), ok: true,
+			name:            "build info without VCS settings",
+			injectedVersion: "dev", info: buildInfo(nil), ok: true,
 			wantVersion: "dev", wantGoVersion: "go1.99.0", wantRevision: "unknown",
 		},
 		{
-			// Reachable: a workflow_dispatch release run produces no semver.
-			name: "an empty version becomes the placeholder",
-			ver:  "", rev: "abc123", info: buildInfo(nil), ok: true,
+			name:            "an empty version becomes the placeholder",
+			injectedVersion: "", injectedRevision: "abc123", info: buildInfo(nil), ok: true,
 			wantVersion: "dev", wantGoVersion: "go1.99.0", wantRevision: "abc123",
 		},
 		{
 			// Dirty with no revision must not produce a bare "-dirty".
-			name: "dirty without a revision stays unknown",
-			ver:  "dev", info: buildInfo(map[string]string{"vcs.modified": "true"}), ok: true,
+			name:            "dirty without a revision stays unknown",
+			injectedVersion: "dev", info: buildInfo(map[string]string{"vcs.modified": "true"}), ok: true,
 			wantVersion: "dev", wantGoVersion: "go1.99.0", wantRevision: "unknown",
 		},
 		{
 			// info present but ok false: this is what distinguishes the
 			// `ok &&` guard from an `info != nil &&` one.
-			name: "build info present but not ok is ignored",
-			ver:  "dev", info: buildInfo(map[string]string{"vcs.revision": "abc123"}), ok: false,
+			name:            "build info present but not ok is ignored",
+			injectedVersion: "dev", info: buildInfo(map[string]string{"vcs.revision": "abc123"}), ok: false,
 			wantVersion: "dev", wantGoVersion: runtime.Version(), wantRevision: "unknown",
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Arrange
+			info, ok := tc.info, tc.ok
+
 			// Act
-			id := resolveFrom(tc.ver, tc.rev, tc.info, tc.ok)
+			id := resolveFrom(tc.injectedVersion, tc.injectedRevision, info, ok)
 
 			// Assert
 			if id.version != tc.wantVersion {
@@ -102,8 +102,8 @@ func TestResolveFromBuildInfo(t *testing.T) {
 			}
 			// Asserted exactly, not merely non-empty: in-process
 			// debug.ReadBuildInfo().GoVersion equals runtime.Version(), so a
-			// test routing through the real build info cannot tell the
-			// difference and deleting the override survived.
+			// test routing through the real build info could not tell
+			// whether the override is there at all.
 			if id.goVersion != tc.wantGoVersion {
 				t.Errorf("goVersion = %q, want %q", id.goVersion, tc.wantGoVersion)
 			}
@@ -112,11 +112,8 @@ func TestResolveFromBuildInfo(t *testing.T) {
 }
 
 func TestResolveIdentityReadsTheRealBuildInfo(t *testing.T) {
-	// resolveFrom being testable is not enough: resolveIdentity is the only
-	// production path, and replacing its body with
-	// `resolveFrom(ver, rev, nil, false)` -- which deletes VCS stamping
-	// entirely -- kept the whole suite green. Swapping the seam is what makes
-	// that visible.
+	// resolveIdentity must take the revision and Go version from the build
+	// info, which only this test sees through the readBuildInfo seam.
 
 	// Arrange
 	original := readBuildInfo
@@ -134,12 +131,29 @@ func TestResolveIdentityReadsTheRealBuildInfo(t *testing.T) {
 	// Act
 	id := resolveIdentity("dev", "")
 
-	// Assert -- both the revision and the Go version must come from what the
-	// seam returned, proving resolveIdentity actually consults it.
+	// Assert
+	// Both the revision and the Go version must come from what the seam
+	// returned, proving resolveIdentity actually consults it.
 	if id.revision != "seam-dirty" {
 		t.Errorf("revision = %q, want seam-dirty; resolveIdentity is not reading the build info", id.revision)
 	}
 	if id.goVersion != "go0.0.0-sentinel" {
 		t.Errorf("goVersion = %q, want the sentinel; resolveIdentity is not reading the build info", id.goVersion)
+	}
+}
+
+func TestVersionLineNamesVersionRevisionAndGoVersion(t *testing.T) {
+	// --version is what a bug report quotes, so it must carry every part of
+	// the identity in a fixed shape.
+
+	// Arrange
+	id := buildID{version: "v1.2.3", revision: "cafebabe", goVersion: "go1.2.3"}
+
+	// Act
+	got := id.versionLine()
+
+	// Assert
+	if want := "kea-prom-exporter v1.2.3 (revision cafebabe, go1.2.3)"; got != want {
+		t.Errorf("versionLine() = %q, want %q", got, want)
 	}
 }
