@@ -3,9 +3,9 @@ package main
 // The Prometheus collector: the metric descriptors and the scrape that
 // fills them.
 //
-// One reason to change: the exported metric contract -- a metric added,
-// renamed, or relabelled. Which Kea statistic feeds which metric is
-// statmap.go.
+// One reason to change: what a scrape produces, meaning the metrics it exports
+// (added, renamed or relabelled) and the Kea commands it sends to get them.
+// Which Kea statistic feeds which metric is statmap.go.
 //
 // Kea symbols named below hold across the supported Kea releases; the
 // supported set is in README.md.
@@ -22,11 +22,30 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// collector implements prometheus.Collector. Each /metrics scrape
-// triggers a single statistic-get-all + status-get round trip — we
-// emit ConstMetrics inline rather than maintaining a pre-registered
-// gauge cache, which avoids label-set drift surprises when Kea adds new
-// statistic dimensions between releases.
+// supportedService is the only Kea service whose statistics are mapped.
+const supportedService = "dhcp4"
+
+// The control commands a scrape sends. Each name is also the `command` label
+// of kea_command_up and kea_scrape_errors_total.
+const (
+	cmdStatisticGetAll = "statistic-get-all"
+	cmdStatusGet       = "status-get"
+)
+
+// scrapeCommands are the control commands one Collect sends, in order and one
+// after the other.
+var scrapeCommands = []string{cmdStatisticGetAll, cmdStatusGet}
+
+// maxScrapeDuration is the longest a legitimate scrape can take: every command
+// in scrapeCommands running to its own deadline in turn.
+func maxScrapeDuration(keaTimeout time.Duration) time.Duration {
+	return time.Duration(len(scrapeCommands)) * effectiveTimeout(keaTimeout)
+}
+
+// collector implements prometheus.Collector. Each /metrics scrape triggers one
+// round of scrapeCommands. It emits ConstMetrics inline rather than
+// maintaining a pre-registered gauge cache, which avoids label-set drift
+// surprises when Kea adds new statistic dimensions between releases.
 type collector struct {
 	kea   *keaClient
 	build buildID
@@ -67,7 +86,7 @@ type collector struct {
 	scrapeSeconds *prometheus.Desc
 
 	// Count of statistics Kea reports that this exporter has no mapping for.
-	// The names are only logged, and only at debug -- a gauge makes drift
+	// The names are only logged, and only at debug, so a gauge makes drift
 	// after a Kea upgrade alertable without restarting at a higher log level.
 	unhandledStats *prometheus.Desc
 
@@ -77,24 +96,25 @@ type collector struct {
 	statErrorCount atomic.Uint64
 	haErrorCount   atomic.Uint64
 
-	// Track stat keys we don't have a mapping for. Logged exactly
-	// once each — keeps scrape noise low while still surfacing drift.
+	// Track stat keys we don't have a mapping for. Logged exactly once each,
+	// which keeps scrape noise low while still surfacing drift.
 	unhandledMu sync.Mutex
 	unhandled   map[string]struct{}
 
-	// Injected rather than taken from slog.Default() at each call site, so a
-	// test can assert on what the collector logs without mutating a global.
+	// slog.Default() as it stood when the collector was built. A field rather
+	// than a call at each log site, so a test can replace it and assert on
+	// what the collector logs without mutating a global.
 	log *slog.Logger
 
-	// Built once. It was rebuilt per statistic per scrape, which is ~33 map
-	// constructions a scrape for a value that never changes.
+	// Built once per collector, not per statistic per scrape: it never
+	// changes.
 	stats map[statID]statMetric
 }
 
-func newCollector(k *keaClient) *collector {
-	const ns = "kea_dhcp4"
+func newCollector(client *keaClient) *collector {
+	const ns = "kea_" + supportedService
 	c := &collector{
-		kea:       k,
+		kea:       client,
 		build:     buildIdentity(),
 		unhandled: make(map[string]struct{}),
 		log:       slog.Default(),
@@ -216,8 +236,8 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *collector) Collect(ch chan<- prometheus.Metric) {
-	// No shared deadline here: keaClient.call bounds each request on its own,
-	// so a slow first command cannot starve the second.
+	// No deadline here: newRequest gives each command its own, for the reason
+	// given there.
 	ctx := context.Background()
 	start := time.Now()
 
@@ -225,25 +245,25 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	haErr := c.collectHA(ctx, ch)
 
 	if statErr != nil {
-		c.log.Error("control command failed", "command", "statistic-get-all", "err", statErr)
+		c.log.Error("control command failed", "command", cmdStatisticGetAll, "err", statErr)
 	}
 	if haErr != nil {
-		c.log.Error("control command failed", "command", "status-get", "err", haErr)
+		c.log.Error("control command failed", "command", cmdStatusGet, "err", haErr)
 	}
 
-	// kea_up is 0 if ANY command failed. Reporting 1 while half the metric
-	// set is silently missing is worse than reporting down: an operator
-	// alerting on kea_up == 0 would never see a half-broken scrape.
+	// kea_up is 0 if ANY command failed. Reporting 1 while part of the metric
+	// set is silently missing is worse than reporting down: an alert on
+	// kea_up == 0 would never see a partly broken scrape.
 	upValue := 1.0
 	if statErr != nil || haErr != nil {
 		upValue = 0
 	}
 	ch <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, upValue)
 
-	// Per-command health and error counters, so the two failure modes are
-	// distinguishable without reading logs.
-	c.emitCommandHealth(ch, "statistic-get-all", statErr, &c.statErrorCount)
-	c.emitCommandHealth(ch, "status-get", haErr, &c.haErrorCount)
+	// Per-command health and error counters, so which command failed is
+	// visible without reading logs.
+	c.emitCommandHealth(ch, cmdStatisticGetAll, statErr, &c.statErrorCount)
+	c.emitCommandHealth(ch, cmdStatusGet, haErr, &c.haErrorCount)
 
 	c.unhandledMu.Lock()
 	unhandled := float64(len(c.unhandled))
@@ -254,7 +274,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		c.build.version, c.build.revision, c.build.goVersion)
 
 	// Emitted last so it covers everything above it, including the failure
-	// paths -- a scrape that timed out is exactly the one worth timing.
+	// paths: a scrape that timed out is exactly the one worth timing.
 	ch <- prometheus.MustNewConstMetric(c.scrapeSeconds, prometheus.GaugeValue, time.Since(start).Seconds())
 }
 
@@ -272,7 +292,7 @@ func (c *collector) emitCommandHealth(
 }
 
 func (c *collector) collectStats(ctx context.Context, ch chan<- prometheus.Metric) error {
-	resp, err := c.kea.call(ctx, "statistic-get-all")
+	resp, err := c.kea.call(ctx, cmdStatisticGetAll)
 	if err != nil {
 		return err
 	}
@@ -280,15 +300,15 @@ func (c *collector) collectStats(ctx context.Context, ch chan<- prometheus.Metri
 	// Numeric values may decode as float64 or as JSON number.
 	var stats map[string]json.RawMessage
 	if err := json.Unmarshal(resp.Arguments, &stats); err != nil {
-		return fmt.Errorf("decode statistic-get-all arguments: %w", err)
+		return fmt.Errorf("decode %s arguments: %w", cmdStatisticGetAll, err)
 	}
 	for key, raw := range stats {
 		val, ok := mostRecentValue(raw)
 		if !ok {
 			// Kea also reports string- and duration-typed statistics. Route
-			// them through the same once-only log as unmapped keys: dropping
-			// them silently left an absent metric with nothing anywhere
-			// explaining why.
+			// them through the same once-only log as unmapped keys: dropped
+			// silently, they would leave an absent metric with nothing
+			// anywhere explaining why.
 			c.noteUnhandled(key)
 			continue
 		}
@@ -331,18 +351,18 @@ func (c *collector) emitStat(ch chan<- prometheus.Metric, key string, value floa
 		return
 	}
 
-	m, ok := c.stats[id]
+	metric, ok := c.stats[id]
 	if !ok {
 		// classifyStat named an ID with no descriptor behind it. That is a bug
 		// in this package, not drift in Kea, so it must not be counted as an
-		// unhandled statistic -- kea_exporter_unhandled_statistics means
+		// unhandled statistic: kea_exporter_unhandled_statistics means
 		// "Kea reports something we do not map", and mislabelling this as that
 		// sends the reader looking at the wrong system.
 		c.log.Error("statistic classified to an ID with no descriptor; this is an exporter bug",
 			"statistic", key, "id", int(id))
 		return
 	}
-	ch <- prometheus.MustNewConstMetric(m.desc, m.typ, value, labels...)
+	ch <- prometheus.MustNewConstMetric(metric.desc, metric.typ, value, labels...)
 }
 
 func (c *collector) noteUnhandled(key string) {

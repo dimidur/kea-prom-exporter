@@ -1,7 +1,7 @@
 package main
 
 // Client for Kea's HTTP control socket, and the wire shapes its responses
-// decode into -- including the [[value, timestamp], ...] sample encoding.
+// decode into, including the [[value, timestamp], ...] sample encoding.
 //
 // One reason to change: Kea's control protocol or its JSON encoding.
 // What the values *mean* is statmap.go's problem, not this file's.
@@ -18,7 +18,7 @@ import (
 )
 
 // keaResponse is the shape of a single element in Kea's response array.
-// Kea wraps every command response in an array — one entry per service
+// Kea wraps every command response in an array, with one entry per service
 // the command was forwarded to.
 type keaResponse struct {
 	Result    int             `json:"result"`
@@ -26,6 +26,9 @@ type keaResponse struct {
 	Arguments json.RawMessage `json:"arguments,omitempty"`
 }
 
+// keaClient talks to one Kea control socket. Its fields other than client are
+// the Kea settings, and newKeaClient sets client. validateConfig decides which
+// settings are refused.
 type keaClient struct {
 	url      string
 	user     string
@@ -35,24 +38,36 @@ type keaClient struct {
 	client   *http.Client
 }
 
-// defaultKeaTimeout applies when a client is constructed without one. A zero
-// duration on context.WithTimeout is a deadline already past, and a negative
-// one likewise, so this is not a "no limit" fallback -- it is what stops an
-// unset field turning every call into an instant failure.
+// newKeaClient returns a client with the given settings and an HTTP client of
+// its own; any client in settings is replaced. The timeout bounds each
+// command, and the HTTP client's limit is twice that, a backstop for anything
+// the per-command deadline does not cover.
+func newKeaClient(settings keaClient) *keaClient {
+	client := settings
+	client.client = &http.Client{Timeout: 2 * effectiveTimeout(settings.timeout)}
+	return &client
+}
+
+// defaultKeaTimeout is the --kea-timeout default, and the fallback when the
+// timeout is zero or negative. Either of those on context.WithTimeout is a
+// deadline already past, so this is not a "no limit" fallback: it is what stops
+// such a setting turning every call into an instant failure.
 const defaultKeaTimeout = 5 * time.Second
 
-// effectiveTimeout exists so the fallback is assertable without a test that
-// waits for it to elapse.
-func effectiveTimeout(d time.Duration) time.Duration {
-	if d <= 0 {
+// effectiveTimeout is the one place the timeout fallback is decided. The
+// per-command deadline, the HTTP client's backstop and the scrape bound behind
+// the shutdown grace all go through it, so they cannot disagree about what a
+// zero timeout means.
+func effectiveTimeout(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
 		return defaultKeaTimeout
 	}
-	return d
+	return timeout
 }
 
 // keaCommand is marshalled rather than formatted into a string. The service
-// name is operator-supplied, and hand-built JSON would let a stray quote
-// change the command actually sent.
+// name comes from a flag, and hand-built JSON would let a stray quote change
+// the command actually sent.
 type keaCommand struct {
 	Command string   `json:"command"`
 	Service []string `json:"service"`
@@ -63,30 +78,14 @@ type keaCommand struct {
 // useful possible message for the most common misconfiguration.
 const errBodyLimit = 512
 
+// call sends command to Kea and returns its reply, as interpretResponse reads
+// it.
 func (k *keaClient) call(ctx context.Context, command string) (*keaResponse, error) {
-	service := k.service
-	if service == "" {
-		service = "dhcp4"
-	}
-	body, err := json.Marshal(keaCommand{Command: command, Service: []string{service}})
+	req, cancel, err := k.newRequest(ctx, command)
 	if err != nil {
-		return nil, fmt.Errorf("encode command %q: %w", command, err)
+		return nil, err
 	}
-
-	// Per-request deadline. One deadline shared across the whole scrape let a
-	// slow first command starve the second, whose failure was then reported
-	// as if the second command were at fault.
-	ctx, cancel := context.WithTimeout(ctx, effectiveTimeout(k.timeout))
 	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, k.url, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if k.user != "" {
-		req.SetBasicAuth(k.user, k.password)
-	}
 	resp, err := k.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("kea call %q: %w", command, err)
@@ -97,27 +96,57 @@ func (k *keaClient) call(ctx context.Context, command string) (*keaResponse, err
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, errBodyLimit))
 		_ = resp.Body.Close()
 	}()
+	return interpretResponse(command, resp.StatusCode, resp.Body)
+}
 
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		detail, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyLimit))
-		if msg := strings.TrimSpace(string(detail)); msg != "" {
-			return nil, fmt.Errorf("kea call %q: HTTP %d: %s", command, resp.StatusCode, msg)
-		}
-		return nil, fmt.Errorf("kea call %q: HTTP %d", command, resp.StatusCode)
+// newRequest builds the request that sends command to Kea, under a deadline of
+// its own. The caller calls cancel once the reply has been read.
+func (k *keaClient) newRequest(ctx context.Context, command string) (*http.Request, context.CancelFunc, error) {
+	body, err := json.Marshal(keaCommand{Command: command, Service: []string{k.service}})
+	if err != nil {
+		return nil, nil, fmt.Errorf("encode command %q: %w", command, err)
 	}
 
-	var arr []keaResponse
-	if err := json.NewDecoder(resp.Body).Decode(&arr); err != nil {
+	// Per-request deadline. One deadline shared across the whole scrape would
+	// let a slow first command starve the second, whose failure would then be
+	// reported as if the second command were at fault.
+	ctx, cancel := context.WithTimeout(ctx, effectiveTimeout(k.timeout))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, k.url, bytes.NewReader(body))
+	if err != nil {
+		cancel()
+		return nil, nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if k.user != "" {
+		req.SetBasicAuth(k.user, k.password)
+	}
+	return req, cancel, nil
+}
+
+// interpretResponse reads Kea's reply to command: the HTTP status and body it
+// answered with. It returns the reply's first response, or an error saying
+// why there is no usable one.
+func interpretResponse(command string, status int, body io.Reader) (*keaResponse, error) {
+	if status < 200 || status > 299 {
+		detail, _ := io.ReadAll(io.LimitReader(body, errBodyLimit))
+		if msg := strings.TrimSpace(string(detail)); msg != "" {
+			return nil, fmt.Errorf("kea call %q: HTTP %d: %s", command, status, msg)
+		}
+		return nil, fmt.Errorf("kea call %q: HTTP %d", command, status)
+	}
+
+	var replies []keaResponse
+	if err := json.NewDecoder(body).Decode(&replies); err != nil {
 		return nil, fmt.Errorf("decode response for %q: %w", command, err)
 	}
-	if len(arr) == 0 {
+	if len(replies) == 0 {
 		return nil, fmt.Errorf("empty response array for %q", command)
 	}
-	r := arr[0]
-	if r.Result != 0 {
-		return nil, fmt.Errorf("kea %q returned result=%d: %s", command, r.Result, r.Text)
+	first := replies[0]
+	if first.Result != 0 {
+		return nil, fmt.Errorf("kea %q returned result=%d: %s", command, first.Result, first.Text)
 	}
-	return &r, nil
+	return &first, nil
 }
 
 // mostRecentValue extracts the value of the newest sample from Kea's
@@ -136,9 +165,9 @@ func mostRecentValue(raw json.RawMessage) (float64, bool) {
 	if string(bytes.TrimSpace(samples[0][0])) == "null" {
 		return 0, false
 	}
-	var v float64
-	if err := json.Unmarshal(samples[0][0], &v); err != nil {
+	var value float64
+	if err := json.Unmarshal(samples[0][0], &value); err != nil {
 		return 0, false
 	}
-	return v, true
+	return value, true
 }
