@@ -29,6 +29,12 @@
       "rangeStrategy": "bump"
     },
     {
+      "description": "Indirect modules are pinned in go.mod like any other, so they move with every release too; Renovate leaves them alone by default.",
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["indirect"],
+      "enabled": true
+    },
+    {
       "description": "The renovate-version input of renovatebot/github-action has no place to write a digest, so a digest pin of it can never be applied.",
       "matchManagers": ["github-actions"],
       "matchDepTypes": ["uses-with"],
