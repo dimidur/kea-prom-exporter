@@ -10,18 +10,18 @@ rather than a public issue.
 
 It holds a credential for Kea's **control socket**, which is worth being
 explicit about: that socket is an administrative interface. This exporter only
-ever issues two read commands -- `statistic-get-all` and `status-get` -- but
-the credential it holds is not inherently read-only — anything else able to
-read that credential can drive the control socket fully.
+ever sends commands that read state, but the credential it holds is not
+inherently read-only: anything else able to read that credential can drive the
+control socket fully.
 
-- **Prefer `--kea-password-file` / `KEA_PASSWORD_FILE`** over the inline password
-  flag or env var. An environment variable is visible to anything that can run
-  `docker inspect`; a mounted file is not.
+- **Prefer `--kea-password-file` / `KEA_PASSWORD_FILE`** over the inline
+  password flag or env var. An environment variable is visible to anything
+  that can run `docker inspect`; a mounted file is not.
 - **Kea's HTTP control socket is plaintext** unless you have configured
-  `socket-type: https`. Keep the exporter and Kea on the same trusted segment, or
-  on the same host.
-- **Give Kea a dedicated control-socket account** if your deployment supports it,
-  rather than reusing an administrative one.
+  `socket-type: https`. Keep the exporter and Kea on the same trusted segment,
+  or on the same host.
+- **Give Kea a dedicated control-socket account** if your deployment supports
+  it, rather than reusing an administrative one.
 
 ## Exposure of the metrics endpoint
 
@@ -31,7 +31,7 @@ internal address and let your scraper reach it there rather than publishing it.
 
 ## Hardening in the shipped image
 
-- Static binary on distroless `static` — no shell, no package manager, no libc.
+- Static binary on distroless `static`: no shell, no package manager, no libc.
   It carries only a CA bundle, a `/etc/passwd` entry, `/tmp` and tzdata.
 - **Runs as uid 65532 (`nonroot`)**, a dedicated identity with its own passwd
   entry rather than the shared `nobody`. Kubernetes `runAsNonRoot` and
@@ -50,5 +50,5 @@ ship a CA bundle. If you are pinned to v0.2.0 or earlier and need
 
 ## Supported versions
 
-The most recent release. This is a small project — fixes go into a new release
-rather than being backported.
+The most recent release. This is a small project, so fixes go into a new
+release rather than being backported.

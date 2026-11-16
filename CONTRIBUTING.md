@@ -75,8 +75,8 @@ The same carve-out covers the inline `status-get` payloads in `ha_test.go`, for
 HA topologies that cannot be captured either: a downed partner, a backup
 server, and a hub with several relationships. **Check them against the Kea
 source before trusting them**: a payload the daemon would reject makes a test
-that passes while proving nothing. Two constraints are easy to violate and are
-enforced at config time, not in the `status-get` response:
+that passes while proving nothing. These constraints are easy to violate and
+are enforced at config time, not in the `status-get` response:
 
 - Server names must be unique across *all* relationships
   (`HAConfigParser::parseOne`, `HARelationshipMapper::map`).
@@ -99,10 +99,10 @@ func TestSomething(t *testing.T) {
     // Why this matters, in one or two lines.
 
     // Arrange
-    srv := keaStub(t, ...)
+    collector := newCollector(newFakeKea(statistics, status), quietLogger)
 
     // Act
-    got := collectAll(c)
+    got := collectAll(collector)
 
     // Assert
     if len(got) == 0 { ... }

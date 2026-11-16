@@ -1,13 +1,15 @@
 package main
 
 import (
+	"log/slog"
 	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
-// Tests for ha.go: decoding the HA hook's status-get payload.
+// Tests for ha.go: the HA part of a scrape, from the status-get payload to the
+// HA metrics it yields.
 //
 // Kea symbols named below hold across the supported Kea releases; the
 // supported set is in README.md.
@@ -17,10 +19,10 @@ func TestEveryHARelationshipIsExported(t *testing.T) {
 	// one is exported, told apart by its labels. The two below differ in
 	// every field, so exporting one twice or dropping either is visible.
 
-	// Arrange -- the shape HAImpl::commandProcessed builds: a list of
+	// Arrange: the shape HAImpl::commandProcessed builds, a list of
 	// {ha-servers, ha-mode} with no relationship identifier of its own.
 	//
-	// Two config-time constraints shape the payload:
+	// Config-time constraints shape the payload:
 	//
 	//  - Server names are unique across ALL relationships, so the hub carries
 	//    a different this-server-name in each. HAConfigParser::parseOne
@@ -34,7 +36,7 @@ func TestEveryHARelationshipIsExported(t *testing.T) {
 	// relationship and each branch is the primary. And communication-
 	// interrupted is only true where age exceeds max-response-delay, since
 	// CommunicationState::isCommunicationInterrupted is exactly
-	// getDurationInMillisecs() > getMaxResponseDelay(), whose default is
+	// `getDurationInMillisecs() > getMaxResponseDelay()`, whose default is
 	// 60000ms.
 	status := []byte(`[{"result":0,"arguments":{"high-availability":[
 	  {"ha-mode":"hot-standby","ha-servers":{
@@ -45,9 +47,8 @@ func TestEveryHARelationshipIsExported(t *testing.T) {
 	   "local":{"role":"standby","state":"partner-down","server-name":"server4"},
 	   "remote":{"age":94,"communication-interrupted":true,"in-touch":true,
 	             "last-state":"unavailable","role":"primary","server-name":"server3"}}}]}}]`)
-	srv := keaStub(t, fixture(t, "statistic-get-all.json"), status)
-	defer srv.Close()
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	kea := newFakeKea(fixture(t, "statistic-get-all.json"), status)
+	collector := newCollector(kea, quietLogger)
 
 	// relationship is min(local, remote): "server1" and "server3", the remote
 	// names here rather than the local ones. Deriving it from local would
@@ -63,7 +64,7 @@ kea_dhcp4_ha_partner_last_contact_seconds{peer="server1",relationship="server1"}
 kea_dhcp4_ha_partner_last_contact_seconds{peer="server3",relationship="server3"} 94
 `
 	// Act + Assert
-	if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
+	if err := testutil.CollectAndCompare(collector, strings.NewReader(expected),
 		"kea_dhcp4_ha_communication_interrupted",
 		"kea_dhcp4_ha_partner_last_contact_seconds"); err != nil {
 		t.Errorf("multi-relationship metrics: %v", err)
@@ -91,9 +92,8 @@ func TestRelationshipLabelIsIdenticalFromBothPeers(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Arrange
-			srv := keaStub(t, fixture(t, tc.statistics), fixture(t, tc.status))
-			defer srv.Close()
-			c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+			kea := newFakeKea(fixture(t, tc.statistics), fixture(t, tc.status))
+			collector := newCollector(kea, quietLogger)
 
 			// The relationship label is the same string in both subtests;
 			// only peer flips. That is the property being pinned.
@@ -103,7 +103,7 @@ func TestRelationshipLabelIsIdenticalFromBothPeers(t *testing.T) {
 kea_dhcp4_ha_partner_in_touch{peer="` + tc.wantPeer + `",relationship="kea-primary"} 1
 `
 			// Act + Assert
-			if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
+			if err := testutil.CollectAndCompare(collector, strings.NewReader(expected),
 				"kea_dhcp4_ha_partner_in_touch"); err != nil {
 				t.Errorf("%s: %v", tc.name, err)
 			}
@@ -115,10 +115,9 @@ func TestPartnerStateAndRoleAreExported(t *testing.T) {
 	// Partner state is the other half of HA visibility: local state alone
 	// cannot distinguish "my partner is syncing" from "my partner is gone".
 
-	// Arrange -- the real primary capture, whose partner reports hot-standby.
-	srv := keaStub(t, fixture(t, "statistic-get-all.json"), fixture(t, "status-get.json"))
-	defer srv.Close()
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	// Arrange: the real primary capture, whose partner reports hot-standby.
+	kea := healthyKea(t)
+	collector := newCollector(kea, quietLogger)
 
 	expected := `
 # HELP kea_dhcp4_ha_partner_state_info HA state of the partner as last reported to this peer (info-metric; value always 1). Absent until the partner has been contacted at least once, because Kea reports an empty state until then.
@@ -126,7 +125,7 @@ func TestPartnerStateAndRoleAreExported(t *testing.T) {
 kea_dhcp4_ha_partner_state_info{peer="kea-standby",relationship="kea-primary",role="standby",state="hot-standby"} 1
 `
 	// Act + Assert
-	if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
+	if err := testutil.CollectAndCompare(collector, strings.NewReader(expected),
 		"kea_dhcp4_ha_partner_state_info"); err != nil {
 		t.Errorf("partner state: %v", err)
 	}
@@ -135,7 +134,7 @@ kea_dhcp4_ha_partner_state_info{peer="kea-standby",relationship="kea-primary",ro
 func TestPartnerStateIsOmittedWhenKeaReportsItEmpty(t *testing.T) {
 	// The CommunicationState constructor starts partner_state_ at -1 and
 	// stateToString rejects it, so getReport's try/catch writes last-state:""
-	// for a partner never contacted. Exporting that yields state="" -- the
+	// for a partner never contacted. Exporting that yields state="", the
 	// same class of falsehood as reporting age 0 as "contacted 0 seconds
 	// ago". The metric is withheld instead.
 
@@ -144,12 +143,11 @@ func TestPartnerStateIsOmittedWhenKeaReportsItEmpty(t *testing.T) {
 	  "ha-servers":{"local":{"role":"primary","state":"waiting","server-name":"a"},
 	  "remote":{"age":0,"communication-interrupted":true,"in-touch":false,
 	            "last-state":"","role":"standby","server-name":"b"}}}]}}]`)
-	srv := keaStub(t, fixture(t, "statistic-get-all.json"), status)
-	defer srv.Close()
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	kea := newFakeKea(fixture(t, "statistic-get-all.json"), status)
+	collector := newCollector(kea, quietLogger)
 
 	// Act
-	got := testutil.CollectAndCount(c, "kea_dhcp4_ha_partner_state_info")
+	got := testutil.CollectAndCount(collector, "kea_dhcp4_ha_partner_state_info")
 
 	// Assert
 	if got != 0 {
@@ -167,15 +165,14 @@ func TestUnavailablePartnerStateIsStillExported(t *testing.T) {
 	// getPartnerState() > 0 and HA_UNAVAILABLE_ST is a large positive
 	// constant. This test does not distinguish the last-state gate from an
 	// in-touch gate, and no test can, because the two are equivalent for
-	// every input Kea can produce -- see the gate in ha.go.
+	// every input Kea can produce; see the gate in ha.go.
 
-	// Arrange -- the partner-down fixture, which is the situation producing
+	// Arrange: the partner-down fixture, which is the situation producing
 	// this state: every path concluding the partner is gone calls
 	// CommunicationState::setPartnerUnavailable, which writes exactly
 	// "unavailable".
-	srv := keaStub(t, fixture(t, "statistic-get-all-standby.json"), fixture(t, "status-get-partner-down.json"))
-	defer srv.Close()
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	kea := newFakeKea(fixture(t, "statistic-get-all-standby.json"), fixture(t, "status-get-partner-down.json"))
+	collector := newCollector(kea, quietLogger)
 
 	expected := `
 # HELP kea_dhcp4_ha_partner_state_info HA state of the partner as last reported to this peer (info-metric; value always 1). Absent until the partner has been contacted at least once, because Kea reports an empty state until then.
@@ -183,7 +180,7 @@ func TestUnavailablePartnerStateIsStillExported(t *testing.T) {
 kea_dhcp4_ha_partner_state_info{peer="kea-primary",relationship="kea-primary",role="primary",state="unavailable"} 1
 `
 	// Act + Assert
-	if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
+	if err := testutil.CollectAndCompare(collector, strings.NewReader(expected),
 		"kea_dhcp4_ha_partner_state_info"); err != nil {
 		t.Errorf("unavailable partner state: %v", err)
 	}
@@ -200,17 +197,16 @@ func TestBackupServerHasNoPartnerMetrics(t *testing.T) {
 	// Arrange
 	status := []byte(`[{"result":0,"arguments":{"high-availability":[{"ha-mode":"passive-backup",
 	  "ha-servers":{"local":{"role":"backup","state":"backup","server-name":"archive"}}}]}}]`)
-	srv := keaStub(t, fixture(t, "statistic-get-all.json"), status)
-	defer srv.Close()
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	kea := newFakeKea(fixture(t, "statistic-get-all.json"), status)
+	collector := newCollector(kea, quietLogger)
 
 	expected := `
 # HELP kea_dhcp4_ha_local_state_info HA state of this peer (info-metric; value always 1; state in label).
 # TYPE kea_dhcp4_ha_local_state_info gauge
 kea_dhcp4_ha_local_state_info{mode="passive-backup",peer="archive",relationship="archive",role="backup",state="backup"} 1
 `
-	// Act + Assert -- local state present and labelled by the local name...
-	if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
+	// Act + Assert: local state present and labelled by the local name...
+	if err := testutil.CollectAndCompare(collector, strings.NewReader(expected),
 		"kea_dhcp4_ha_local_state_info"); err != nil {
 		t.Errorf("backup local state: %v", err)
 	}
@@ -221,27 +217,24 @@ kea_dhcp4_ha_local_state_info{mode="passive-backup",peer="archive",relationship=
 		"kea_dhcp4_ha_communication_interrupted",
 		"kea_dhcp4_ha_partner_last_contact_seconds",
 	} {
-		if got := testutil.CollectAndCount(c, name); got != 0 {
+		if got := testutil.CollectAndCount(collector, name); got != 0 {
 			t.Errorf("%s emitted %d series with no partner configured, want none", name, got)
 		}
 	}
 }
 
 func TestIdentityDerivesLabelsFromWhicheverNamesKeaGave(t *testing.T) {
-	// identity has four arms and the collector-level tests only ever reach
-	// two of them, because a healthy Kea always names both servers. The
-	// remaining arms decide what happens when a name is missing, and deleting
-	// either of them left the whole suite green -- so they are pinned here,
-	// where each arm is one row.
-
-	// Arrange
+	// The collector-level tests only reach the arms of identity where Kea
+	// names both servers, because a healthy Kea always does. The arms for a
+	// missing name are reached nowhere else, so they are pinned here, one row
+	// each.
 	named := func(local, remote string) haRelationship {
-		var r haRelationship
-		r.HAServers.Local.ServerName = local
+		var relationship haRelationship
+		relationship.HAServers.Local.ServerName = local
 		if remote != "-" {
-			r.HAServers.Remote = &haRemote{ServerName: remote}
+			relationship.HAServers.Remote = &haRemote{ServerName: remote}
 		}
-		return r
+		return relationship
 	}
 	cases := []struct {
 		name              string
@@ -264,8 +257,11 @@ func TestIdentityDerivesLabelsFromWhicheverNamesKeaGave(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Arrange
+			relationship := named(tc.local, tc.remote)
+
 			// Act
-			gotRel, gotPeer := named(tc.local, tc.remote).identity()
+			gotRel, gotPeer := relationship.identity()
 
 			// Assert
 			if gotRel != tc.wantRel || gotPeer != tc.wantPeer {
@@ -277,7 +273,7 @@ func TestIdentityDerivesLabelsFromWhicheverNamesKeaGave(t *testing.T) {
 }
 
 func TestCollidingIdentitiesDoNotDestroyTheWholeScrape(t *testing.T) {
-	// Kea's own loader makes these inputs impossible -- peer names are unique
+	// Kea's own loader makes these inputs impossible: peer names are unique
 	// across a daemon's relationships or the hook does not load (see the
 	// citations on identity). They are still worth defending against, because
 	// a duplicate label set does not fail one metric: it fails the entire
@@ -324,7 +320,7 @@ kea_dhcp4_ha_local_state_info{mode="passive-backup",peer="hub",relationship="hub
 			// A suffixed identity that collides in turn, which is the only
 			// input where the suffix loop iterates more than once. With a
 			// plain `if` instead of the loop, entries 2 and 3 both land on
-			// "x#2" and Gather dies -- so this is what stops the loop being
+			// "x#2" and Gather dies, so this is what stops the loop being
 			// decorative. Entry 2 is named "x#2" outright, which is a legal
 			// Kea server name.
 			name: "a suffix that collides in turn",
@@ -357,11 +353,10 @@ kea_dhcp4_ha_partner_last_contact_seconds{peer="0",relationship="0"} 2`,
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Arrange
-			srv := keaStub(t, fixture(t, "statistic-get-all.json"), []byte(tc.status))
-			defer srv.Close()
-			c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+			kea := newFakeKea(fixture(t, "statistic-get-all.json"), []byte(tc.status))
+			collector := newCollector(kea, quietLogger)
 
-			// Act + Assert -- the unrelated metrics must survive. Gather
+			// Act + Assert: the unrelated metrics must survive. Gather
 			// fails as a whole on a duplicate, so this goes red for any
 			// collision regardless of which HA metric caused it.
 			subnets := `
@@ -369,7 +364,7 @@ kea_dhcp4_ha_partner_last_contact_seconds{peer="0",relationship="0"} 2`,
 # TYPE kea_dhcp4_addresses_assigned gauge
 kea_dhcp4_addresses_assigned{subnet="1"} 23
 `
-			if err := testutil.CollectAndCompare(c, strings.NewReader(subnets),
+			if err := testutil.CollectAndCompare(collector, strings.NewReader(subnets),
 				"kea_dhcp4_addresses_assigned"); err != nil {
 				t.Errorf("an HA label collision took the subnet gauges with it: %v", err)
 			}
@@ -379,7 +374,7 @@ kea_dhcp4_addresses_assigned{subnet="1"} 23
 			if tc.want != "" {
 				expected := "\n# HELP kea_dhcp4_ha_partner_last_contact_seconds Seconds since the last successful heartbeat from the HA partner. Absent until the partner has been contacted at least once.\n" +
 					"# TYPE kea_dhcp4_ha_partner_last_contact_seconds gauge\n" + tc.want + "\n"
-				if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
+				if err := testutil.CollectAndCompare(collector, strings.NewReader(expected),
 					"kea_dhcp4_ha_partner_last_contact_seconds"); err != nil {
 					t.Errorf("colliding identities: %v", err)
 				}
@@ -387,7 +382,7 @@ kea_dhcp4_addresses_assigned{subnet="1"} 23
 			if tc.wantLocal != "" {
 				expected := "\n# HELP kea_dhcp4_ha_local_state_info HA state of this peer (info-metric; value always 1; state in label).\n" +
 					"# TYPE kea_dhcp4_ha_local_state_info gauge\n" + tc.wantLocal + "\n"
-				if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
+				if err := testutil.CollectAndCompare(collector, strings.NewReader(expected),
 					"kea_dhcp4_ha_local_state_info"); err != nil {
 					t.Errorf("colliding identities (local state): %v", err)
 				}
@@ -398,36 +393,38 @@ kea_dhcp4_addresses_assigned{subnet="1"} 23
 
 func TestStatusGetDecodeErrorFailsTheScrape(t *testing.T) {
 	// A status-get whose arguments do not decode is a broken scrape, not an
-	// absent HA hook. Swallowing the error reported kea_up 1 with no HA
-	// metrics -- indistinguishable from the hook not being loaded.
+	// absent HA hook. Swallowing the error would report kea_up 1 with no HA
+	// metrics, indistinguishable from the hook not being loaded.
 
 	// Arrange
 	status := []byte(`[{"result":0,"arguments":{"high-availability":"not-an-array"}}]`)
-	srv := keaStub(t, fixture(t, "statistic-get-all.json"), status)
-	defer srv.Close()
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	kea := newFakeKea(fixture(t, "statistic-get-all.json"), status)
+	logger, logs := capturingLogger(slog.LevelInfo)
+	collector := newCollector(kea, logger)
 
 	// Act
-	got := testutil.ToFloat64(upOnly{c})
+	got := testutil.ToFloat64(upOnly{collector})
 
 	// Assert
 	if got != 0 {
 		t.Errorf("kea_up = %v when status-get could not be decoded, want 0", got)
 	}
+	if !strings.Contains(logs.String(), "decode status-get arguments") {
+		t.Errorf("log = %q, want the decode failure attributed to status-get", logs.String())
+	}
 }
 
 func TestPartnerDownIsReported(t *testing.T) {
-	// kea_dhcp4_ha_communication_interrupted is the metric an operator alerts
-	// on, and it was only ever asserted as 0 -- so replacing the branch with a
-	// constant 0 kept the whole suite green. A partner-down pair cannot be
-	// captured without breaking production DHCP, so this is the live standby
-	// capture with the one boolean flipped and the local state moved to
-	// partner-down, per the fixture carve-out in CONTRIBUTING.
+	// kea_dhcp4_ha_communication_interrupted is the metric people alert on,
+	// and the other tests only ever see it at 0, so a constant 0 in its place
+	// would pass them. A partner-down pair cannot be captured without
+	// breaking production DHCP, so this is the live standby capture with the
+	// one boolean flipped and the local state moved to partner-down, per the
+	// fixture carve-out in CONTRIBUTING.
 
 	// Arrange
-	srv := keaStub(t, fixture(t, "statistic-get-all-standby.json"), fixture(t, "status-get-partner-down.json"))
-	defer srv.Close()
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	kea := newFakeKea(fixture(t, "statistic-get-all-standby.json"), fixture(t, "status-get-partner-down.json"))
+	collector := newCollector(kea, quietLogger)
 
 	expected := `
 # HELP kea_dhcp4_ha_communication_interrupted 1 if HA communication with the partner is interrupted, else 0.
@@ -442,63 +439,61 @@ kea_dhcp4_ha_partner_last_contact_seconds{peer="kea-primary",relationship="kea-p
 `
 
 	// Act + Assert
-	if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
+	if err := testutil.CollectAndCompare(collector, strings.NewReader(expected),
 		"kea_dhcp4_ha_communication_interrupted", "kea_dhcp4_ha_local_state_info",
 		"kea_dhcp4_ha_partner_last_contact_seconds"); err != nil {
 		t.Errorf("partner-down metrics: %v", err)
 	}
 
 	// Losing the partner is not a scrape failure: the exporter is fine and the
-	// HA metrics are precisely how the operator learns the pair is degraded.
-	if got := testutil.ToFloat64(upOnly{c}); got != 1 {
+	// HA metrics are precisely how whoever runs it learns the pair is degraded.
+	if got := testutil.ToFloat64(upOnly{collector}); got != 1 {
 		t.Errorf("kea_up = %v with the partner down, want 1", got)
 	}
 }
 
 func TestHAHookAbsentIsDistinguishableFromScrapeFailure(t *testing.T) {
 	// No `high-availability` key means the hook is not loaded. That must be
-	// an explicit 0, not silence -- otherwise it is indistinguishable from
-	// status-get having failed.
+	// an explicit 0, not silence, or it is indistinguishable from status-get
+	// having failed.
+
 	// Arrange
 	status := []byte(`[{"result":0,"arguments":{"pid":1,"uptime":10}}]`)
-	srv := keaStub(t, fixture(t, "statistic-get-all.json"), status)
-	defer srv.Close()
-
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	kea := newFakeKea(fixture(t, "statistic-get-all.json"), status)
+	collector := newCollector(kea, quietLogger)
 	expected := `
 # HELP kea_dhcp4_ha_enabled 1 when Kea reports an HA relationship, 0 when the HA hook is not loaded.
 # TYPE kea_dhcp4_ha_enabled gauge
 kea_dhcp4_ha_enabled 0
 `
 	// Act + Assert
-	if err := testutil.CollectAndCompare(c, strings.NewReader(expected), "kea_dhcp4_ha_enabled"); err != nil {
+	if err := testutil.CollectAndCompare(collector, strings.NewReader(expected), "kea_dhcp4_ha_enabled"); err != nil {
 		t.Errorf("ha_enabled: %v", err)
 	}
 	// And the scrape itself is healthy: an absent hook is not an error.
-	if got := testutil.ToFloat64(upOnly{c}); got != 1 {
+	if got := testutil.ToFloat64(upOnly{collector}); got != 1 {
 		t.Errorf("kea_up = %v with the HA hook absent, want 1", got)
 	}
 }
 
 func TestPartnerAgeIsAbsentUntilInTouch(t *testing.T) {
 	// Kea reports age 0 when it has never reached the partner. Exported
-	// unconditionally that reads as "contacted 0 seconds ago" -- the inverse
-	// of the truth -- so the gauge is withheld until in-touch is true.
+	// unconditionally, that reads as "contacted 0 seconds ago", the inverse
+	// of the truth, so the gauge is withheld until in-touch is true.
+
 	// Arrange
 	status := []byte(`[{"result":0,"arguments":{"high-availability":[{"ha-mode":"hot-standby",
 	  "ha-servers":{"local":{"role":"primary","state":"waiting","server-name":"a"},
 	  "remote":{"age":0,"communication-interrupted":true,"in-touch":false,"server-name":"b"}}}]}}]`)
-	srv := keaStub(t, fixture(t, "statistic-get-all.json"), status)
-	defer srv.Close()
-
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	kea := newFakeKea(fixture(t, "statistic-get-all.json"), status)
+	collector := newCollector(kea, quietLogger)
 	expected := `
 # HELP kea_dhcp4_ha_partner_in_touch 1 once this peer has been in contact with its HA partner, else 0.
 # TYPE kea_dhcp4_ha_partner_in_touch gauge
 kea_dhcp4_ha_partner_in_touch{peer="b",relationship="a"} 0
 `
 	// Act + Assert
-	if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
+	if err := testutil.CollectAndCompare(collector, strings.NewReader(expected),
 		"kea_dhcp4_ha_partner_in_touch", "kea_dhcp4_ha_partner_last_contact_seconds"); err != nil {
 		t.Errorf("partner contact metrics: %v", err)
 	}

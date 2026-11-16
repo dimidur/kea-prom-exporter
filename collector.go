@@ -42,12 +42,21 @@ func maxScrapeDuration(keaTimeout time.Duration) time.Duration {
 	return time.Duration(len(scrapeCommands)) * effectiveTimeout(keaTimeout)
 }
 
+// keaCaller is what the collector needs from Kea: one control command and
+// its reply. Each call bounds itself with a deadline of its own, and callers
+// pass a context without one, so a slow command cannot eat into the time of
+// the next; maxScrapeDuration, and the shutdown grace built on it, rely on
+// that. *keaClient is the implementation.
+type keaCaller interface {
+	call(ctx context.Context, command string) (*keaResponse, error)
+}
+
 // collector implements prometheus.Collector. Each /metrics scrape triggers one
 // round of scrapeCommands. It emits ConstMetrics inline rather than
 // maintaining a pre-registered gauge cache, which avoids label-set drift
 // surprises when Kea adds new statistic dimensions between releases.
 type collector struct {
-	kea   *keaClient
+	kea   keaCaller
 	build buildID
 
 	// Scrape health.
@@ -96,14 +105,14 @@ type collector struct {
 	statErrorCount atomic.Uint64
 	haErrorCount   atomic.Uint64
 
-	// Track stat keys we don't have a mapping for. Logged exactly once each,
-	// which keeps scrape noise low while still surfacing drift.
-	unhandledMu sync.Mutex
-	unhandled   map[string]struct{}
+	// Stat keys without a mapping, each logged once, which keeps scrape noise
+	// low while still surfacing drift. unhandledCount is the set's size, kept
+	// beside it so Collect reads it without taking the lock.
+	unhandledMu    sync.Mutex
+	unhandled      map[string]struct{}
+	unhandledCount atomic.Int64
 
-	// slog.Default() as it stood when the collector was built. A field rather
-	// than a call at each log site, so a test can replace it and assert on
-	// what the collector logs without mutating a global.
+	// Where command failures, statistic drift and exporter bugs are logged.
 	log *slog.Logger
 
 	// Built once per collector, not per statistic per scrape: it never
@@ -111,13 +120,14 @@ type collector struct {
 	stats map[statID]statMetric
 }
 
-func newCollector(client *keaClient) *collector {
-	const ns = "kea_" + supportedService
-	c := &collector{
-		kea:       client,
+// newCollector returns a collector that scrapes kea and logs to logger.
+func newCollector(kea keaCaller, logger *slog.Logger) *collector {
+	const namespace = "kea_" + supportedService
+	collector := &collector{
+		kea:       kea,
 		build:     buildIdentity(),
 		unhandled: make(map[string]struct{}),
-		log:       slog.Default(),
+		log:       logger,
 
 		up: prometheus.NewDesc(
 			"kea_up", "1 if the last scrape of the Kea control socket succeeded, else 0.",
@@ -135,37 +145,37 @@ func newCollector(client *keaClient) *collector {
 		// over-counts. The HELP text carries the consequence; the citation
 		// stays here rather than in it, since HELP ships on every scrape.
 		addressesAssigned: prometheus.NewDesc(
-			ns+"_addresses_assigned", "Currently assigned IPv4 addresses in the pool. Includes declined addresses: Kea keeps them assigned so pool-utilisation stays meaningful, so do not add "+ns+"_addresses_declined to this.",
+			namespace+"_addresses_assigned", "Currently assigned IPv4 addresses in the pool. Includes declined addresses: Kea keeps them assigned so pool-utilisation stays meaningful, so do not add "+namespace+"_addresses_declined to this.",
 			[]string{"subnet"}, nil),
 		addressesCapacity: prometheus.NewDesc(
-			ns+"_addresses_capacity", "Pool size: total IPv4 addresses available in the subnet.",
+			namespace+"_addresses_capacity", "Pool size: total IPv4 addresses available in the subnet.",
 			[]string{"subnet"}, nil),
 		addressesDeclined: prometheus.NewDesc(
-			ns+"_addresses_declined", "Addresses currently withdrawn from the pool by a DHCPDECLINE.",
+			namespace+"_addresses_declined", "Addresses currently withdrawn from the pool by a DHCPDECLINE.",
 			[]string{"subnet"}, nil),
 
 		pkt4Received: prometheus.NewDesc(
-			ns+"_packets_received_total", "Total DHCPv4 packets received by type.",
+			namespace+"_packets_received_total", "Total DHCPv4 packets received by type.",
 			[]string{"type"}, nil),
 		pkt4Sent: prometheus.NewDesc(
-			ns+"_packets_sent_total", "Total DHCPv4 packets sent by type.",
+			namespace+"_packets_sent_total", "Total DHCPv4 packets sent by type.",
 			[]string{"type"}, nil),
 		pkt4Dropped: prometheus.NewDesc(
-			ns+"_packets_dropped_total",
-			"Total inbound DHCPv4 packets dropped. Equal to the sum of "+ns+"_packets_dropped_by_reason_total, and stays correct when a Kea release adds a reason this exporter does not know.",
+			namespace+"_packets_dropped_total",
+			"Total inbound DHCPv4 packets dropped. Equal to the sum of "+namespace+"_packets_dropped_by_reason_total, and stays correct when a Kea release adds a reason this exporter does not know.",
 			nil, nil),
 		pkt4DropReasons: prometheus.NewDesc(
-			ns+"_packets_dropped_by_reason_total",
-			"Inbound DHCPv4 packets dropped, by reason. These sum to "+ns+"_packets_dropped_total, so use one or the other -- adding them together double-counts.",
+			namespace+"_packets_dropped_by_reason_total",
+			"Inbound DHCPv4 packets dropped, by reason. These sum to "+namespace+"_packets_dropped_total, so use one or the other; adding them together double-counts.",
 			[]string{"reason"}, nil),
 
 		allocFailScope: prometheus.NewDesc(
-			ns+"_allocation_failures_by_scope_total",
+			namespace+"_allocation_failures_by_scope_total",
 			"Server-wide address allocation failures by where the client was looked up. A true partition: shared-network and subnet sum to the total.",
 			[]string{"scope"}, nil),
 		allocFailCause: prometheus.NewDesc(
-			ns+"_allocation_failures_by_cause_total",
-			"Server-wide address allocation failures by cause. A second true partition of the SAME failures: no-pools and attempts-exhausted also sum to the total, so do not add this to "+ns+"_allocation_failures_by_scope_total.",
+			namespace+"_allocation_failures_by_cause_total",
+			"Server-wide address allocation failures by cause. A second true partition of the SAME failures: no-pools and attempts-exhausted also sum to the total, so do not add this to "+namespace+"_allocation_failures_by_scope_total.",
 			[]string{"cause"}, nil),
 
 		// ha_enabled describes the daemon, not any one relationship: it
@@ -173,24 +183,24 @@ func newCollector(client *keaClient) *collector {
 		// there are no relationships to name. It is deliberately the only
 		// unlabelled HA metric.
 		haEnabled: prometheus.NewDesc(
-			ns+"_ha_enabled", "1 when Kea reports an HA relationship, 0 when the HA hook is not loaded.",
+			namespace+"_ha_enabled", "1 when Kea reports an HA relationship, 0 when the HA hook is not loaded.",
 			nil, nil),
 		haLocalState: prometheus.NewDesc(
-			ns+"_ha_local_state_info", "HA state of this peer (info-metric; value always 1; state in label).",
+			namespace+"_ha_local_state_info", "HA state of this peer (info-metric; value always 1; state in label).",
 			haLabels("state", "role", "mode"), nil),
 		haPartnerState: prometheus.NewDesc(
-			ns+"_ha_partner_state_info",
+			namespace+"_ha_partner_state_info",
 			"HA state of the partner as last reported to this peer (info-metric; value always 1). Absent until the partner has been contacted at least once, because Kea reports an empty state until then.",
 			haLabels("state", "role"), nil),
 		haPartnerAge: prometheus.NewDesc(
-			ns+"_ha_partner_last_contact_seconds",
+			namespace+"_ha_partner_last_contact_seconds",
 			"Seconds since the last successful heartbeat from the HA partner. Absent until the partner has been contacted at least once.",
 			haLabels(), nil),
 		haPartnerInTouch: prometheus.NewDesc(
-			ns+"_ha_partner_in_touch", "1 once this peer has been in contact with its HA partner, else 0.",
+			namespace+"_ha_partner_in_touch", "1 once this peer has been in contact with its HA partner, else 0.",
 			haLabels(), nil),
 		haCommBroken: prometheus.NewDesc(
-			ns+"_ha_communication_interrupted", "1 if HA communication with the partner is interrupted, else 0.",
+			namespace+"_ha_communication_interrupted", "1 if HA communication with the partner is interrupted, else 0.",
 			haLabels(), nil),
 
 		buildInfo: prometheus.NewDesc(
@@ -207,8 +217,8 @@ func newCollector(client *keaClient) *collector {
 			"Number of distinct Kea statistics seen that this exporter has no mapping for.",
 			nil, nil),
 	}
-	c.stats = c.buildStatMetrics()
-	return c
+	collector.stats = collector.buildStatMetrics()
+	return collector
 }
 
 func (c *collector) Describe(ch chan<- *prometheus.Desc) {
@@ -236,8 +246,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *collector) Collect(ch chan<- prometheus.Metric) {
-	// No deadline here: newRequest gives each command its own, for the reason
-	// given there.
+	// No deadline here: keaCaller bounds each command itself.
 	ctx := context.Background()
 	start := time.Now()
 
@@ -265,9 +274,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	c.emitCommandHealth(ch, cmdStatisticGetAll, statErr, &c.statErrorCount)
 	c.emitCommandHealth(ch, cmdStatusGet, haErr, &c.haErrorCount)
 
-	c.unhandledMu.Lock()
-	unhandled := float64(len(c.unhandled))
-	c.unhandledMu.Unlock()
+	unhandled := float64(c.unhandledCount.Load())
 	ch <- prometheus.MustNewConstMetric(c.unhandledStats, prometheus.GaugeValue, unhandled)
 
 	ch <- prometheus.MustNewConstMetric(c.buildInfo, prometheus.GaugeValue, 1,
@@ -372,6 +379,7 @@ func (c *collector) noteUnhandled(key string) {
 		return
 	}
 	c.unhandled[key] = struct{}{}
+	c.unhandledCount.Add(1)
 	// Debug, not info: a stock Kea reports statistics this exporter does
 	// not map, and printing all of them on the first scrape buries anything
 	// that matters.

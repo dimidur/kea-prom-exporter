@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -169,17 +169,107 @@ func TestCallersCancellationReachesTheRequest(t *testing.T) {
 	}
 }
 
+// trackedBody is a response body that records whether it was closed and how
+// much of it was still unread at that moment. A read after Close is what a
+// real response body refuses, so only bytes consumed before Close count.
+type trackedBody struct {
+	*strings.Reader
+	closed        bool
+	unreadAtClose int
+}
+
+func newTrackedBody(content string) *trackedBody {
+	return &trackedBody{Reader: strings.NewReader(content)}
+}
+
+func (b *trackedBody) Close() error {
+	if !b.closed {
+		b.unreadAtClose = b.Len()
+	}
+	b.closed = true
+	return nil
+}
+
+// stubTransport stands in for the network under an http.Client. A round trip
+// fails with the request context's error once that context is done, as a real
+// transport does, and with err when it is set; otherwise it answers with
+// status and body.
+type stubTransport struct {
+	status int
+	body   *trackedBody
+	err    error
+}
+
+func (s stubTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := req.Context().Err(); err != nil {
+		return nil, err
+	}
+	if s.err != nil {
+		return nil, s.err
+	}
+	return &http.Response{
+		StatusCode: s.status,
+		Header:     http.Header{},
+		Body:       s.body,
+		Request:    req,
+	}, nil
+}
+
+func TestTransportFailureNamesTheCommand(t *testing.T) {
+	// A refused connection or a timeout never reaches interpretResponse, so
+	// call itself must say which command failed and why; it is all the log
+	// shows for a Kea that is down.
+
+	// Arrange
+	refused := errors.New("connection refused")
+	kea := &keaClient{url: "http://kea.example/", client: &http.Client{Transport: stubTransport{err: refused}}}
+
+	// Act
+	_, err := kea.call(t.Context(), cmdStatusGet)
+
+	// Assert
+	if !errors.Is(err, refused) {
+		t.Errorf("call error = %v, want it to wrap the transport's error", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), cmdStatusGet) {
+		t.Errorf("call error = %v, want it to name %s", err, cmdStatusGet)
+	}
+}
+
+func TestCallDrainsAndClosesTheReply(t *testing.T) {
+	// The JSON decoder stops after the first value, and a body left unread or
+	// unclosed keeps its connection out of the pool, so every scrape would
+	// open a new one to Kea's control socket.
+
+	// Arrange: more trailing bytes than the decoder's first read takes, and
+	// no more than errBodyLimit, so only the drain can consume them.
+	body := newTrackedBody(`[{"result":0,"arguments":{}}]` + strings.Repeat(" ", errBodyLimit))
+	transport := stubTransport{status: http.StatusOK, body: body}
+	kea := &keaClient{url: "http://kea.example/", client: &http.Client{Transport: transport}}
+
+	// Act
+	_, err := kea.call(t.Context(), cmdStatusGet)
+
+	// Assert
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !body.closed {
+		t.Fatal("the reply body was not closed")
+	}
+	if body.unreadAtClose != 0 {
+		t.Errorf("%d bytes of the reply were still unread when it was closed", body.unreadAtClose)
+	}
+}
+
 func TestCallHandsKeasReplyToInterpretResponse(t *testing.T) {
 	// call only sends and receives; what the reply means is
 	// interpretResponse's decision, so the status and body Kea answered with
 	// must reach it unchanged.
 
 	// Arrange
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "credentials rejected", http.StatusUnauthorized)
-	}))
-	defer srv.Close()
-	kea := &keaClient{url: srv.URL, client: srv.Client()}
+	transport := stubTransport{status: http.StatusUnauthorized, body: newTrackedBody("credentials rejected\n")}
+	kea := &keaClient{url: "http://kea.example/", client: &http.Client{Transport: transport}}
 
 	// Act
 	_, err := kea.call(t.Context(), "status-get")

@@ -2,7 +2,7 @@
 
 Prometheus exporter for **ISC Kea DHCP 3.x**, written in Go.
 
-Surfaces lease-pool utilisation, packet counters, and — the reason this exists —
+Surfaces lease-pool utilisation, packet counters and, the reason this exists,
 **HA peer state**, so a failed-over or partner-down DHCP cluster is visible in
 Prometheus and alertable like anything else.
 
@@ -13,14 +13,14 @@ Prometheus and alertable like anything else.
 one path not exercised against real hardware is **multiple HA relationships**
 (hub-and-spoke), which needs a topology this project has no lab for; it is
 covered by constructed `status-get` payloads only, shaped to the ARM's example.
-The scope is a headline metric set rather than full statistic coverage — see
+The scope is a headline metric set rather than full statistic coverage; see
 the roadmap.
 
 Unit tests run mostly against **response fixtures captured from that same live
 Kea**, so the parser is pinned to the shape Kea actually emits, including the
 per-pool statistic dimension introduced in 3.x. Where a state cannot be
-captured without breaking a production DHCP server — allocation failures, a
-downed partner, a hub — the payload is constructed instead, and CONTRIBUTING
+captured without breaking a production DHCP server (allocation failures, a
+downed partner, a hub), the payload is constructed instead, and CONTRIBUTING
 says how those are derived.
 
 ### Supported Kea versions
@@ -32,10 +32,10 @@ releases".
 Only **stable** releases are in scope. ISC ships odd minor versions (3.1, 3.3)
 as [development releases][isc-versions] that are EOL as soon as the next stable
 lands; even minors are the stable line. A newer version number is therefore not
-automatically a newer supported release — 3.3.0 is a development branch, while
+automatically a newer supported release: 3.3.0 is a development branch, while
 3.2.x is current stable and 3.0.x is LTS.
 
-Other stable branches are **untested, not unsupported** — nothing is known to
+Other stable branches are **untested, not unsupported**: nothing is known to
 break on 3.0.x, it simply has not been exercised. Widening this list means
 running the suite against that release, not editing the line.
 
@@ -50,21 +50,21 @@ running the suite against that release, not editing the line.
 | `kea_dhcp4_addresses_declined` | `subnet` | addresses withdrawn by a DHCPDECLINE |
 | `kea_dhcp4_packets_received_total` | `type` | DHCPv4 packets in, by op |
 | `kea_dhcp4_packets_sent_total` | `type` | DHCPv4 packets out, by op |
-| `kea_dhcp4_packets_dropped_total` | — | inbound packets dropped, **total** |
-| `kea_dhcp4_packets_dropped_by_reason_total` | `reason` | the same drops, by reason — see the warning below |
+| `kea_dhcp4_packets_dropped_total` | *(none)* | inbound packets dropped, **total** |
+| `kea_dhcp4_packets_dropped_by_reason_total` | `reason` | the same drops, by reason; see the warning below |
 | `kea_dhcp4_allocation_failures_by_scope_total` | `scope` | server-wide allocation failures, partitioned by lookup scope |
 | `kea_dhcp4_allocation_failures_by_cause_total` | `cause` | the **same** failures, partitioned by cause |
-| `kea_dhcp4_ha_enabled` | — | 1 when Kea reports an HA relationship, 0 when the hook is not loaded |
+| `kea_dhcp4_ha_enabled` | *(none)* | 1 when Kea reports an HA relationship, 0 when the hook is not loaded |
 | `kea_dhcp4_ha_local_state_info` | `relationship`, `peer`, `state`, `role`, `mode` | HA state of this peer |
 | `kea_dhcp4_ha_partner_state_info` | `relationship`, `peer`, `state`, `role` | HA state of the partner; **absent until in touch** |
 | `kea_dhcp4_ha_partner_in_touch` | `relationship`, `peer` | 1 once the partner has been contacted |
 | `kea_dhcp4_ha_partner_last_contact_seconds` | `relationship`, `peer` | seconds since last partner heartbeat; **absent until in touch** |
 | `kea_dhcp4_ha_communication_interrupted` | `relationship`, `peer` | 1 when HA communication is broken |
-| `kea_up` | — | 1 only when **every** control command succeeded |
+| `kea_up` | *(none)* | 1 only when **every** control command succeeded |
 | `kea_command_up` | `command` | 1 when that specific command succeeded |
 | `kea_scrape_errors_total` | `command` | cumulative failures, per command |
-| `kea_scrape_duration_seconds` | — | time spent collecting from Kea, emitted even when the scrape failed |
-| `kea_exporter_unhandled_statistics` | — | count of Kea statistics with no mapping here |
+| `kea_scrape_duration_seconds` | *(none)* | time spent collecting from Kea, emitted even when the scrape failed |
+| `kea_exporter_unhandled_statistics` | *(none)* | count of Kea statistics with no mapping here |
 | `kea_exporter_build_info` | `version`, `revision`, `goversion` | build identity (value always 1) |
 
 ### Counting failures without double-counting them
@@ -73,9 +73,9 @@ Kea records one event in several statistics at once, so some of these metrics
 deliberately do **not** share a label. Reading them as if they did doubles the
 numbers.
 
-What follows is the operator-facing summary. The derivations behind it — which
-Kea symbol each claim comes from, and where the ARM contradicts the source —
-are in [docs/kea-behaviour.md](docs/kea-behaviour.md).
+What follows is the summary for whoever reads these metrics. The derivations
+behind it, which Kea symbol each claim comes from and where the ARM contradicts
+the source, are in [docs/kea-behaviour.md](docs/kea-behaviour.md).
 
 **Allocation failures.** Kea counts a single failure in two independent branches
 (`AllocEngine::allocateUnreservedLease4` in [`alloc_engine.cc`][alloc-engine]):
@@ -94,16 +94,16 @@ sum by (cause) (rate(kea_dhcp4_allocation_failures_by_cause_total[5m]))
 
 `attempts-exhausted` is this exporter's label for Kea's `v4-allocation-fail`.
 Note Kea's own ARM calls that statistic the *"number of total address allocation
-failures"*, which the source contradicts — it is the `else` branch of
+failures"*, which the source contradicts: it is the `else` branch of
 `total_attempts == 0`, i.e. a peer of `no-pools`, not their sum. The label name
 says what it actually counts.
 
 Several statistics are deliberately **not** exported, each because exporting it
 would double something already counted: the `pkt4-received` / `pkt4-sent` grand
 totals, the server-wide `assigned-addresses` and `declined-addresses` (sums of
-their per-subnet forms), and two allocation-failure cases.
+their per-subnet forms), and the allocation-failure cases below.
 `v4-allocation-fail-classes` counts failures where the client belonged to any
-class — but `Dhcpv4Exchange::classifyPacket` adds the `ALL` class to every
+class, but `Dhcpv4Exchange::classifyPacket` adds the `ALL` class to every
 packet ([`dhcp4_srv.cc`][dhcp4-srv]), so it tracks the by-cause total rather
 than isolating anything. And the per-subnet `subnet[N].v4-allocation-fail*`
 keys duplicate the globals shown here; the globals are used because Kea does
@@ -111,7 +111,7 @@ not create the per-subnet ones until the first failure, so a healthy server
 would otherwise export no series at all.
 
 **Dropped packets.** The reasons *are* an exact partition of the total: Kea
-records a reason, then bumps the drop alongside it — see the *"Specific drop
+records a reason, then bumps the drop alongside it; see the *"Specific drop
 cause stat was increased by accept\* methods"* comment in
 `Dhcpv4Srv::processPacket` ([`dhcp4_srv.cc`][dhcp4-srv]). Several sites bump the
 total; each records a reason at the same time, which is what keeps the partition
@@ -134,18 +134,18 @@ already right and `assigned + declined` is not.
 
 > **Breaking change.** Four of the five `kea_dhcp4_ha_*` metrics that existed
 > before now carry two additional labels, `relationship` and `peer`
-> (`kea_dhcp4_ha_enabled` stays unlabelled — it describes the daemon, not a
+> (`kea_dhcp4_ha_enabled` stays unlabelled: it describes the daemon, not a
 > relationship). Queries that
 > match a full label set exactly need updating; queries selecting by metric
 > name are unaffected. Separately, a daemon with several relationships now
 > emits one series per relationship where it previously emitted one in total,
-> so `sum`/`avg`/`max` over those metrics change there — that is from
+> so `sum`/`avg`/`max` over those metrics change there. That is from
 > exporting every relationship, not from the labels. This is
 > pre-1.0 and metric names are treated as an API, so the change is called out
 > here rather than made quietly.
 
 `kea_dhcp4_ha_partner_last_contact_seconds` is deliberately **absent** rather
-than 0 before first contact — Kea reports age 0 in that state, which reads on a
+than 0 before first contact: Kea reports age 0 in that state, which reads on a
 dashboard as "contacted 0 seconds ago". Pair it with
 `kea_dhcp4_ha_partner_in_touch`. `kea_dhcp4_ha_partner_state_info` is absent in
 the same situation and for the same reason: Kea reports the partner's state as
@@ -161,7 +161,7 @@ therefore derived from the server names Kea does report:
 - **`relationship`** is the lower of the two names, so that **both nodes of a
   pair compute the same value**. It is unique per relationship, so it alone
   tells one relationship from another.
-- **`peer`** is the partner's `server-name` — it names the *other* end, so a
+- **`peer`** is the partner's `server-name`. It names the *other* end, so a
   sample carrying `peer=X` was observed from X's partner. It is the thing
   `relationship` deliberately hides, which is why both exist rather than one.
 
@@ -176,7 +176,7 @@ normal deployment. Each node sees the *other* as its peer, so `peer` alone
 differs between the two views of one relationship and cannot join them:
 
 ```promql
-# one relationship, two exporters — same relationship, different peer
+# one relationship, two exporters: same relationship, different peer
 kea_dhcp4_ha_partner_in_touch{relationship="kea-primary", peer="kea-standby"} 1  # from the primary
 kea_dhcp4_ha_partner_in_touch{relationship="kea-primary", peer="kea-primary"} 1  # from the standby
 
@@ -206,7 +206,7 @@ from the *first* relationship's configuration (`HAImpl::commandProcessed` calls
 only permits multiple relationships when [every one of them is
 hot-standby][ha-validate], so all the modes are equal and relationship 0's is
 always the right answer. The label becomes wrong only if Kea lifts that
-restriction — it is recorded here so the cause is known if it ever does, not
+restriction. It is recorded here so the cause is known if it ever does, not
 because the `mode` label is currently untrustworthy.
 
 [alloc-engine]: https://github.com/isc-projects/kea/blob/Kea-3.2.0/src/lib/dhcpsrv/alloc_engine.cc
@@ -234,12 +234,12 @@ Kea release that adds statistics degrades to *missing* metrics rather than *no*
 metrics, and `kea_exporter_unhandled_statistics` counts them.
 
 Extending coverage starts with a row in one of the tables in
-[`statmap.go`](statmap.go) — `exactStats` for a fixed name, `subnetStats` for a
+[`statmap.go`](statmap.go): `exactStats` for a fixed name, `subnetStats` for a
 `subnet[N].` suffix, `packetStats` for a `pkt4-` direction. That decides which
 `statID` a key maps to; the metric it becomes is then wired in
 [`collector.go`](collector.go): a `statID`, a descriptor field, its `NewDesc`,
-a line in `Describe`, and a `statMetrics` row. The tables remove the branching,
-not the wiring, and the tests fail if the two halves disagree.
+a line in `Describe`, and a `buildStatMetrics` row. The tables remove the
+branching, not the wiring, and the tests fail if the two halves disagree.
 
 ## Build
 
@@ -273,8 +273,8 @@ KEA_PASSWORD_FILE=/etc/kea/control-password \
 ```
 
 Every flag has an environment equivalent, and an explicit flag always wins over
-the environment. A value the environment cannot supply — an unparseable
-`KEA_TIMEOUT`, an unrecognised `LOG_LEVEL` — is reported at `WARN` and the
+the environment. A value the environment cannot supply, such as an unparseable
+`KEA_TIMEOUT` or an unrecognised `LOG_LEVEL`, is reported at `WARN` and the
 default is kept, rather than being applied silently or zeroed.
 
 | Flag | Env | Default | Notes |
@@ -284,11 +284,11 @@ default is kept, rather than being applied silently or zeroed.
 | `--kea-user` | `KEA_USER` | *(empty)* | empty disables basic auth |
 | `--kea-password-file` | `KEA_PASSWORD_FILE` | *(empty)* | preferred over the inline form |
 | `--kea-password` | `KEA_PASSWORD` | *(empty)* | visible in `docker inspect` |
-| `--kea-timeout` | `KEA_TIMEOUT` | `5s` | **per control command**, and a scrape issues two |
+| `--kea-timeout` | `KEA_TIMEOUT` | `5s` | **per control command**, and a scrape sends its commands one after another; zero or less means `5s` |
 | `--kea-service` | `KEA_SERVICE` | `dhcp4` | only `dhcp4` is implemented |
 | `--log-level` | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `--log-format` | `LOG_FORMAT` | `text` | `text` or `json` |
-| `--version` | — | — | prints build identity and exits; deliberately has no env form |
+| `--version` | *(none)* | *(none)* | prints build identity and exits; deliberately has no env form |
 
 `--log-level=debug` additionally names each Kea statistic the exporter has no
 mapping for. The count is always exported as
@@ -296,14 +296,15 @@ mapping for. The count is always exported as
 without turning debug logging on.
 
 On `SIGTERM` or `SIGINT` the exporter stops accepting connections and lets
-in-flight scrapes finish before exiting, within a grace period of
-`2 × --kea-timeout + 1s` — the longest a legitimate scrape can take. It exits 0
-even if that grace expires; a slow shutdown is not a crash.
+in-flight scrapes finish before exiting. The grace period is one effective
+`--kea-timeout` (`5s` when it is zero or less) for every control command a
+scrape sends, which is the longest a legitimate scrape can take, plus one
+second. It exits 0 even if that grace expires; a slow shutdown is not a crash.
 
 ## Docker
 
 The image runs as **uid 65532** (`nonroot`), so a mounted password file must be
-readable by that user — a `0600` file owned by your account is not.
+readable by that user; a `0600` file owned by your account is not.
 
 ```bash
 docker build -t kea-prom-exporter:dev .
@@ -327,7 +328,7 @@ docker buildx build --platform linux/amd64,linux/arm64 \
   -t dimidur/kea-prom-exporter:0.1.0 --push .
 ```
 
-Without those build args the image reports `version=dev revision=unknown` —
+Without those build args the image reports `version=dev revision=unknown`:
 `.dockerignore` keeps `.git` out of the build context, so Go cannot stamp the
 revision itself. The release workflow supplies both automatically.
 
@@ -357,22 +358,22 @@ prometheus.scrape "kea_exporter" {
 
 Grouped by milestone rather than date.
 
-### v0.1 — green CI, scrapes a live Kea peer
+### v0.1: green CI, scrapes a live Kea peer
 
 - [x] Commit `go.sum` so CI's `git diff --exit-code go.mod go.sum` step succeeds.
-- [x] Verify against a live Kea peer — confirmed on 3.2.0 in hot-standby HA;
+- [x] Verify against a live Kea peer: confirmed on 3.2.0 in hot-standby HA;
   every declared metric returns real data.
 - [x] Unit tests over captured `statistic-get-all` + `status-get` fixtures, so
   regressions surface in CI without a live Kea.
 - [x] Tagged `v0.1.0` with a multi-arch image published from CI.
 
-### v0.5 — feature completeness
+### v0.5: feature completeness
 
 - [ ] Full `statistic-get-all` coverage: `reclaimed-*`, `*-lease-reuses`,
   `*-reservation-conflicts`, and the rest of the long tail.
   (`v4-allocation-fail-*`, the `pkt4-*-drop` reasons and `declined-addresses`
   are done.)
-- [ ] Per-pool subnet metrics (`subnet[N].pool[M].*`) — the Kea 3.x dimension.
+- [ ] Per-pool subnet metrics (`subnet[N].pool[M].*`), the Kea 3.x dimension.
 - [x] HA partner-side state (`remote.last-state`, `remote.role`) as a labelled
   metric, and every relationship exported rather than only the first.
 - [ ] HA served scopes (`local.scopes`, `remote.last-scopes`), which say which
@@ -395,19 +396,19 @@ Grouped by milestone rather than date.
 
 ## Non-goals
 
-- **Stork-server compatibility.** This speaks Prometheus only — no gRPC stream
-  to a Stork server. If you want Stork, run Stork.
+- **Stork-server compatibility.** This speaks Prometheus only, with no gRPC
+  stream to a Stork server. If you want Stork, run Stork.
 - **isc-dhcp support.** Kea 3.x only; the legacy `isc-dhcpd` is a different
   daemon with a different management surface.
-- **General-purpose Kea CLI.** Read-only: it issues `statistic-get-all` and
-  `status-get`, nothing else. No `config-set`, no `lease-add`.
+- **General-purpose Kea CLI.** Read-only: it sends only commands that read
+  state. No `config-set`, no `lease-add`.
 
 ## Alternatives
 
-- [mweinelt/kea-exporter](https://github.com/mweinelt/kea-exporter) — the
+- [mweinelt/kea-exporter](https://github.com/mweinelt/kea-exporter): the
   established Python exporter for Kea. As of v0.7.0 its parser predates the
   Kea 3.x per-pool statistic dimension.
-- [ISC Stork](https://gitlab.isc.org/isc-projects/stork) — the vendor's own
+- [ISC Stork](https://gitlab.isc.org/isc-projects/stork): the vendor's own
   monitoring stack. Its agent can expose Prometheus metrics, though HA state is
   surfaced through Stork's own channel rather than in that metric set.
 

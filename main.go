@@ -40,8 +40,9 @@ func main() {
 	envProblems := applyEnv(flag.CommandLine, os.LookupEnv)
 
 	logger, logProblems := newLogger(*logLevel, *logFormat)
-	// Before newExporter: the collector logs to slog.Default() as it stands
-	// when the collector is built.
+	// fatal logs through the default logger, and so do net/http's own server
+	// errors: SetDefault routes the log package, which http.Server uses when
+	// it has no ErrorLog, through the same handler.
 	slog.SetDefault(logger)
 	// Deferred until the logger exists, and every problem is reported rather
 	// than only the last one.
@@ -63,7 +64,7 @@ func main() {
 	if err := validateConfig(settings); err != nil {
 		fatal("invalid configuration", "err", err)
 	}
-	srv := buildServer(*listenAddr, newExporter(newKeaClient(settings)), logger)
+	srv := buildServer(*listenAddr, newExporter(newKeaClient(settings), logger), logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -74,12 +75,12 @@ func main() {
 	}
 }
 
-// newExporter returns the registry that /metrics serves: the Kea collector
-// plus the Go runtime and process collectors.
-func newExporter(client *keaClient) *prometheus.Registry {
+// newExporter returns the registry that /metrics serves: the Kea collector,
+// logging to logger, plus the Go runtime and process collectors.
+func newExporter(kea keaCaller, logger *slog.Logger) *prometheus.Registry {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
-		newCollector(client),
+		newCollector(kea, logger),
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)

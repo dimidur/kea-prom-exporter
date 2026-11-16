@@ -1,9 +1,11 @@
 package main
 
-// Decoding of the HA hook's status-get payload.
+// The HA part of a scrape: sending status-get, decoding the HA hook's payload,
+// and deciding which HA metrics it yields.
 //
 // One reason to change: the HA hook's response shape, which Kea versions
-// separately from the core statistics, hence its own file.
+// separately from the core statistics, hence its own file. Which HA metrics
+// are emitted, and when, follows that shape.
 //
 // Why the labels are derived the way they are, and what Kea guarantees about
 // them, is in docs/kea-behaviour.md.
