@@ -82,7 +82,7 @@ jobs:
         with:
           token: ${{ steps.app-token.outputs.token }}
           # Exact, so a run is reproducible; Renovate bumps this pin itself.
-          renovate-version: 44.239.1
+          renovate-version: 44.244.1
         env:
           RENOVATE_REPOSITORIES: ${{ github.repository }}
           # Commits go through the API, so GitHub signs them as the App. The
