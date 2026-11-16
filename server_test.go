@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -20,30 +19,9 @@ import (
 
 // Tests for server.go: serving /metrics and draining on a signal.
 
-// quietLogger discards everything, for tests that do not look at the log.
-var quietLogger = slog.New(slog.DiscardHandler)
-
 // testClient bounds every request a test makes, so a handler that never
 // answers fails the test instead of hanging it.
 var testClient = &http.Client{Timeout: 5 * time.Second}
-
-// httpGet fetches url and returns the status and body. It reports a failure
-// through t.Errorf rather than t.Fatalf, so it is safe to call from a
-// goroutine.
-func httpGet(t *testing.T, url string) (int, string) {
-	t.Helper()
-	resp, err := testClient.Get(url)
-	if err != nil {
-		t.Errorf("GET %s: %v", url, err)
-		return 0, ""
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Errorf("read %s: %v", url, err)
-	}
-	return resp.StatusCode, string(body)
-}
 
 // serve runs one request through handler and returns the recorded response.
 func serve(handler http.Handler, path string) *httptest.ResponseRecorder {
@@ -165,32 +143,25 @@ func TestBuildServerSharesOneCollectionBetweenConcurrentScrapes(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collector)
 	handler := buildServer("127.0.0.1:0", reg, quietLogger).Handler
-	arrived := make(chan struct{}, 2)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		arrived <- struct{}{}
-		handler.ServeHTTP(w, r)
-	}))
-	// Registered before the release, because cleanups run last-registered
-	// first: the collection is released before Close waits for the handlers
-	// blocked on it.
-	t.Cleanup(server.Close)
 	var release func()
 	collector.release, release = releaseOnCleanup(t)
+	arrived := make(chan struct{}, 2)
 	bodies := make(chan string, 2)
 	scrape := func() {
-		_, body := httpGet(t, server.URL+"/metrics")
-		bodies <- body
+		arrived <- struct{}{}
+		bodies <- serve(handler, "/metrics").Body.String()
 	}
 
 	// Act
 	go scrape()
-	receive(t, arrived, "the first scrape to reach the handler")
+	receive(t, arrived, "the first scrape to start")
 	receive(t, collector.entered, "the first collection to start")
 	go scrape()
-	receive(t, arrived, "the second scrape to reach the handler")
-	// The second request has reached the handler but not necessarily joined
-	// the collection yet. If it has not by the time the first is released, it
-	// starts a second collection and the test fails; it cannot pass wrongly.
+	receive(t, arrived, "the second scrape to start")
+	// The second request is entering the handler but has not necessarily
+	// joined the collection yet. If it has not by the time the first is
+	// released, it starts a second collection and the test fails; it cannot
+	// pass wrongly.
 	time.Sleep(100 * time.Millisecond)
 	release()
 	first := receive(t, bodies, "the first scrape to finish")
@@ -223,8 +194,8 @@ func TestBuildServerLogsWhyAScrapeFailed(t *testing.T) {
 	// Arrange
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(failingCollector{prometheus.NewDesc("failing", "Always fails.", nil, nil)})
-	var logs bytes.Buffer
-	handler := buildServer("127.0.0.1:0", reg, slog.New(slog.NewTextHandler(&logs, nil))).Handler
+	logger, logs := capturingLogger(slog.LevelInfo)
+	handler := buildServer("127.0.0.1:0", reg, logger).Handler
 
 	// Act
 	response := serve(handler, "/metrics")
@@ -339,10 +310,10 @@ func TestServeUntilSignalDrainsInFlightRequests(t *testing.T) {
 	// Arrange
 	started := make(chan struct{})
 	mux := http.NewServeMux()
-	mux.HandleFunc("/slow", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/slow", func(writer http.ResponseWriter, _ *http.Request) {
 		close(started)
 		time.Sleep(150 * time.Millisecond)
-		_, _ = w.Write([]byte("done"))
+		_, _ = writer.Write([]byte("done"))
 	})
 	srv := &http.Server{Addr: freeAddr(t), Handler: mux, ReadHeaderTimeout: time.Second}
 	ctx, cancel := context.WithCancel(t.Context())
@@ -393,8 +364,7 @@ func TestServeUntilSignalGraceExpiryIsNotAFailure(t *testing.T) {
 	// rather than the global default.
 
 	// Arrange
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	logger, logs := capturingLogger(slog.LevelInfo)
 	release, _ := releaseOnCleanup(t)
 	started := make(chan struct{})
 	mux := http.NewServeMux()
@@ -439,8 +409,7 @@ func TestServeUntilSignalReportsABindFailure(t *testing.T) {
 	}
 	defer listener.Close()
 	srv := &http.Server{Addr: listener.Addr().String(), ReadHeaderTimeout: time.Second}
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	logger, logs := capturingLogger(slog.LevelInfo)
 
 	// Act
 	err = serveUntilSignal(t.Context(), srv, time.Second, logger, nil)

@@ -5,8 +5,10 @@
   "words": [
     "alertable",
     "aquasecurity",
+    "blackbox",
     "buildx",
     "DHCPDECLINE",
+    "dhcpd",
     "Dhcpv",
     "dimidur",
     "distroless",
@@ -17,11 +19,13 @@
     "gomod",
     "gosec",
     "GOTOOLCHAIN",
+    "goversion",
     "govulncheck",
     "honnef",
     "hostnames",
     "ldflags",
     "libc",
+    "Millisecs",
     "mweinelt",
     "nonroot",
     "nosec",
@@ -35,6 +39,7 @@
     "testdata",
     "testutil",
     "trimpath",
+    "tzdata",
     "unparseable",
     "venv"
   ]

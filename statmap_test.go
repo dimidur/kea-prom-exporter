@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"log/slog"
-	"maps"
 	"reflect"
 	"slices"
 	"sort"
@@ -14,6 +12,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // Tests for statmap.go: the statistic-name mapping.
@@ -21,12 +20,10 @@ import (
 // Kea symbols named below hold across the supported Kea releases; the
 // supported set is in README.md.
 
-// classifyStat is a pure function of the key, so the mapping can be pinned
-// exhaustively without constructing a collector or a fake Kea, which a branch
-// chain inside an emitter cannot be.
-
 func TestClassifyStat(t *testing.T) {
-	// Arrange
+	// classifyStat is a pure function of the key, so the mapping can be pinned
+	// exhaustively without constructing a collector or a fake Kea, which a
+	// branch chain inside an emitter cannot be.
 	cases := []struct {
 		name       string
 		key        string
@@ -63,7 +60,7 @@ func TestClassifyStat(t *testing.T) {
 		{"subnet truncated after bracket", "subnet[1]", statUnmapped, nil},
 
 		// An empty subnet id still yields one label, because the descriptor
-		// has one either way -- passing zero would panic in Gather.
+		// has one either way; passing zero would panic in Gather.
 		{"empty subnet id", "subnet[].assigned-addresses", statAddressesAssigned, []string{""}},
 
 		// Kea increments the global and the subnet[N] form of these for the
@@ -75,7 +72,7 @@ func TestClassifyStat(t *testing.T) {
 		// Two partitions of one event, hence two metrics: scope and cause each
 		// sum to the real total, and classes overlaps both.
 		// Taken from the global keys, because Kea does not create the
-		// per-subnet ones until the first failure -- a healthy server would
+		// per-subnet ones until the first failure, and a healthy server would
 		// otherwise export no series at all.
 		{"alloc fail scope shared-network", "v4-allocation-fail-shared-network", statAllocFailByScope, []string{"shared-network"}},
 		{"alloc fail scope subnet", "v4-allocation-fail-subnet", statAllocFailByScope, []string{"subnet"}},
@@ -98,24 +95,26 @@ func TestClassifyStat(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Arrange
+			key := tc.key
+
 			// Act
-			id, labels := classifyStat(tc.key)
+			id, labels := classifyStat(key)
 
 			// Assert
 			if id != tc.wantID {
-				t.Errorf("classifyStat(%q) id = %v, want %v", tc.key, id, tc.wantID)
+				t.Errorf("classifyStat(%q) id = %v, want %v", key, id, tc.wantID)
 			}
 			if !reflect.DeepEqual(labels, tc.wantLabels) {
-				t.Errorf("classifyStat(%q) labels = %#v, want %#v", tc.key, labels, tc.wantLabels)
+				t.Errorf("classifyStat(%q) labels = %#v, want %#v", key, labels, tc.wantLabels)
 			}
 		})
 	}
 }
 
 // mappedIDs derives the set of statIDs the classifier can actually return,
-// from the tables themselves. Restating it by hand is what made an earlier
-// version of the descriptor test inert: both halves had to be edited
-// together, which is precisely the coupling the test exists to catch.
+// from the tables themselves. Restated by hand, the set and the tables would
+// have to be edited together, which is the coupling the test exists to catch.
 func mappedIDs() map[statID]struct{} {
 	ids := map[statID]struct{}{}
 	for _, table := range []map[string]statTarget{exactStats, subnetStats, packetStats} {
@@ -135,19 +134,19 @@ func TestEveryMappedStatIDHasADescriptor(t *testing.T) {
 	// bug it is.
 
 	// Arrange
-	c := newCollector(&keaClient{})
+	collector := newCollector(nil, quietLogger)
 
 	// Act
-	metrics := c.stats
+	metrics := collector.stats
 
 	// Assert
 	for id := range mappedIDs() {
-		m, ok := metrics[id]
+		metric, ok := metrics[id]
 		if !ok {
 			t.Errorf("statID %v is reachable from a table but has no descriptor", id)
 			continue
 		}
-		if m.desc == nil {
+		if metric.desc == nil {
 			t.Errorf("statID %v has a nil descriptor", id)
 		}
 	}
@@ -160,13 +159,13 @@ func TestEveryMappedStatIDHasADescriptor(t *testing.T) {
 
 func TestLabelArityMatchesTheDescriptor(t *testing.T) {
 	// MustNewConstMetric panics when the label count disagrees with the
-	// descriptor, and Registry.Gather runs collectors without recovering it --
+	// descriptor, and Registry.Gather runs collectors without recovering it,
 	// so this disagreement kills the process on a scrape rather than
 	// producing a bad metric. Checked here so a statistic absent from the
 	// fixture is covered too.
 
 	// Arrange
-	c := newCollector(&keaClient{})
+	collector := newCollector(nil, quietLogger)
 	probes := map[statID]string{
 		statAddressesAssigned: "subnet[1].assigned-addresses",
 		statAddressesCapacity: "subnet[1].total-addresses",
@@ -179,7 +178,7 @@ func TestLabelArityMatchesTheDescriptor(t *testing.T) {
 		statAllocFailByCause:  "v4-allocation-fail",
 	}
 
-	for id, m := range c.stats {
+	for id, metric := range collector.stats {
 		key, ok := probes[id]
 		if !ok {
 			t.Errorf("statID %v has no probe key; add one so its arity is checked", id)
@@ -197,7 +196,7 @@ func TestLabelArityMatchesTheDescriptor(t *testing.T) {
 		// Ask client_golang directly rather than parsing Desc.String():
 		// NewConstMetric returns exactly the error MustNewConstMetric panics
 		// on, so this is the real failure mode rather than a rendering of it.
-		if _, err := prometheus.NewConstMetric(m.desc, m.typ, 0, labels...); err != nil {
+		if _, err := prometheus.NewConstMetric(metric.desc, metric.typ, 0, labels...); err != nil {
 			t.Errorf("%q yields labels %#v that its descriptor rejects: %v", key, labels, err)
 		}
 	}
@@ -207,9 +206,9 @@ func TestTablesAndClassifierAgree(t *testing.T) {
 	// The tables are the documented extension point, so a row the classifier
 	// cannot reach would be quietly inert.
 
-	// Arrange -- the tables themselves; each subtest pins one of them.
+	// Arrange: the tables themselves; each subtest pins one of them.
 	t.Run("exact names", func(t *testing.T) {
-		// Arrange -- written out rather than read back from exactStats, which
+		// Arrange: written out rather than read back from exactStats, which
 		// would make the assertion a restatement of the code under test.
 		want := map[string][]string{
 			"pkt4-receive-drop":                 nil,
@@ -247,7 +246,7 @@ func TestTablesAndClassifierAgree(t *testing.T) {
 
 		// And every labelled row must be pinned above. Without this, a new row
 		// can be added with no expectation and its label is then free to be
-		// wrong -- which is how three drop reasons went unpinned before.
+		// wrong.
 		for key, target := range exactStats {
 			if len(target.extra) == 0 {
 				continue
@@ -259,7 +258,7 @@ func TestTablesAndClassifierAgree(t *testing.T) {
 	})
 
 	t.Run("returned labels do not alias the tables", func(t *testing.T) {
-		// Arrange -- checking for corruption via append cannot fail: every
+		// Arrange: checking for corruption via append cannot fail: every
 		// `extra` is a composite literal with len == cap, and append on a full
 		// slice always reallocates. Compare the backing arrays instead, which
 		// goes red the moment the clone is removed.
@@ -306,7 +305,7 @@ func TestTablesAndClassifierAgree(t *testing.T) {
 
 	t.Run("packet suffixes carry the operation", func(t *testing.T) {
 		for suffix, want := range packetStats {
-			// Arrange -- the operation is the only label these carry.
+			// Arrange: the operation is the only label these carry.
 			key := "pkt4-discover" + suffix
 
 			// Act
@@ -332,13 +331,12 @@ func TestAllocationFailureMetricsAgainstAFailingServer(t *testing.T) {
 	// two-metric split exists to preserve.
 
 	// Arrange
-	srv := keaStub(t, fixture(t, "statistic-get-all-with-failures.json"), fixture(t, "status-get.json"))
-	defer srv.Close()
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	kea := newFakeKea(fixture(t, "statistic-get-all-with-failures.json"), fixture(t, "status-get.json"))
+	collector := newCollector(kea, quietLogger)
 
-	// Arrange -- the expected exposition. The Act is the Gather inside
+	// Arrange: the expected exposition. The Act is the Gather inside
 	// CollectAndCompare below, which is where an arity mismatch would surface
-	// the way it does in production: a panic in an unrecovered goroutine.
+	// the way it does in production: a panic in a goroutine nothing recovers.
 	expected := `
 # HELP kea_dhcp4_allocation_failures_by_cause_total Server-wide address allocation failures by cause. A second true partition of the SAME failures: no-pools and attempts-exhausted also sum to the total, so do not add this to kea_dhcp4_allocation_failures_by_scope_total.
 # TYPE kea_dhcp4_allocation_failures_by_cause_total counter
@@ -351,18 +349,17 @@ kea_dhcp4_allocation_failures_by_scope_total{scope="subnet"} 6
 `
 
 	// Act + Assert
-	if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
+	if err := testutil.CollectAndCompare(collector, strings.NewReader(expected),
 		"kea_dhcp4_allocation_failures_by_scope_total",
 		"kea_dhcp4_allocation_failures_by_cause_total"); err != nil {
 		t.Errorf("allocation failure metrics: %v", err)
 	}
 
-	// The two partitions summing equal is what makes them two metrics, and the
-	// golden above already pins all four values -- 4+6 == 3+7 follows from it.
-	// A separate sum assertion here detects nothing the golden does not
-	// (verified by deleting it and re-running the mutations), so it is stated
-	// in the fixture and in the README rather than restated as a test that
-	// cannot fail.
+	// The partitions summing equal is what makes them two metrics, and the
+	// golden above already pins every value, so 4+6 == 3+7 follows from it.
+	// A separate sum assertion here would detect nothing the golden does not,
+	// so it is stated in the fixture and in the README rather than restated
+	// as a test that cannot fail.
 
 	// Declined addresses are non-zero here, so this pins the value and not
 	// merely the presence of the family.
@@ -371,29 +368,24 @@ kea_dhcp4_allocation_failures_by_scope_total{scope="subnet"} 6
 # TYPE kea_dhcp4_addresses_declined gauge
 kea_dhcp4_addresses_declined{subnet="1"} 2
 `
-	if err := testutil.CollectAndCompare(c, strings.NewReader(declined), "kea_dhcp4_addresses_declined"); err != nil {
+	if err := testutil.CollectAndCompare(collector, strings.NewReader(declined), "kea_dhcp4_addresses_declined"); err != nil {
 		t.Errorf("declined addresses: %v", err)
 	}
 }
 
 func TestFixtureCarriesThePerSubnetAllocationFailKeys(t *testing.T) {
-	// The derived fixture exists for the subnet[N].v4-allocation-fail* keys --
+	// The derived fixture exists for the subnet[N].v4-allocation-fail* keys,
 	// the ones Kea does not create until a failure happens. They are
 	// deliberately ignored rather than exported, so nothing in the output
 	// would notice if they vanished from the file; the fixture's own content
 	// has to be checked, as the per-pool guard in collector_test.go does.
 
 	// Arrange
-	var raw []struct {
-		Arguments map[string]json.RawMessage `json:"arguments"`
-	}
-	if err := json.Unmarshal(fixture(t, "statistic-get-all-with-failures.json"), &raw); err != nil {
-		t.Fatalf("decode fixture: %v", err)
-	}
+	statistics := fixtureArguments(t, "statistic-get-all-with-failures.json")
 
 	// Act
 	var perSubnetFailures int
-	for key := range raw[0].Arguments {
+	for key := range statistics {
 		if strings.HasPrefix(key, "subnet[") && strings.Contains(key, "v4-allocation-fail") {
 			perSubnetFailures++
 		}
@@ -407,19 +399,19 @@ func TestFixtureCarriesThePerSubnetAllocationFailKeys(t *testing.T) {
 }
 
 func TestIgnoredStatisticsAreNotReportedAsUnmapped(t *testing.T) {
-	// statIgnored and statUnmapped mean different things to an operator: one
+	// statIgnored and statUnmapped mean different things to a reader: one
 	// is a considered omission, the other is drift in Kea. A regression that
 	// reclassified the ignored keys would show up here and nowhere else.
 
 	// Arrange
-	srv := keaStub(t, fixture(t, "statistic-get-all-with-failures.json"), fixture(t, "status-get.json"))
-	defer srv.Close()
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	kea := newFakeKea(fixture(t, "statistic-get-all-with-failures.json"), fixture(t, "status-get.json"))
+	logger, logs := capturingLogger(slog.LevelDebug)
+	collector := newCollector(kea, logger)
 
 	// Act
-	unhandled := sumFamily(t, c, "kea_exporter_unhandled_statistics")
+	unhandled := sumFamily(t, collector, "kea_exporter_unhandled_statistics")
 
-	// Assert -- five families the exporter does not map yet, each in a global
+	// Assert: the families the exporter does not map yet, each in a global
 	// and a subnet[N] form. The key set rather than the count: a count stays
 	// green when one key is reclassified and another appears.
 	want := []string{
@@ -430,9 +422,8 @@ func TestIgnoredStatisticsAreNotReportedAsUnmapped(t *testing.T) {
 		"subnet[1].v4-reservation-conflicts",
 	}
 	sort.Strings(want)
-	c.unhandledMu.Lock()
-	got := slices.Sorted(maps.Keys(c.unhandled))
-	c.unhandledMu.Unlock()
+	got := loggedUnhandled(logs.String())
+	sort.Strings(got)
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("unmapped set is\n  %v\nwant\n  %v", got, want)
 	}
@@ -441,10 +432,11 @@ func TestIgnoredStatisticsAreNotReportedAsUnmapped(t *testing.T) {
 	}
 }
 
-// TestTablesWithoutExtraSupportDoNotUseIt guards the class, not the instance:
-// classifySubnetStat and classifyPacketStat deliberately ignore `extra`, so a
-// row that sets one would have its label silently dropped.
 func TestTablesWithoutExtraSupportDoNotUseIt(t *testing.T) {
+	// This guards the class, not the instance: classifySubnetStat and
+	// classifyPacketStat deliberately ignore `extra`, so a row that sets one
+	// would have its label silently dropped.
+
 	// Arrange
 	tables := map[string]map[string]statTarget{
 		"subnetStats": subnetStats,
@@ -455,7 +447,7 @@ func TestTablesWithoutExtraSupportDoNotUseIt(t *testing.T) {
 	for name, table := range tables {
 		for key, target := range table {
 			if len(target.extra) != 0 {
-				t.Errorf("%s[%q] sets extra=%#v, but its classifier does not consult it -- the label would be dropped silently. Add the handling with the row that needs it.",
+				t.Errorf("%s[%q] sets extra=%#v, but its classifier does not consult it, so the label would be dropped silently. Add the handling with the row that needs it.",
 					name, key, target.extra)
 			}
 		}
@@ -463,71 +455,52 @@ func TestTablesWithoutExtraSupportDoNotUseIt(t *testing.T) {
 }
 
 // sumFamily totals every sample in one metric family.
-func sumFamily(t *testing.T, c prometheus.Collector, name string) float64 {
+func sumFamily(t *testing.T, source prometheus.Collector, name string) float64 {
 	t.Helper()
-	reg := prometheus.NewPedanticRegistry()
-	if err := reg.Register(c); err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	mfs, err := reg.Gather()
-	if err != nil {
-		t.Fatalf("gather: %v", err)
-	}
+	return sumOf(gather(t, source), name)
+}
+
+// sumOf totals every sample in the family called name.
+func sumOf(families []*dto.MetricFamily, name string) float64 {
 	var total float64
-	for _, mf := range mfs {
-		if mf.GetName() != name {
+	for _, family := range families {
+		if family.GetName() != name {
 			continue
 		}
-		for _, m := range mf.GetMetric() {
-			total += m.GetCounter().GetValue() + m.GetGauge().GetValue()
+		for _, metric := range family.GetMetric() {
+			total += metric.GetCounter().GetValue() + metric.GetGauge().GetValue()
 		}
 	}
 	return total
 }
 
 func TestDropReasonsSumToTheDropTotal(t *testing.T) {
-	// Arrange -- both fixtures, so the invariant is checked against Kea's own
-	// capture and not only against the derived one.
-	// Act + Assert -- both live in the helper, run once per fixture.
-	for _, fixtureName := range []string{"statistic-get-all.json", "statistic-get-all-with-failures.json"} {
-		t.Run(fixtureName, func(t *testing.T) { assertDropReasonsSumToTotal(t, fixtureName) })
-	}
-}
-
-func assertDropReasonsSumToTotal(t *testing.T, fixtureName string) {
-	t.Helper()
 	// Kea records a reason and bumps the drop alongside it, as in
 	// Dhcpv4Srv::processPacket, so the two must agree exactly. Several sites
 	// bump the total and each records a reason at the same time. If they
 	// diverge, either Kea changed or a reason is mapped onto the wrong metric.
 
-	// Arrange -- both fixtures: the real capture is the evidence about Kea,
+	// Arrange: both fixtures. The real capture is the evidence about Kea, and
 	// the derived one exercises reasons the capture leaves at zero.
-	srv := keaStub(t, fixture(t, fixtureName), fixture(t, "status-get.json"))
-	defer srv.Close()
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
-	reg := prometheus.NewPedanticRegistry()
-	if err := reg.Register(c); err != nil {
-		t.Fatalf("register: %v", err)
+	// Act + Assert: both live in the helper, run once per fixture.
+	for _, fixtureName := range []string{"statistic-get-all.json", "statistic-get-all-with-failures.json"} {
+		t.Run(fixtureName, func(t *testing.T) { assertDropReasonsSumToTotal(t, fixtureName) })
 	}
+}
 
-	// Act
-	mfs, err := reg.Gather()
-	if err != nil {
-		t.Fatalf("gather: %v", err)
-	}
+// assertDropReasonsSumToTotal checks TestDropReasonsSumToTheDropTotal's
+// invariant against one fixture.
+func assertDropReasonsSumToTotal(t *testing.T, fixtureName string) {
+	t.Helper()
 
-	var total, reasons float64
-	for _, mf := range mfs {
-		switch mf.GetName() {
-		case "kea_dhcp4_packets_dropped_total":
-			total = mf.GetMetric()[0].GetCounter().GetValue()
-		case "kea_dhcp4_packets_dropped_by_reason_total":
-			for _, m := range mf.GetMetric() {
-				reasons += m.GetCounter().GetValue()
-			}
-		}
-	}
+	// Arrange
+	kea := newFakeKea(fixture(t, fixtureName), fixture(t, "status-get.json"))
+	collector := newCollector(kea, quietLogger)
+
+	// Act: one scrape, since the invariant holds within a scrape.
+	families := gather(t, collector)
+	total := sumOf(families, "kea_dhcp4_packets_dropped_total")
+	reasons := sumOf(families, "kea_dhcp4_packets_dropped_by_reason_total")
 
 	// Assert
 	if total == 0 {
@@ -540,20 +513,19 @@ func assertDropReasonsSumToTotal(t *testing.T, fixtureName string) {
 
 func TestDropMetricsAgainstRealKeaOutput(t *testing.T) {
 	// The evidence about Kea has to come from Kea. The real capture carries a
-	// live instance of the invariant -- pkt4-service-disabled 4 alongside
-	// pkt4-receive-drop 4 -- and every one of the nine drop reasons, because
-	// Kea initialises every name in its dhcp4_statistics set to 0 at startup.
+	// live instance of the invariant (pkt4-service-disabled 4 alongside
+	// pkt4-receive-drop 4) and every drop reason, because Kea initialises
+	// every name in its dhcp4_statistics set to 0 at startup.
 	// Pinning the whole family here is what catches a reason mapped to the
 	// wrong metric or spelled wrong, which a fixture built to satisfy a sum
 	// cannot.
 
 	// Arrange
-	srv := keaStub(t, fixture(t, "statistic-get-all.json"), fixture(t, "status-get.json"))
-	defer srv.Close()
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	kea := healthyKea(t)
+	collector := newCollector(kea, quietLogger)
 
 	expected := `
-# HELP kea_dhcp4_packets_dropped_by_reason_total Inbound DHCPv4 packets dropped, by reason. These sum to kea_dhcp4_packets_dropped_total, so use one or the other -- adding them together double-counts.
+# HELP kea_dhcp4_packets_dropped_by_reason_total Inbound DHCPv4 packets dropped, by reason. These sum to kea_dhcp4_packets_dropped_total, so use one or the other; adding them together double-counts.
 # TYPE kea_dhcp4_packets_dropped_by_reason_total counter
 kea_dhcp4_packets_dropped_by_reason_total{reason="admin-filtered"} 0
 kea_dhcp4_packets_dropped_by_reason_total{reason="duplicate"} 0
@@ -570,7 +542,7 @@ kea_dhcp4_packets_dropped_total 4
 `
 
 	// Act + Assert
-	if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
+	if err := testutil.CollectAndCompare(collector, strings.NewReader(expected),
 		"kea_dhcp4_packets_dropped_by_reason_total", "kea_dhcp4_packets_dropped_total"); err != nil {
 		t.Errorf("drop metrics: %v", err)
 	}
@@ -583,14 +555,12 @@ func TestIgnoredStatisticsDoNotLogAnExporterBug(t *testing.T) {
 	// difference is one ERROR per ignored statistic per scrape, forever.
 
 	// Arrange
-	var buf bytes.Buffer
-	srv := keaStub(t, fixture(t, "statistic-get-all-with-failures.json"), fixture(t, "status-get.json"))
-	defer srv.Close()
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
-	c.log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger, buf := capturingLogger(slog.LevelError)
+	kea := newFakeKea(fixture(t, "statistic-get-all-with-failures.json"), fixture(t, "status-get.json"))
+	collector := newCollector(kea, logger)
 
 	// Act
-	collectAll(c)
+	collectAll(collector)
 
 	// Assert
 	if strings.Contains(buf.String(), "exporter bug") {
@@ -607,7 +577,7 @@ func TestFixturesKeepKeasSampleShape(t *testing.T) {
 	// true through the next edit, which is the point at which a fixture
 	// quietly stops resembling the daemon.
 
-	// Arrange -- the four exceptions are gauges, inherited unmodified from the
+	// Arrange: the exceptions are gauges, inherited unmodified from the
 	// real capture, where they also break the rule.
 	gauges := map[string]bool{
 		"subnet[1].pool[0].assigned-addresses": true,
@@ -618,6 +588,7 @@ func TestFixturesKeepKeasSampleShape(t *testing.T) {
 
 	for _, name := range []string{"statistic-get-all.json", "statistic-get-all-with-failures.json"} {
 		t.Run(name, func(t *testing.T) {
+			// Arrange: decode the fixture's samples.
 			var raw []struct {
 				Arguments map[string][][]json.RawMessage `json:"arguments"`
 			}
@@ -667,18 +638,17 @@ func TestFixturesKeepKeasSampleShape(t *testing.T) {
 }
 
 func TestAllocationFailureSeriesExistOnAHealthyServer(t *testing.T) {
-	// This is the property that forced the globals to be used instead of the
-	// per-subnet keys. Kea does not create subnet[N].v4-allocation-fail* until
-	// something fails, so exporting only those left a healthy server with no
-	// series at all -- and an alert cannot tell "no failures" from "exporter
-	// broken" when the series is simply absent.
+	// This is why the globals are used instead of the per-subnet keys. Kea
+	// does not create subnet[N].v4-allocation-fail* until something fails, so
+	// exporting only those would leave a healthy server with no series at
+	// all, and an alert cannot tell "no failures" from "exporter broken" when
+	// the series is simply absent.
 	//
 	// The real capture is a healthy server, so it is the right evidence.
 
 	// Arrange
-	srv := keaStub(t, fixture(t, "statistic-get-all.json"), fixture(t, "status-get.json"))
-	defer srv.Close()
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	kea := healthyKea(t)
+	collector := newCollector(kea, quietLogger)
 
 	expected := `
 # HELP kea_dhcp4_allocation_failures_by_cause_total Server-wide address allocation failures by cause. A second true partition of the SAME failures: no-pools and attempts-exhausted also sum to the total, so do not add this to kea_dhcp4_allocation_failures_by_scope_total.
@@ -691,8 +661,8 @@ kea_dhcp4_allocation_failures_by_scope_total{scope="shared-network"} 0
 kea_dhcp4_allocation_failures_by_scope_total{scope="subnet"} 0
 `
 
-	// Act + Assert -- present and zero, not absent.
-	if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
+	// Act + Assert: present and zero, not absent.
+	if err := testutil.CollectAndCompare(collector, strings.NewReader(expected),
 		"kea_dhcp4_allocation_failures_by_scope_total",
 		"kea_dhcp4_allocation_failures_by_cause_total"); err != nil {
 		t.Errorf("allocation failures on a healthy server: %v", err)
@@ -700,46 +670,44 @@ kea_dhcp4_allocation_failures_by_scope_total{scope="subnet"} 0
 }
 
 func TestUnmappedStatisticsAreLoggedOncePerKey(t *testing.T) {
-	// noteUnhandled dedups so an unmapped statistic costs one line for the
-	// process lifetime, not one per scrape. Removing the dedup changes no
-	// metric -- the map write is idempotent -- so only the log shows it.
+	// noteUnhandled logs each unmapped statistic once, so it costs one line
+	// for the process lifetime, not one per scrape. Logging it every time
+	// would change no metric, since the map write is idempotent, so only the
+	// log shows it.
 
 	// Arrange
-	var buf bytes.Buffer
-	srv := keaStub(t, fixture(t, "statistic-get-all.json"), fixture(t, "status-get.json"))
-	defer srv.Close()
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
-	c.log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	logger, buf := capturingLogger(slog.LevelDebug)
+	kea := healthyKea(t)
+	collector := newCollector(kea, logger)
 
-	// Act -- three scrapes over the same statistics.
-	collectAll(c)
-	collectAll(c)
-	collectAll(c)
+	// Act: repeated scrapes over the same statistics.
+	const scrapes = 3
+	for range scrapes {
+		collectAll(collector)
+	}
 
 	// Assert
-	lines := strings.Count(buf.String(), "unhandled statistic")
-	c.unhandledMu.Lock()
-	distinct := len(c.unhandled)
-	c.unhandledMu.Unlock()
+	logged := loggedUnhandled(buf.String())
+	lines := len(logged)
+	slices.Sort(logged)
+	distinct := len(slices.Compact(logged))
 	if lines != distinct {
-		t.Errorf("logged %d unhandled-statistic lines for %d distinct keys over three scrapes; it must be one per key, not one per scrape",
-			lines, distinct)
+		t.Errorf("logged %d unhandled-statistic lines for %d distinct keys over %d scrapes; it must be one per key, not one per scrape",
+			lines, distinct, scrapes)
 	}
 }
 
 func TestUnmappedStatisticsLogAtDebugNotHigher(t *testing.T) {
-	// A stock Kea reports ten statistics this exporter does not map. At info
+	// A stock Kea reports statistics this exporter does not map. At info
 	// they would bury anything that matters on every start.
 
 	// Arrange
-	var buf bytes.Buffer
-	srv := keaStub(t, fixture(t, "statistic-get-all.json"), fixture(t, "status-get.json"))
-	defer srv.Close()
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
-	c.log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger, buf := capturingLogger(slog.LevelInfo)
+	kea := healthyKea(t)
+	collector := newCollector(kea, logger)
 
 	// Act
-	collectAll(c)
+	collectAll(collector)
 
 	// Assert
 	if strings.Contains(buf.String(), "unhandled statistic") {
@@ -754,29 +722,27 @@ func TestMissingDescriptorIsAnExporterBugNotKeaDrift(t *testing.T) {
 	// wrong system, so the branch logs and deliberately does not count.
 
 	// Arrange
-	srv := keaStub(t, fixture(t, "statistic-get-all.json"), fixture(t, "status-get.json"))
-	defer srv.Close()
-	var buf bytes.Buffer
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
-	c.log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError}))
-	before := sumFamily(t, c, "kea_exporter_unhandled_statistics")
+	kea := healthyKea(t)
+	logger, buf := capturingLogger(slog.LevelError)
+	collector := newCollector(kea, logger)
+	before := sumFamily(t, collector, "kea_exporter_unhandled_statistics")
 
-	// Act -- remove a descriptor the classifier still routes to.
-	delete(c.stats, statPacketsReceived)
-	collectAll(c)
+	// Act: remove a descriptor the classifier still routes to.
+	delete(collector.stats, statPacketsReceived)
+	collectAll(collector)
 
 	// Assert
 	if !strings.Contains(buf.String(), "exporter bug") {
 		t.Errorf("a statistic with no descriptor was not reported as an exporter bug:\n%s", buf.String())
 	}
-	if after := sumFamily(t, c, "kea_exporter_unhandled_statistics"); after != before {
+	if after := sumFamily(t, collector, "kea_exporter_unhandled_statistics"); after != before {
 		t.Errorf("unhandled statistics moved %v -> %v; an exporter bug must not be reported as Kea drift", before, after)
 	}
 }
 
 func TestDropReasonsPartitionTheDropTotalOnRealCaptures(t *testing.T) {
 	// Kea records a drop reason and then its caller bumps pkt4-receive-drop,
-	// so the reasons sum to the total. Verified on all three real captures,
+	// so the reasons sum to the total. This holds on every real capture,
 	// including a hot-standby standby whose HA hook drops every packet.
 	//
 	// No relation is asserted between pkt4-received and the typed counters.
@@ -785,7 +751,7 @@ func TestDropReasonsPartitionTheDropTotalOnRealCaptures(t *testing.T) {
 	// not-for-us in the buffer4_receive callout, which Dhcpv4Srv::processPacket
 	// runs before it types the packet, while Dhcpv4Srv::acceptServerId bumps
 	// the same statistic after typing. The live standby capture shows the
-	// consequence -- 98836 pkt4-not-for-us with every typed counter at zero.
+	// consequence: 98836 pkt4-not-for-us with every typed counter at zero.
 
 	// Arrange
 	reasons := []string{
@@ -812,11 +778,11 @@ func TestDropReasonsPartitionTheDropTotalOnRealCaptures(t *testing.T) {
 				if !ok || len(samples) == 0 {
 					return 0
 				}
-				var v int
-				if err := json.Unmarshal(samples[0][0], &v); err != nil {
+				var count int
+				if err := json.Unmarshal(samples[0][0], &count); err != nil {
 					t.Fatalf("%s: %v", key, err)
 				}
-				return v
+				return count
 			}
 
 			// Act
@@ -845,15 +811,14 @@ func TestDropReasonsPartitionTheDropTotalOnRealCaptures(t *testing.T) {
 func TestStandbyPeerFromALiveCapture(t *testing.T) {
 	// Captured from the standby of a live hot-standby pair. Every packet it
 	// receives is dropped by the HA hook as not-for-us, its scopes list is
-	// empty, and remote.age is 0 while in-touch is true -- which is what a
+	// empty, and remote.age is 0 while in-touch is true, which is what a
 	// healthy just-contacted partner looks like, not a never-contacted one.
 	// None of that appears in the primary's capture, and the age-0-but-in-touch
 	// case is exactly what the in-touch gate was built for.
 
 	// Arrange
-	srv := keaStub(t, fixture(t, "statistic-get-all-standby.json"), fixture(t, "status-get-standby.json"))
-	defer srv.Close()
-	c := newCollector(&keaClient{url: srv.URL, client: srv.Client()})
+	kea := newFakeKea(fixture(t, "statistic-get-all-standby.json"), fixture(t, "status-get-standby.json"))
+	collector := newCollector(kea, quietLogger)
 
 	expected := `
 # HELP kea_dhcp4_ha_enabled 1 when Kea reports an HA relationship, 0 when the HA hook is not loaded.
@@ -870,16 +835,16 @@ kea_dhcp4_ha_partner_in_touch{peer="kea-primary",relationship="kea-primary"} 1
 kea_dhcp4_ha_partner_last_contact_seconds{peer="kea-primary",relationship="kea-primary"} 0
 `
 
-	// Act + Assert -- age 0 with in-touch true must be exported, not withheld:
+	// Act + Assert: age 0 with in-touch true must be exported, not withheld:
 	// the gate is on in-touch, not on the value being non-zero.
-	if err := testutil.CollectAndCompare(c, strings.NewReader(expected),
+	if err := testutil.CollectAndCompare(collector, strings.NewReader(expected),
 		"kea_dhcp4_ha_enabled", "kea_dhcp4_ha_local_state_info",
 		"kea_dhcp4_ha_partner_in_touch", "kea_dhcp4_ha_partner_last_contact_seconds"); err != nil {
 		t.Errorf("standby HA metrics: %v", err)
 	}
 
 	drops := `
-# HELP kea_dhcp4_packets_dropped_by_reason_total Inbound DHCPv4 packets dropped, by reason. These sum to kea_dhcp4_packets_dropped_total, so use one or the other -- adding them together double-counts.
+# HELP kea_dhcp4_packets_dropped_by_reason_total Inbound DHCPv4 packets dropped, by reason. These sum to kea_dhcp4_packets_dropped_total, so use one or the other; adding them together double-counts.
 # TYPE kea_dhcp4_packets_dropped_by_reason_total counter
 kea_dhcp4_packets_dropped_by_reason_total{reason="admin-filtered"} 0
 kea_dhcp4_packets_dropped_by_reason_total{reason="duplicate"} 0
@@ -894,13 +859,13 @@ kea_dhcp4_packets_dropped_by_reason_total{reason="service-disabled"} 0
 # TYPE kea_dhcp4_packets_dropped_total counter
 kea_dhcp4_packets_dropped_total 98836
 `
-	if err := testutil.CollectAndCompare(c, strings.NewReader(drops),
+	if err := testutil.CollectAndCompare(collector, strings.NewReader(drops),
 		"kea_dhcp4_packets_dropped_by_reason_total", "kea_dhcp4_packets_dropped_total"); err != nil {
 		t.Errorf("standby drop metrics: %v", err)
 	}
 
 	// The scrape is healthy: a standby dropping everything is doing its job.
-	if got := testutil.ToFloat64(upOnly{c}); got != 1 {
+	if got := testutil.ToFloat64(upOnly{collector}); got != 1 {
 		t.Errorf("kea_up = %v scraping a healthy standby, want 1", got)
 	}
 }

@@ -4,7 +4,7 @@ package main
 //
 // One reason to change: Kea renamed, added, or removed a statistic.
 // The metric descriptors themselves live in collector.go, which changes for a
-// different reason -- the exported contract.
+// different reason: what a scrape produces.
 //
 // Why a given statistic is exported, ignored, or split across two metrics is
 // in docs/kea-behaviour.md. The comments below say only what is needed to
@@ -43,9 +43,9 @@ const (
 // statTarget is a table entry: which metric a statistic feeds, plus any label
 // values the key itself does not supply.
 //
-// Only exactStats uses `extra`; the other two tables derive their single
-// label from the key. It exists because several Kea statistics differ only in
-// their name and belong on one metric under different labels --
+// Only exactStats uses `extra`; the other tables derive their single label
+// from the key. It exists because several Kea statistics differ only in their
+// name and belong on one metric under different labels:
 // v4-allocation-fail-no-pools is the "no-pools" cause of the same counter
 // that v4-allocation-fail is the "attempts-exhausted" cause of.
 type statTarget struct {
@@ -57,7 +57,7 @@ type statTarget struct {
 //
 // Adding a statistic is not only a row here. It also needs a statID above, a
 // descriptor field and NewDesc in collector.go, a line in Describe, and a
-// statMetrics row. The tables remove the branching, not the wiring.
+// buildStatMetrics row. The tables remove the branching, not the wiring.
 var exactStats = map[string]statTarget{
 	// Grand totals, not packet types; exporting them beside the per-type
 	// series doubles sum().
@@ -122,7 +122,7 @@ var subnetStats = map[string]statTarget{
 // the operation. A table rather than a switch so the tests can derive the
 // mapped set instead of restating it.
 //
-// Rows support neither `extra` nor statIgnored -- classifyPacketStat
+// Rows support neither `extra` nor statIgnored, because classifyPacketStat
 // implements neither. Add the handling with the row that needs it.
 var packetStats = map[string]statTarget{
 	"-received": {id: statPacketsReceived},
@@ -130,7 +130,7 @@ var packetStats = map[string]statTarget{
 }
 
 // classifyStat resolves a Kea statistic name to what it maps onto and the
-// label values that accompany it -- nil for an unlabelled metric. Labels are
+// label values that accompany it, nil for an unlabelled metric. Labels are
 // a slice so the arity has one source; getting it wrong kills the process
 // rather than failing a scrape (docs/kea-behaviour.md).
 //
@@ -187,10 +187,10 @@ func classifySubnetStat(key string) (statID, []string) {
 // classifyPacketStat handles `pkt4-<op>-received` and `pkt4-<op>-sent`; the
 // label is the operation, e.g. "discover" or "lease-query".
 func classifyPacketStat(key string) (statID, []string) {
-	op := strings.TrimPrefix(key, "pkt4-")
+	operation := strings.TrimPrefix(key, "pkt4-")
 	for suffix, target := range packetStats {
-		if strings.HasSuffix(op, suffix) {
-			return target.id, []string{strings.TrimSuffix(op, suffix)}
+		if strings.HasSuffix(operation, suffix) {
+			return target.id, []string{strings.TrimSuffix(operation, suffix)}
 		}
 	}
 	return statUnmapped, nil

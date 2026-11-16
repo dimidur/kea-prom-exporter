@@ -102,14 +102,11 @@ func (k *keaClient) call(ctx context.Context, command string) (*keaResponse, err
 // newRequest builds the request that sends command to Kea, under a deadline of
 // its own. The caller calls cancel once the reply has been read.
 func (k *keaClient) newRequest(ctx context.Context, command string) (*http.Request, context.CancelFunc, error) {
-	body, err := json.Marshal(keaCommand{Command: command, Service: []string{k.service}})
-	if err != nil {
-		return nil, nil, fmt.Errorf("encode command %q: %w", command, err)
-	}
+	// Marshal cannot fail here: every field of keaCommand is a string or a
+	// []string.
+	body, _ := json.Marshal(keaCommand{Command: command, Service: []string{k.service}})
 
-	// Per-request deadline. One deadline shared across the whole scrape would
-	// let a slow first command starve the second, whose failure would then be
-	// reported as if the second command were at fault.
+	// A deadline per request, as keaCaller requires of every call.
 	ctx, cancel := context.WithTimeout(ctx, effectiveTimeout(k.timeout))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, k.url, bytes.NewReader(body))
 	if err != nil {

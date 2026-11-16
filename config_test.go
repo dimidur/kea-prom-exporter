@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"slices"
@@ -165,6 +166,37 @@ func TestApplyEnvFillsUnsetFlagsAndReportsBadValues(t *testing.T) {
 			t.Errorf("kea-timeout = %v, want the default kept after a bad value", *timeout)
 		}
 	})
+}
+
+// rejectingValue is a flag.Value that refuses every value, including the one
+// it reports holding.
+type rejectingValue struct{}
+
+func (rejectingValue) String() string   { return "held" }
+func (rejectingValue) Set(string) error { return errors.New("rejected") }
+
+func TestAFlagThatCannotBeRestoredIsReportedToo(t *testing.T) {
+	// A rejected value is answered by restoring the flag to what it held. If
+	// that restore fails too, the flag's value is no longer what the first
+	// problem says it kept, and that must be reported rather than lost.
+
+	// Arrange
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.Var(rejectingValue{}, "kea-url", "")
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// Act
+	problems := applyEnv(fs, func(env string) (string, bool) { return "http://from-env/", env == "KEA_URL" })
+
+	// Assert
+	if len(problems) != 2 {
+		t.Fatalf("problems = %v, want the rejected value and the failed restore", problems)
+	}
+	if !strings.Contains(problems[1].Error(), "could not restore --kea-url to held") {
+		t.Errorf("second problem = %v, want it to name the flag and the value it could not restore", problems[1])
+	}
 }
 
 func TestEveryFlagHasAnEnvEquivalent(t *testing.T) {
