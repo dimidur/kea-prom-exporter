@@ -13,76 +13,63 @@
 // kea_exporter_unhandled_statistics.
 package main
 
-// The composition root: reads the configuration and assembles the exporter
-// from the parts the other files define.
+// Where the process meets the operating system and the build: everything run
+// takes from outside, and the real values of it.
 //
-// One reason to change: what the process is assembled from.
+// One reason to change: what the process takes from outside.
 
 import (
 	"context"
-	"flag"
-	"fmt"
+	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
-	"syscall"
+	"runtime/debug"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 )
 
-func main() {
-	flag.Parse()
-	if *showVersion {
-		fmt.Println(buildIdentity().versionLine())
-		return
-	}
-	envProblems := applyEnv(flag.CommandLine, os.LookupEnv)
+func main() { os.Exit(run(os.Args[0], os.Args[1:], osProcess())) }
 
-	logger, logProblems := newLogger(*logLevel, *logFormat)
-	// fatal logs through the default logger, and so do net/http's own server
-	// errors: SetDefault routes the log package, which http.Server uses when
-	// it has no ErrorLog, through the same handler.
-	slog.SetDefault(logger)
-	// Deferred until the logger exists, and every problem is reported rather
-	// than only the last one.
-	for _, err := range append(envProblems, logProblems...) {
-		logger.Warn("configuration problem", "err", err)
-	}
-
-	secret, err := loadPassword(*keaPassFile, *keaPass)
-	if err != nil {
-		fatal("could not load the Kea password", "err", err)
-	}
-	settings := keaClient{
-		url:      *keaURL,
-		user:     *keaUser,
-		password: secret,
-		service:  *scrapeService,
-		timeout:  *httpTimeout,
-	}
-	if err := validateConfig(settings); err != nil {
-		fatal("invalid configuration", "err", err)
-	}
-	srv := buildServer(*listenAddr, newExporter(newKeaClient(settings), logger), logger)
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	grace := shutdownGrace(maxScrapeDuration(settings.timeout))
-	if err := serveUntilSignal(ctx, srv, grace, logger, stop); err != nil {
-		fatal("http server failed", "err", err)
-	}
+// process is the operating-system and build dependencies run takes from its
+// caller.
+type process struct {
+	stdout, stderr io.Writer
+	lookupEnv      func(key string) (string, bool)
+	readFile       func(name string) ([]byte, error)
+	listen         func(network, address string) (net.Listener, error)
+	notifyContext  func(parent context.Context, signals ...os.Signal) (context.Context, context.CancelFunc)
+	keaTransport   http.RoundTripper
+	// adoptLogger makes the configured logger the process-wide one, which
+	// also routes the log package through it: net/http's client writes
+	// there, outside any ErrorLog.
+	adoptLogger func(*slog.Logger)
+	build       buildSource
+	now         func() time.Time
+	// runtimeCollectors describe the process itself.
+	runtimeCollectors []prometheus.Collector
 }
 
-// newExporter returns the registry that /metrics serves: the Kea collector,
-// logging to logger, plus the Go runtime and process collectors.
-func newExporter(kea keaCaller, logger *slog.Logger) *prometheus.Registry {
-	reg := prometheus.NewRegistry()
-	reg.MustRegister(
-		newCollector(kea, logger),
-		collectors.NewGoCollector(),
-		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-	)
-	return reg
+// osProcess is the process run gets from the operating system and the build.
+func osProcess() process {
+	return process{
+		stdout:        os.Stdout,
+		stderr:        os.Stderr,
+		lookupEnv:     os.LookupEnv,
+		readFile:      os.ReadFile,
+		listen:        net.Listen,
+		notifyContext: signal.NotifyContext,
+		keaTransport:  http.DefaultTransport,
+		adoptLogger:   slog.SetDefault,
+		build:         buildSource{version: version, revision: revision, readInfo: debug.ReadBuildInfo},
+		now:           time.Now,
+		runtimeCollectors: []prometheus.Collector{
+			collectors.NewGoCollector(),
+			collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		},
+	}
 }

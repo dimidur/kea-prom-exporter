@@ -85,60 +85,47 @@ func TestResolveFromBuildInfo(t *testing.T) {
 		},
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
 			// Arrange
-			info, ok := tc.info, tc.ok
+			info, ok := testCase.info, testCase.ok
 
 			// Act
-			id := resolveFrom(tc.injectedVersion, tc.injectedRevision, info, ok)
+			id := resolveFrom(testCase.injectedVersion, testCase.injectedRevision, info, ok)
 
 			// Assert
-			if id.version != tc.wantVersion {
-				t.Errorf("version = %q, want %q", id.version, tc.wantVersion)
+			if id.version != testCase.wantVersion {
+				t.Errorf("version = %q, want %q", id.version, testCase.wantVersion)
 			}
-			if id.revision != tc.wantRevision {
-				t.Errorf("revision = %q, want %q", id.revision, tc.wantRevision)
+			if id.revision != testCase.wantRevision {
+				t.Errorf("revision = %q, want %q", id.revision, testCase.wantRevision)
 			}
 			// Asserted exactly, not merely non-empty: in-process
 			// debug.ReadBuildInfo().GoVersion equals runtime.Version(), so a
 			// test routing through the real build info could not tell
 			// whether the override is there at all.
-			if id.goVersion != tc.wantGoVersion {
-				t.Errorf("goVersion = %q, want %q", id.goVersion, tc.wantGoVersion)
+			if id.goVersion != testCase.wantGoVersion {
+				t.Errorf("goVersion = %q, want %q", id.goVersion, testCase.wantGoVersion)
 			}
 		})
 	}
 }
 
-func TestResolveIdentityReadsTheRealBuildInfo(t *testing.T) {
-	// resolveIdentity must take the revision and Go version from the build
-	// info, which only this test sees through the readBuildInfo seam.
+func TestBuildSourceResolvesFromItsInjectedValuesAndBuildInfo(t *testing.T) {
+	// The identity a binary reports combines what the build injected with
+	// what Go stamped, so a source that consulted only one would report
+	// "dev" or the wrong Go version.
 
 	// Arrange
-	original := readBuildInfo
-	t.Cleanup(func() { readBuildInfo = original })
-	readBuildInfo = func() (*debug.BuildInfo, bool) {
-		return &debug.BuildInfo{
-			GoVersion: "go0.0.0-sentinel",
-			Settings: []debug.BuildSetting{
-				{Key: "vcs.revision", Value: "seam"},
-				{Key: "vcs.modified", Value: "true"},
-			},
-		}, true
-	}
+	source := buildSource{version: "1.2.3", readInfo: sentinelBuildInfo}
+	want := buildID{version: "1.2.3", revision: "abc123", goVersion: "go0.0.0-sentinel"}
 
 	// Act
-	id := resolveIdentity("dev", "")
+	id := source.resolve()
 
 	// Assert
-	// Both the revision and the Go version must come from what the seam
-	// returned, proving resolveIdentity actually consults it.
-	if id.revision != "seam-dirty" {
-		t.Errorf("revision = %q, want seam-dirty; resolveIdentity is not reading the build info", id.revision)
-	}
-	if id.goVersion != "go0.0.0-sentinel" {
-		t.Errorf("goVersion = %q, want the sentinel; resolveIdentity is not reading the build info", id.goVersion)
+	if id != want {
+		t.Errorf("resolve() = %+v, want %+v", id, want)
 	}
 }
 
@@ -148,12 +135,13 @@ func TestVersionLineNamesVersionRevisionAndGoVersion(t *testing.T) {
 
 	// Arrange
 	id := buildID{version: "v1.2.3", revision: "cafebabe", goVersion: "go1.2.3"}
+	const want = "kea-prom-exporter v1.2.3 (revision cafebabe, go1.2.3)"
 
 	// Act
 	got := id.versionLine()
 
 	// Assert
-	if want := "kea-prom-exporter v1.2.3 (revision cafebabe, go1.2.3)"; got != want {
+	if got != want {
 		t.Errorf("versionLine() = %q, want %q", got, want)
 	}
 }

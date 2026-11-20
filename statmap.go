@@ -55,9 +55,9 @@ type statTarget struct {
 
 // exactStats covers statistics Kea reports under a fixed name.
 //
-// Adding a statistic is not only a row here. It also needs a statID above, a
-// descriptor field and NewDesc in collector.go, a line in Describe, and a
-// buildStatMetrics row. The tables remove the branching, not the wiring.
+// Adding a statistic is not only a row here. It also needs a statID above,
+// and in collector.go a descriptor field built with add in newDescriptors and
+// a statMetrics row. The tables remove the branching, not the wiring.
 var exactStats = map[string]statTarget{
 	// Grand totals, not packet types; exporting them beside the per-type
 	// series doubles sum().
@@ -131,8 +131,8 @@ var packetStats = map[string]statTarget{
 
 // classifyStat resolves a Kea statistic name to what it maps onto and the
 // label values that accompany it, nil for an unlabelled metric. Labels are
-// a slice so the arity has one source; getting it wrong kills the process
-// rather than failing a scrape (docs/kea-behaviour.md).
+// a slice so the arity has one source; getting it wrong fails every scrape
+// rather than one series (docs/kea-behaviour.md).
 //
 // It never returns an error: an unrecognised key is statUnmapped, which the
 // caller logs once and counts.

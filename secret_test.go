@@ -1,7 +1,9 @@
 package main
 
 import (
-	"os"
+	"errors"
+	"fmt"
+	"io/fs"
 	"strings"
 	"testing"
 )
@@ -10,56 +12,46 @@ import (
 
 func TestSecretTrimsOnlyTrailingNewlines(t *testing.T) {
 	// TrimSpace would eat a password that legitimately ends in a space, and
-	// the operator would see an authentication failure with no explanation.
+	// the result would be an authentication failure with no explanation.
 	// Only the newline an editor or `echo` leaves behind may go.
-
-	// Arrange
-	dir := t.TempDir()
 	cases := []struct {
 		name     string
 		contents string
 		want     string
 	}{
-		{"trailing newline", "s3cret\n", "s3cret"},
-		{"crlf", "s3cret\r\n", "s3cret"},
-		{"no trailing newline", "s3cret", "s3cret"},
-		{"a trailing space is part of the password", "s3cret \n", "s3cret "},
-		{"a leading space is part of the password", " s3cret\n", " s3cret"},
-		{"internal whitespace survives", "s3 cret\n", "s3 cret"},
+		{"trailing newline", "kea-password\n", "kea-password"},
+		{"crlf", "kea-password\r\n", "kea-password"},
+		{"no trailing newline", "kea-password", "kea-password"},
+		{"a trailing space is part of the password", "kea-password \n", "kea-password "},
+		{"a leading space is part of the password", " kea-password\n", " kea-password"},
+		{"internal whitespace survives", "kea password\n", "kea password"},
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
 			// Arrange
-			path := dir + "/" + strings.ReplaceAll(tc.name, " ", "-")
-			if err := os.WriteFile(path, []byte(tc.contents), 0o600); err != nil {
-				t.Fatalf("write: %v", err)
-			}
+			readFile := filesOf(map[string]string{"/run/secrets/kea": testCase.contents})
 
 			// Act
-			got, err := loadPassword(path, "")
+			got, err := loadPassword(readFile, "/run/secrets/kea", "")
 
 			// Assert
 			if err != nil {
 				t.Fatalf("loadPassword: %v", err)
 			}
-			if got != tc.want {
-				t.Errorf("loadPassword(%q) = %q, want %q", tc.contents, got, tc.want)
+			if got != testCase.want {
+				t.Errorf("loadPassword(%q) = %q, want %q", testCase.contents, got, testCase.want)
 			}
 		})
 	}
 }
 
 func TestLoadPassword(t *testing.T) {
-	// Arrange
-	dir := t.TempDir()
-	file := dir + "/secret"
-	// Trailing newline is what an editor or `echo` leaves behind; sending it
-	// to Kea is an authentication failure with no useful diagnostic.
-	if err := os.WriteFile(file, []byte("from-file\n"), 0o600); err != nil {
-		t.Fatalf("write fixture: %v", err)
-	}
-
+	// The file wins over the inline value when both are given, and a file that
+	// cannot be read is an error rather than an empty password, which Kea
+	// would answer with an authentication failure that names nothing. The
+	// error names the file, the only clue to a secret mounted in the wrong
+	// place.
 	cases := []struct {
 		name    string
 		file    string
@@ -67,22 +59,29 @@ func TestLoadPassword(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{"file wins over inline", file, "inline", "from-file", false},
-		{"trailing newline stripped", file, "", "from-file", false},
+		{"file wins over inline", "/run/secrets/kea", "inline", "from-file", false},
 		{"inline when no file", "", "inline", "inline", false},
 		{"neither is not an error", "", "", "", false},
-		{"missing file is an error", dir + "/absent", "inline", "", true},
+		{"missing file is an error", "/run/secrets/absent", "inline", "", true},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			// Arrange
+			readFile := filesOf(map[string]string{"/run/secrets/kea": "from-file\n"})
+			file, inline := testCase.file, testCase.inline
+
 			// Act
-			got, err := loadPassword(tc.file, tc.inline)
+			got, err := loadPassword(readFile, file, inline)
+
 			// Assert
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("loadPassword(%q, %q) error = %v, wantErr %v", tc.file, tc.inline, err, tc.wantErr)
+			if (err != nil) != testCase.wantErr {
+				t.Fatalf("loadPassword(%q, %q) error = %v, wantErr %v", file, inline, err, testCase.wantErr)
 			}
-			if got != tc.want {
-				t.Errorf("loadPassword(%q, %q) = %q, want %q", tc.file, tc.inline, got, tc.want)
+			if testCase.wantErr && (!errors.Is(err, fs.ErrNotExist) || !strings.Contains(err.Error(), fmt.Sprintf("kea-password-file %q", file))) {
+				t.Errorf("error = %v, want it to wrap the read error and name the flag and %s", err, file)
+			}
+			if got != testCase.want {
+				t.Errorf("loadPassword(%q, %q) = %q, want %q", file, inline, got, testCase.want)
 			}
 		})
 	}

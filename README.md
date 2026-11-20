@@ -132,17 +132,10 @@ already right and `assigned + declined` is not.
 
 ### HA
 
-> **Breaking change.** Four of the five `kea_dhcp4_ha_*` metrics that existed
-> before now carry two additional labels, `relationship` and `peer`
-> (`kea_dhcp4_ha_enabled` stays unlabelled: it describes the daemon, not a
-> relationship). Queries that
-> match a full label set exactly need updating; queries selecting by metric
-> name are unaffected. Separately, a daemon with several relationships now
-> emits one series per relationship where it previously emitted one in total,
-> so `sum`/`avg`/`max` over those metrics change there. That is from
-> exporting every relationship, not from the labels. This is
-> pre-1.0 and metric names are treated as an API, so the change is called out
-> here rather than made quietly.
+Every HA metric except `kea_dhcp4_ha_enabled` carries the labels
+`relationship` and `peer`, and a daemon with several relationships emits one
+series per relationship. `kea_dhcp4_ha_enabled` stays unlabelled: it describes
+the daemon, not a relationship.
 
 `kea_dhcp4_ha_partner_last_contact_seconds` is deliberately **absent** rather
 than 0 before first contact: Kea reports age 0 in that state, which reads on a
@@ -234,12 +227,7 @@ Kea release that adds statistics degrades to *missing* metrics rather than *no*
 metrics, and `kea_exporter_unhandled_statistics` counts them.
 
 Extending coverage starts with a row in one of the tables in
-[`statmap.go`](statmap.go): `exactStats` for a fixed name, `subnetStats` for a
-`subnet[N].` suffix, `packetStats` for a `pkt4-` direction. That decides which
-`statID` a key maps to; the metric it becomes is then wired in
-[`collector.go`](collector.go): a `statID`, a descriptor field, its `NewDesc`,
-a line in `Describe`, and a `buildStatMetrics` row. The tables remove the
-branching, not the wiring, and the tests fail if the two halves disagree.
+[`statmap.go`](statmap.go), whose comments list what else a new metric needs.
 
 ## Build
 
@@ -272,10 +260,12 @@ KEA_PASSWORD_FILE=/etc/kea/control-password \
 ./kea-prom-exporter
 ```
 
-Every flag has an environment equivalent, and an explicit flag always wins over
-the environment. A value the environment cannot supply, such as an unparseable
-`KEA_TIMEOUT` or an unrecognised `LOG_LEVEL`, is reported at `WARN` and the
-default is kept, rather than being applied silently or zeroed.
+Every flag that configures the running exporter has an environment equivalent,
+and an explicit flag always wins over the environment. A value the environment
+cannot supply, such as an unparseable `KEA_TIMEOUT` or an unrecognised
+`LOG_LEVEL`, is reported at `WARN` and the default is kept, rather than being
+applied silently or zeroed. The exporter takes flags only: a positional
+argument is refused with exit 2, as an unknown flag is.
 
 | Flag | Env | Default | Notes |
 | --- | --- | --- | --- |
@@ -300,6 +290,9 @@ in-flight scrapes finish before exiting. The grace period is one effective
 `--kea-timeout` (`5s` when it is zero or less) for every control command a
 scrape sends, which is the longest a legitimate scrape can take, plus one
 second. It exits 0 even if that grace expires; a slow shutdown is not a crash.
+The same span bounds every `/metrics` response: one still being written that
+long after its request was read is cut off, so a scraper that stops reading
+cannot hold up the others.
 
 ## Docker
 
@@ -377,10 +370,7 @@ Grouped by milestone rather than date.
 - [x] HA partner-side state (`remote.last-state`, `remote.role`) as a labelled
   metric, and every relationship exported rather than only the first.
 - [ ] HA served scopes (`local.scopes`, `remote.last-scopes`), which say which
-  peer is actually answering during a failover. When this lands, extract
-  `collectHA`'s per-relationship body into an `emitRelationship` helper: the
-  loop is already at the length where a sixth and seventh emitted field stops
-  being readable, and the scopes fields go straight into it.
+  peer is actually answering during a failover.
 - [ ] DHCPv6 support, mirroring the dhcp4 collector.
 - [ ] Multi-target scraping: one process, several Kea peers, selected by
   `?target=<peer>` (the blackbox-exporter pattern).

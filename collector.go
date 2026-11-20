@@ -56,8 +56,67 @@ type keaCaller interface {
 // maintaining a pre-registered gauge cache, which avoids label-set drift
 // surprises when Kea adds new statistic dimensions between releases.
 type collector struct {
-	kea   keaCaller
+	descriptors
+	selfReport
+
+	kea keaCaller
+
+	// Cumulative scrape failures per command. Atomic and per-collector, not
+	// package globals: Prometheus may call Collect concurrently for
+	// overlapping scrapes, and a plain counter increment there is a data race.
+	statErrorCount atomic.Uint64
+	haErrorCount   atomic.Uint64
+
+	// Stat keys without a mapping, each logged once, which keeps scrape noise
+	// low while still surfacing drift.
+	unhandled unhandledSet
+
+	// Built once per collector, not per statistic per scrape: it never
+	// changes.
+	stats map[statID]statMetric
+}
+
+// unhandledSet is the statistic keys noted as unhandled, each once. Collect
+// may run concurrently, so the set is locked, and its size is kept beside it
+// so that reading it takes no lock. The zero value is an empty set.
+type unhandledSet struct {
+	mu   sync.Mutex
+	keys map[string]struct{}
+	size atomic.Int64
+}
+
+// note records key and reports whether it was not already in the set.
+func (s *unhandledSet) note(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, seen := s.keys[key]; seen {
+		return false
+	}
+	if s.keys == nil {
+		s.keys = map[string]struct{}{}
+	}
+	s.keys[key] = struct{}{}
+	s.size.Add(1)
+	return true
+}
+
+// count is how many distinct keys have been noted.
+func (s *unhandledSet) count() int64 { return s.size.Load() }
+
+// selfReport is how a collector reports on its own work: where command
+// failures, statistic drift and exporter bugs are logged, the build identity
+// it exports, and the clock its scrape duration is measured by.
+type selfReport struct {
+	log   *slog.Logger
 	build buildID
+	now   func() time.Time
+}
+
+// descriptors are the metrics a collector exports. all is what Describe sends;
+// newDescriptors' add lists each descriptor there as it builds it, and a test
+// holds every field to that.
+type descriptors struct {
+	all []*prometheus.Desc
 
 	// Scrape health.
 	up           *prometheus.Desc
@@ -98,160 +157,112 @@ type collector struct {
 	// The names are only logged, and only at debug, so a gauge makes drift
 	// after a Kea upgrade alertable without restarting at a higher log level.
 	unhandledStats *prometheus.Desc
-
-	// Cumulative scrape failures per command. Atomic and per-collector, not
-	// package globals: Prometheus may call Collect concurrently for
-	// overlapping scrapes, and a plain counter increment there is a data race.
-	statErrorCount atomic.Uint64
-	haErrorCount   atomic.Uint64
-
-	// Stat keys without a mapping, each logged once, which keeps scrape noise
-	// low while still surfacing drift. unhandledCount is the set's size, kept
-	// beside it so Collect reads it without taking the lock.
-	unhandledMu    sync.Mutex
-	unhandled      map[string]struct{}
-	unhandledCount atomic.Int64
-
-	// Where command failures, statistic drift and exporter bugs are logged.
-	log *slog.Logger
-
-	// Built once per collector, not per statistic per scrape: it never
-	// changes.
-	stats map[statID]statMetric
 }
 
-// newCollector returns a collector that scrapes kea and logs to logger.
-func newCollector(kea keaCaller, logger *slog.Logger) *collector {
+// newDescriptors builds every descriptor the collector exports, with its name,
+// help text and labels.
+func newDescriptors() descriptors {
 	const namespace = "kea_" + supportedService
-	collector := &collector{
-		kea:       kea,
-		build:     buildIdentity(),
-		unhandled: make(map[string]struct{}),
-		log:       logger,
-
-		up: prometheus.NewDesc(
-			"kea_up", "1 if the last scrape of the Kea control socket succeeded, else 0.",
-			nil, nil),
-		commandUp: prometheus.NewDesc(
-			"kea_command_up", "1 if this Kea control command succeeded on the last scrape, else 0.",
-			[]string{"command"}, nil),
-		scrapeErrors: prometheus.NewDesc(
-			"kea_scrape_errors_total", "Cumulative scrape errors since exporter start, by command.",
-			[]string{"command"}, nil),
-
-		// Dhcpv4Srv::declineLease leaves a declined lease counted in
-		// assigned-addresses so that pool utilisation stays meaningful, which
-		// is why assigned/capacity is already correct and assigned+declined
-		// over-counts. The HELP text carries the consequence; the citation
-		// stays here rather than in it, since HELP ships on every scrape.
-		addressesAssigned: prometheus.NewDesc(
-			namespace+"_addresses_assigned", "Currently assigned IPv4 addresses in the pool. Includes declined addresses: Kea keeps them assigned so pool-utilisation stays meaningful, so do not add "+namespace+"_addresses_declined to this.",
-			[]string{"subnet"}, nil),
-		addressesCapacity: prometheus.NewDesc(
-			namespace+"_addresses_capacity", "Pool size: total IPv4 addresses available in the subnet.",
-			[]string{"subnet"}, nil),
-		addressesDeclined: prometheus.NewDesc(
-			namespace+"_addresses_declined", "Addresses currently withdrawn from the pool by a DHCPDECLINE.",
-			[]string{"subnet"}, nil),
-
-		pkt4Received: prometheus.NewDesc(
-			namespace+"_packets_received_total", "Total DHCPv4 packets received by type.",
-			[]string{"type"}, nil),
-		pkt4Sent: prometheus.NewDesc(
-			namespace+"_packets_sent_total", "Total DHCPv4 packets sent by type.",
-			[]string{"type"}, nil),
-		pkt4Dropped: prometheus.NewDesc(
-			namespace+"_packets_dropped_total",
-			"Total inbound DHCPv4 packets dropped. Equal to the sum of "+namespace+"_packets_dropped_by_reason_total, and stays correct when a Kea release adds a reason this exporter does not know.",
-			nil, nil),
-		pkt4DropReasons: prometheus.NewDesc(
-			namespace+"_packets_dropped_by_reason_total",
-			"Inbound DHCPv4 packets dropped, by reason. These sum to "+namespace+"_packets_dropped_total, so use one or the other; adding them together double-counts.",
-			[]string{"reason"}, nil),
-
-		allocFailScope: prometheus.NewDesc(
-			namespace+"_allocation_failures_by_scope_total",
-			"Server-wide address allocation failures by where the client was looked up. A true partition: shared-network and subnet sum to the total.",
-			[]string{"scope"}, nil),
-		allocFailCause: prometheus.NewDesc(
-			namespace+"_allocation_failures_by_cause_total",
-			"Server-wide address allocation failures by cause. A second true partition of the SAME failures: no-pools and attempts-exhausted also sum to the total, so do not add this to "+namespace+"_allocation_failures_by_scope_total.",
-			[]string{"cause"}, nil),
-
-		// ha_enabled describes the daemon, not any one relationship: it
-		// answers "is the HA hook loaded", which is still meaningful when
-		// there are no relationships to name. It is deliberately the only
-		// unlabelled HA metric.
-		haEnabled: prometheus.NewDesc(
-			namespace+"_ha_enabled", "1 when Kea reports an HA relationship, 0 when the HA hook is not loaded.",
-			nil, nil),
-		haLocalState: prometheus.NewDesc(
-			namespace+"_ha_local_state_info", "HA state of this peer (info-metric; value always 1; state in label).",
-			haLabels("state", "role", "mode"), nil),
-		haPartnerState: prometheus.NewDesc(
-			namespace+"_ha_partner_state_info",
-			"HA state of the partner as last reported to this peer (info-metric; value always 1). Absent until the partner has been contacted at least once, because Kea reports an empty state until then.",
-			haLabels("state", "role"), nil),
-		haPartnerAge: prometheus.NewDesc(
-			namespace+"_ha_partner_last_contact_seconds",
-			"Seconds since the last successful heartbeat from the HA partner. Absent until the partner has been contacted at least once.",
-			haLabels(), nil),
-		haPartnerInTouch: prometheus.NewDesc(
-			namespace+"_ha_partner_in_touch", "1 once this peer has been in contact with its HA partner, else 0.",
-			haLabels(), nil),
-		haCommBroken: prometheus.NewDesc(
-			namespace+"_ha_communication_interrupted", "1 if HA communication with the partner is interrupted, else 0.",
-			haLabels(), nil),
-
-		buildInfo: prometheus.NewDesc(
-			"kea_exporter_build_info",
-			"Build identity of the running exporter (info-metric; value always 1).",
-			[]string{"version", "revision", "goversion"}, nil),
-		scrapeSeconds: prometheus.NewDesc(
-			"kea_scrape_duration_seconds",
-			"Duration of the exporter's collection for this scrape, including the Kea round trips.",
-			nil, nil),
-
-		unhandledStats: prometheus.NewDesc(
-			"kea_exporter_unhandled_statistics",
-			"Number of distinct Kea statistics seen that this exporter has no mapping for.",
-			nil, nil),
+	var set descriptors
+	add := func(name, help string, labels []string) *prometheus.Desc {
+		desc := prometheus.NewDesc(name, help, labels, nil)
+		set.all = append(set.all, desc)
+		return desc
 	}
-	collector.stats = collector.buildStatMetrics()
-	return collector
+
+	set.up = add("kea_up", "1 if the last scrape of the Kea control socket succeeded, else 0.", nil)
+	set.commandUp = add("kea_command_up", "1 if this Kea control command succeeded on the last scrape, else 0.",
+		[]string{"command"})
+	set.scrapeErrors = add("kea_scrape_errors_total", "Cumulative scrape errors since exporter start, by command.",
+		[]string{"command"})
+
+	// Dhcpv4Srv::declineLease leaves a declined lease counted in
+	// assigned-addresses so that pool utilisation stays meaningful, which is
+	// why assigned/capacity is already correct and assigned+declined
+	// over-counts. The HELP text carries the consequence; the citation stays
+	// here rather than in it, since HELP ships on every scrape.
+	set.addressesAssigned = add(namespace+"_addresses_assigned",
+		"Currently assigned IPv4 addresses in the pool. Includes declined addresses: Kea keeps them assigned so pool-utilisation stays meaningful, so do not add "+namespace+"_addresses_declined to this.",
+		[]string{"subnet"})
+	set.addressesCapacity = add(namespace+"_addresses_capacity",
+		"Pool size: total IPv4 addresses available in the subnet.", []string{"subnet"})
+	set.addressesDeclined = add(namespace+"_addresses_declined",
+		"Addresses currently withdrawn from the pool by a DHCPDECLINE.", []string{"subnet"})
+
+	set.pkt4Received = add(namespace+"_packets_received_total", "Total DHCPv4 packets received by type.",
+		[]string{"type"})
+	set.pkt4Sent = add(namespace+"_packets_sent_total", "Total DHCPv4 packets sent by type.", []string{"type"})
+	set.pkt4Dropped = add(namespace+"_packets_dropped_total",
+		"Total inbound DHCPv4 packets dropped. Equal to the sum of "+namespace+"_packets_dropped_by_reason_total, and stays correct when a Kea release adds a reason this exporter does not know.",
+		nil)
+	set.pkt4DropReasons = add(namespace+"_packets_dropped_by_reason_total",
+		"Inbound DHCPv4 packets dropped, by reason. These sum to "+namespace+"_packets_dropped_total, so use one or the other; adding them together double-counts.",
+		[]string{"reason"})
+
+	set.allocFailScope = add(namespace+"_allocation_failures_by_scope_total",
+		"Server-wide address allocation failures by where the client was looked up. A true partition: shared-network and subnet sum to the total.",
+		[]string{"scope"})
+	set.allocFailCause = add(namespace+"_allocation_failures_by_cause_total",
+		"Server-wide address allocation failures by cause. A second true partition of the SAME failures: no-pools and attempts-exhausted also sum to the total, so do not add this to "+namespace+"_allocation_failures_by_scope_total.",
+		[]string{"cause"})
+
+	// ha_enabled describes the daemon, not any one relationship: it answers
+	// "is the HA hook loaded", which is still meaningful when there are no
+	// relationships to name. It is deliberately the only unlabelled HA metric.
+	set.haEnabled = add(namespace+"_ha_enabled",
+		"1 when Kea reports an HA relationship, 0 when the HA hook is not loaded.", nil)
+	set.haLocalState = add(namespace+"_ha_local_state_info",
+		"HA state of this peer (info-metric; value always 1; state in label).", haLabels("state", "role", "mode"))
+	set.haPartnerState = add(namespace+"_ha_partner_state_info",
+		"HA state of the partner as last reported to this peer (info-metric; value always 1). Absent until the partner has been contacted at least once, because Kea reports an empty state until then.",
+		haLabels("state", "role"))
+	set.haPartnerAge = add(namespace+"_ha_partner_last_contact_seconds",
+		"Seconds since the last successful heartbeat from the HA partner. Absent until the partner has been contacted at least once.",
+		haLabels())
+	set.haPartnerInTouch = add(namespace+"_ha_partner_in_touch",
+		"1 once this peer has been in contact with its HA partner, else 0.", haLabels())
+	set.haCommBroken = add(namespace+"_ha_communication_interrupted",
+		"1 if HA communication with the partner is interrupted, else 0.", haLabels())
+
+	set.buildInfo = add("kea_exporter_build_info",
+		"Build identity of the running exporter (info-metric; value always 1).",
+		[]string{"version", "revision", "goversion"})
+	set.scrapeSeconds = add("kea_scrape_duration_seconds",
+		"Duration of the exporter's collection for this scrape, including the Kea round trips.", nil)
+
+	set.unhandledStats = add("kea_exporter_unhandled_statistics",
+		"Number of distinct Kea statistics seen that this exporter has no mapping for.", nil)
+	return set
 }
 
-func (c *collector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- c.up
-	ch <- c.commandUp
-	ch <- c.scrapeErrors
-	ch <- c.addressesAssigned
-	ch <- c.addressesCapacity
-	ch <- c.addressesDeclined
-	ch <- c.pkt4Received
-	ch <- c.pkt4Sent
-	ch <- c.pkt4Dropped
-	ch <- c.pkt4DropReasons
-	ch <- c.allocFailScope
-	ch <- c.allocFailCause
-	ch <- c.haEnabled
-	ch <- c.haLocalState
-	ch <- c.haPartnerState
-	ch <- c.haPartnerAge
-	ch <- c.haPartnerInTouch
-	ch <- c.haCommBroken
-	ch <- c.buildInfo
-	ch <- c.scrapeSeconds
-	ch <- c.unhandledStats
+// newCollector returns a collector that scrapes kea and reports on its own
+// work through report.
+func newCollector(kea keaCaller, report selfReport) *collector {
+	set := newDescriptors()
+	return &collector{
+		descriptors: set,
+		selfReport:  report,
+		kea:         kea,
+		stats:       set.statMetrics(),
+	}
 }
 
-func (c *collector) Collect(ch chan<- prometheus.Metric) {
+// Describe sends every descriptor the collector exports.
+func (c *collector) Describe(out chan<- *prometheus.Desc) {
+	for _, desc := range c.all {
+		out <- desc
+	}
+}
+
+// Collect runs one round of scrapeCommands against Kea and sends what it
+// yields, followed by the exporter's own health and identity metrics.
+func (c *collector) Collect(out chan<- prometheus.Metric) {
 	// No deadline here: keaCaller bounds each command itself.
 	ctx := context.Background()
-	start := time.Now()
+	start := c.now()
 
-	statErr := c.collectStats(ctx, ch)
-	haErr := c.collectHA(ctx, ch)
+	statErr := c.collectStats(ctx, out)
+	haErr := c.collectHA(ctx, out)
 
 	if statErr != nil {
 		c.log.Error("control command failed", "command", cmdStatisticGetAll, "err", statErr)
@@ -267,26 +278,28 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	if statErr != nil || haErr != nil {
 		upValue = 0
 	}
-	ch <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, upValue)
+	out <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, upValue)
 
 	// Per-command health and error counters, so which command failed is
 	// visible without reading logs.
-	c.emitCommandHealth(ch, cmdStatisticGetAll, statErr, &c.statErrorCount)
-	c.emitCommandHealth(ch, cmdStatusGet, haErr, &c.haErrorCount)
+	c.emitCommandHealth(out, cmdStatisticGetAll, statErr, &c.statErrorCount)
+	c.emitCommandHealth(out, cmdStatusGet, haErr, &c.haErrorCount)
 
-	unhandled := float64(c.unhandledCount.Load())
-	ch <- prometheus.MustNewConstMetric(c.unhandledStats, prometheus.GaugeValue, unhandled)
+	unhandled := float64(c.unhandled.count())
+	out <- prometheus.MustNewConstMetric(c.unhandledStats, prometheus.GaugeValue, unhandled)
 
-	ch <- prometheus.MustNewConstMetric(c.buildInfo, prometheus.GaugeValue, 1,
+	out <- prometheus.MustNewConstMetric(c.buildInfo, prometheus.GaugeValue, 1,
 		c.build.version, c.build.revision, c.build.goVersion)
 
 	// Emitted last so it covers everything above it, including the failure
 	// paths: a scrape that timed out is exactly the one worth timing.
-	ch <- prometheus.MustNewConstMetric(c.scrapeSeconds, prometheus.GaugeValue, time.Since(start).Seconds())
+	out <- prometheus.MustNewConstMetric(c.scrapeSeconds, prometheus.GaugeValue, c.now().Sub(start).Seconds())
 }
 
+// emitCommandHealth sends kea_command_up and kea_scrape_errors_total for
+// command, counting err, if any, in counter.
 func (c *collector) emitCommandHealth(
-	ch chan<- prometheus.Metric, command string, err error, counter *atomic.Uint64,
+	out chan<- prometheus.Metric, command string, err error, counter *atomic.Uint64,
 ) {
 	value := 1.0
 	count := counter.Load()
@@ -294,23 +307,35 @@ func (c *collector) emitCommandHealth(
 		value = 0
 		count = counter.Add(1)
 	}
-	ch <- prometheus.MustNewConstMetric(c.commandUp, prometheus.GaugeValue, value, command)
-	ch <- prometheus.MustNewConstMetric(c.scrapeErrors, prometheus.CounterValue, float64(count), command)
+	out <- prometheus.MustNewConstMetric(c.commandUp, prometheus.GaugeValue, value, command)
+	out <- prometheus.MustNewConstMetric(c.scrapeErrors, prometheus.CounterValue, float64(count), command)
 }
 
-func (c *collector) collectStats(ctx context.Context, ch chan<- prometheus.Metric) error {
-	resp, err := c.kea.call(ctx, cmdStatisticGetAll)
+// callArguments sends command to kea and decodes the arguments of its reply
+// as Arguments.
+func callArguments[Arguments any](ctx context.Context, kea keaCaller, command string) (Arguments, error) {
+	var arguments Arguments
+	resp, err := kea.call(ctx, command)
+	if err != nil {
+		return arguments, err
+	}
+	if err := json.Unmarshal(resp.Arguments, &arguments); err != nil {
+		return arguments, fmt.Errorf("decode %s arguments: %w", command, err)
+	}
+	return arguments, nil
+}
+
+// collectStats sends a metric for each statistic statistic-get-all reports,
+// and returns the error if the command failed or its reply did not decode.
+func (c *collector) collectStats(ctx context.Context, out chan<- prometheus.Metric) error {
+	// Kea returns: {"<stat-name>": [[value, "timestamp"], ...]}.
+	// Numeric values may decode as float64 or as JSON number.
+	stats, err := callArguments[map[string]json.RawMessage](ctx, c.kea, cmdStatisticGetAll)
 	if err != nil {
 		return err
 	}
-	// Kea returns: {"<stat-name>": [[value, "timestamp"], ...]}.
-	// Numeric values may decode as float64 or as JSON number.
-	var stats map[string]json.RawMessage
-	if err := json.Unmarshal(resp.Arguments, &stats); err != nil {
-		return fmt.Errorf("decode %s arguments: %w", cmdStatisticGetAll, err)
-	}
 	for key, raw := range stats {
-		val, ok := mostRecentValue(raw)
+		value, ok := mostRecentValue(raw)
 		if !ok {
 			// Kea also reports string- and duration-typed statistics. Route
 			// them through the same once-only log as unmapped keys: dropped
@@ -319,7 +344,7 @@ func (c *collector) collectStats(ctx context.Context, ch chan<- prometheus.Metri
 			c.noteUnhandled(key)
 			continue
 		}
-		c.emitStat(ch, key, val)
+		c.emitStat(out, key, value)
 	}
 	return nil
 }
@@ -332,54 +357,91 @@ type statMetric struct {
 	typ  prometheus.ValueType
 }
 
-func (c *collector) buildStatMetrics() map[statID]statMetric {
+// statMetrics is the metric each mapped statID is exported as.
+func (d descriptors) statMetrics() map[statID]statMetric {
 	return map[statID]statMetric{
-		statAddressesAssigned: {c.addressesAssigned, prometheus.GaugeValue},
-		statAddressesCapacity: {c.addressesCapacity, prometheus.GaugeValue},
-		statPacketsReceived:   {c.pkt4Received, prometheus.CounterValue},
-		statPacketsSent:       {c.pkt4Sent, prometheus.CounterValue},
-		statAddressesDeclined: {c.addressesDeclined, prometheus.GaugeValue},
-		statPacketsDropped:    {c.pkt4Dropped, prometheus.CounterValue},
-		statDropReason:        {c.pkt4DropReasons, prometheus.CounterValue},
-		statAllocFailByScope:  {c.allocFailScope, prometheus.CounterValue},
-		statAllocFailByCause:  {c.allocFailCause, prometheus.CounterValue},
+		statAddressesAssigned: {d.addressesAssigned, prometheus.GaugeValue},
+		statAddressesCapacity: {d.addressesCapacity, prometheus.GaugeValue},
+		statPacketsReceived:   {d.pkt4Received, prometheus.CounterValue},
+		statPacketsSent:       {d.pkt4Sent, prometheus.CounterValue},
+		statAddressesDeclined: {d.addressesDeclined, prometheus.GaugeValue},
+		statPacketsDropped:    {d.pkt4Dropped, prometheus.CounterValue},
+		statDropReason:        {d.pkt4DropReasons, prometheus.CounterValue},
+		statAllocFailByScope:  {d.allocFailScope, prometheus.CounterValue},
+		statAllocFailByCause:  {d.allocFailCause, prometheus.CounterValue},
 	}
 }
 
-// emitStat translates one statistic into at most one metric. What a key means
-// is classifyStat's decision; this only carries it out.
-func (c *collector) emitStat(ch chan<- prometheus.Metric, key string, value float64) {
+// statOutcome is what one statistic becomes. statMissingDescriptor is the zero
+// value, so a resolvedStat nobody filled in is logged as an exporter bug
+// rather than emitted.
+type statOutcome int
+
+const (
+	statMissingDescriptor statOutcome = iota // mapped to an ID with no descriptor
+	statEmit                                 // a metric, from metric and labels
+	statSkip                                 // deliberately not exported
+	statRecordUnhandled                      // Kea reports something not mapped
+)
+
+// resolvedStat is resolveStat's answer for one key.
+type resolvedStat struct {
+	outcome statOutcome
+	id      statID
+	metric  statMetric
+	labels  []string
+}
+
+// resolveStat decides what the statistic key becomes, given the descriptor for
+// each statID. What a key means is classifyStat's decision; this pairs it with
+// its descriptor.
+func resolveStat(stats map[statID]statMetric, key string) resolvedStat {
 	id, labels := classifyStat(key)
 	switch id {
 	case statIgnored:
-		return
+		return resolvedStat{outcome: statSkip, id: id}
 	case statUnmapped:
-		c.noteUnhandled(key)
-		return
+		return resolvedStat{outcome: statRecordUnhandled, id: id}
 	}
-
-	metric, ok := c.stats[id]
+	metric, ok := stats[id]
 	if !ok {
+		return resolvedStat{outcome: statMissingDescriptor, id: id}
+	}
+	return resolvedStat{outcome: statEmit, id: id, metric: metric, labels: labels}
+}
+
+// emitStat translates one statistic into at most one metric.
+func (c *collector) emitStat(out chan<- prometheus.Metric, key string, value float64) {
+	c.emitResolved(out, key, value, resolveStat(c.stats, key))
+}
+
+// emitResolved carries out what resolveStat decided for key.
+func (c *collector) emitResolved(out chan<- prometheus.Metric, key string, value float64, resolved resolvedStat) {
+	switch resolved.outcome {
+	case statSkip:
+		// Deliberately not exported: classifyStat ignores the key.
+		return
+	case statRecordUnhandled:
+		c.noteUnhandled(key)
+	case statMissingDescriptor:
 		// classifyStat named an ID with no descriptor behind it. That is a bug
 		// in this package, not drift in Kea, so it must not be counted as an
 		// unhandled statistic: kea_exporter_unhandled_statistics means
 		// "Kea reports something we do not map", and mislabelling this as that
 		// sends the reader looking at the wrong system.
 		c.log.Error("statistic classified to an ID with no descriptor; this is an exporter bug",
-			"statistic", key, "id", int(id))
-		return
+			"statistic", key, "id", int(resolved.id))
+	case statEmit:
+		out <- prometheus.MustNewConstMetric(resolved.metric.desc, resolved.metric.typ, value, resolved.labels...)
 	}
-	ch <- prometheus.MustNewConstMetric(metric.desc, metric.typ, value, labels...)
 }
 
+// noteUnhandled records a statistic the exporter does not map, logging it the
+// first time it is seen.
 func (c *collector) noteUnhandled(key string) {
-	c.unhandledMu.Lock()
-	defer c.unhandledMu.Unlock()
-	if _, seen := c.unhandled[key]; seen {
+	if !c.unhandled.note(key) {
 		return
 	}
-	c.unhandled[key] = struct{}{}
-	c.unhandledCount.Add(1)
 	// Debug, not info: a stock Kea reports statistics this exporter does
 	// not map, and printing all of them on the first scrape buries anything
 	// that matters.

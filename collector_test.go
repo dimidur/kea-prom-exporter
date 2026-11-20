@@ -1,21 +1,55 @@
 package main
 
 import (
+	"encoding/json"
 	"log/slog"
 	"reflect"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // Tests for collector.go. The helpers they share with the rest of the suite
 // are in helpers_test.go.
+
+func TestEveryDescriptorIsInDescribe(t *testing.T) {
+	// Describe sends descriptors.all, so a descriptor field filled without
+	// newDescriptors' add would be collected but never described.
+
+	// Arrange
+	descType := reflect.TypeFor[*prometheus.Desc]()
+
+	// Act
+	set := newDescriptors()
+
+	// Assert
+	listed := map[uintptr]int{}
+	for _, desc := range set.all {
+		listed[reflect.ValueOf(desc).Pointer()]++
+	}
+	value := reflect.ValueOf(set)
+	timesListed := map[string]int{}
+	for i := range value.NumField() {
+		if field := value.Field(i); field.Type() == descType {
+			timesListed[value.Type().Field(i).Name] = listed[field.Pointer()]
+		}
+	}
+	if len(timesListed) == 0 || len(set.all) != len(timesListed) {
+		t.Errorf("all holds %d descriptors for %d descriptor fields", len(set.all), len(timesListed))
+	}
+	for name, count := range timesListed {
+		if count != 1 {
+			t.Errorf("descriptor field %s appears %d times in all, want once", name, count)
+		}
+	}
+}
 
 func TestCollectAgainstRealKeaOutput(t *testing.T) {
 	// The values the exporter derives from a real Kea capture, for the subnet
@@ -25,7 +59,7 @@ func TestCollectAgainstRealKeaOutput(t *testing.T) {
 
 	// Arrange
 	kea := healthyKea(t)
-	collector := newCollector(kea, quietLogger)
+	collector := newCollector(kea, testReport(quietLogger))
 	subnetExpected := `
 # HELP kea_dhcp4_addresses_assigned Currently assigned IPv4 addresses in the pool. Includes declined addresses: Kea keeps them assigned so pool-utilisation stays meaningful, so do not add kea_dhcp4_addresses_declined to this.
 # TYPE kea_dhcp4_addresses_assigned gauge
@@ -72,7 +106,7 @@ func TestCollectSendsExactlyScrapeCommands(t *testing.T) {
 
 	// Arrange
 	kea := healthyKea(t)
-	collector := newCollector(kea, quietLogger)
+	collector := newCollector(kea, testReport(quietLogger))
 
 	// Act
 	collectAll(collector)
@@ -95,7 +129,7 @@ func TestCollectLeavesEachCommandItsOwnDeadline(t *testing.T) {
 
 	// Arrange
 	kea := healthyKea(t)
-	collector := newCollector(kea, quietLogger)
+	collector := newCollector(kea, testReport(quietLogger))
 
 	// Act
 	collectAll(collector)
@@ -127,17 +161,17 @@ func TestMaxScrapeDurationCoversEveryCommandAtItsDeadline(t *testing.T) {
 		{time.Second, 2 * time.Second},
 		{5 * time.Second, 10 * time.Second},
 	}
-	for _, tc := range tests {
-		t.Run(tc.timeout.String(), func(t *testing.T) {
+	for _, testCase := range tests {
+		t.Run(testCase.timeout.String(), func(t *testing.T) {
 			// Arrange
-			timeout := tc.timeout
+			timeout := testCase.timeout
 
 			// Act
 			got := maxScrapeDuration(timeout)
 
 			// Assert
-			if got != tc.want {
-				t.Errorf("maxScrapeDuration(%v) = %v, want %v", timeout, got, tc.want)
+			if got != testCase.want {
+				t.Errorf("maxScrapeDuration(%v) = %v, want %v", timeout, got, testCase.want)
 			}
 		})
 	}
@@ -151,12 +185,13 @@ func TestMaxScrapeDurationFollowsScrapeCommands(t *testing.T) {
 	original := scrapeCommands
 	t.Cleanup(func() { scrapeCommands = original })
 	scrapeCommands = append(slices.Clone(original), "extra-command")
+	want := time.Duration(len(original)+1) * time.Second
 
 	// Act
 	got := maxScrapeDuration(time.Second)
 
 	// Assert
-	if want := time.Duration(len(original)+1) * time.Second; got != want {
+	if got != want {
 		t.Errorf("maxScrapeDuration(1s) with one more command = %v, want %v", got, want)
 	}
 }
@@ -166,12 +201,12 @@ func TestPacketTypesDoNotIncludeTheAggregate(t *testing.T) {
 	// pkt4-ack-sent. Emitting it as type="sent" makes sum() return double.
 
 	// Arrange
-	aggregate, ok := mostRecentValue(fixtureArguments(t, "statistic-get-all.json")["pkt4-sent"])
+	aggregate, ok := mostRecentValue(fixtureStatistics[json.RawMessage](t, "statistic-get-all.json")["pkt4-sent"])
 	if !ok {
 		t.Fatal("fixture has no pkt4-sent aggregate to guard against")
 	}
 	kea := healthyKea(t)
-	collector := newCollector(kea, quietLogger)
+	collector := newCollector(kea, testReport(quietLogger))
 
 	// Act
 	families := gather(t, collector)
@@ -202,7 +237,7 @@ func TestMetricNamesSatisfyPromlint(t *testing.T) {
 
 	// Arrange
 	kea := healthyKea(t)
-	collector := newCollector(kea, quietLogger)
+	collector := newCollector(kea, testReport(quietLogger))
 
 	// Act
 	problems, err := testutil.CollectAndLint(collector)
@@ -216,26 +251,61 @@ func TestMetricNamesSatisfyPromlint(t *testing.T) {
 	}
 }
 
+func TestScrapeErrorCountSurvivesASuccess(t *testing.T) {
+	// kea_scrape_errors_total is a counter: a successful scrape after failed
+	// ones must keep the count, because a drop reads to Prometheus as a
+	// counter reset and corrupts rate() and increase().
+
+	// Arrange: a command that has failed three times before.
+	collector := newCollector(nil, testReport(quietLogger))
+	var failures atomic.Uint64
+	failures.Store(3)
+	emitted := make(chan prometheus.Metric, 2)
+
+	// Act
+	collector.emitCommandHealth(emitted, cmdStatusGet, nil, &failures)
+
+	// Assert
+	var up, errorCount dto.Metric
+	if err := (<-emitted).Write(&up); err != nil {
+		t.Fatalf("write kea_command_up: %v", err)
+	}
+	if err := (<-emitted).Write(&errorCount); err != nil {
+		t.Fatalf("write kea_scrape_errors_total: %v", err)
+	}
+	if got := up.GetGauge().GetValue(); got != 1 {
+		t.Errorf("kea_command_up = %v after a success, want 1", got)
+	}
+	if got := errorCount.GetCounter().GetValue(); got != 3 {
+		t.Errorf("kea_scrape_errors_total = %v after a success, want the 3 earlier failures kept", got)
+	}
+}
+
 func TestPartialFailureIsVisible(t *testing.T) {
 	// When one command fails and the rest succeed, kea_up must be 0, since
 	// the alternative is reporting healthy while part of the metric set is
 	// missing. The per-command series and the log must blame the command that
 	// failed, not the one that worked.
-	statistics := fixture(t, "statistic-get-all.json")
-	status := fixture(t, "status-get.json")
 	tests := []struct {
 		failing, working   string
-		statistics, status []byte
+		statistics, status string // fixtures; empty fails the command
 	}{
-		{cmdStatisticGetAll, cmdStatusGet, nil, status},
-		{cmdStatusGet, cmdStatisticGetAll, statistics, nil},
+		{cmdStatisticGetAll, cmdStatusGet, "", "status-get.json"},
+		{cmdStatusGet, cmdStatisticGetAll, "statistic-get-all.json", ""},
 	}
-	for _, tc := range tests {
-		t.Run(tc.failing+" fails", func(t *testing.T) {
+	for _, testCase := range tests {
+		t.Run(testCase.failing+" fails", func(t *testing.T) {
 			// Arrange
-			kea := newFakeKea(tc.statistics, tc.status)
+			kea := newFakeKea(fixtureOrNone(t, testCase.statistics), fixtureOrNone(t, testCase.status))
 			logger, logs := capturingLogger(slog.LevelInfo)
-			collector := newCollector(kea, logger)
+			collector := newCollector(kea, testReport(logger))
+			want := map[string]float64{
+				"kea_up": 0,
+				"kea_command_up{" + testCase.failing + "}":          0,
+				"kea_command_up{" + testCase.working + "}":          1,
+				"kea_scrape_errors_total{" + testCase.failing + "}": 1,
+				"kea_scrape_errors_total{" + testCase.working + "}": 0,
+			}
 
 			// Act
 			families := gather(t, collector)
@@ -258,20 +328,13 @@ func TestPartialFailureIsVisible(t *testing.T) {
 					}
 				}
 			}
-			want := map[string]float64{
-				"kea_up":                                      0,
-				"kea_command_up{" + tc.failing + "}":          0,
-				"kea_command_up{" + tc.working + "}":          1,
-				"kea_scrape_errors_total{" + tc.failing + "}": 1,
-				"kea_scrape_errors_total{" + tc.working + "}": 0,
-			}
 			for name, value := range want {
 				if actual, ok := got[name]; !ok || actual != value {
 					t.Errorf("%s = %v (present %v), want %v", name, actual, ok, value)
 				}
 			}
-			if log := logs.String(); !strings.Contains(log, "command="+tc.failing) || strings.Contains(log, "command="+tc.working) {
-				t.Errorf("log = %q, want the failure logged against %s only", log, tc.failing)
+			if logged := logs.String(); !strings.Contains(logged, "command="+testCase.failing) || strings.Contains(logged, "command="+testCase.working) {
+				t.Errorf("log = %q, want the failure logged against %s only", logged, testCase.failing)
 			}
 		})
 	}
@@ -283,7 +346,7 @@ func TestScrapeSucceedsAgainstRealOutput(t *testing.T) {
 
 	// Arrange
 	kea := healthyKea(t)
-	collector := newCollector(kea, quietLogger)
+	collector := newCollector(kea, testReport(quietLogger))
 
 	// Act + Assert
 	if got := testutil.ToFloat64(upOnly{collector}); got != 1 {
@@ -297,7 +360,7 @@ func TestUnreachableKeaReportsDownRatherThanFailing(t *testing.T) {
 
 	// Arrange
 	kea := newFakeKea(nil, nil)
-	collector := newCollector(kea, quietLogger)
+	collector := newCollector(kea, testReport(quietLogger))
 
 	// Act + Assert
 	if got := testutil.ToFloat64(upOnly{collector}); got != 0 {
@@ -314,7 +377,7 @@ func TestUndecodableStatisticsFailTheScrape(t *testing.T) {
 	statistics := []byte(`[{"result":0,"arguments":["not-an-object"]}]`)
 	kea := newFakeKea(statistics, fixture(t, "status-get.json"))
 	logger, logs := capturingLogger(slog.LevelInfo)
-	collector := newCollector(kea, logger)
+	collector := newCollector(kea, testReport(logger))
 
 	// Act
 	got := testutil.ToFloat64(upOnly{collector})
@@ -334,7 +397,7 @@ func TestPerPoolStatisticsAreNotDoubleCounted(t *testing.T) {
 	// utilisation; the per-pool keys must be skipped.
 
 	// Arrange
-	statistics := fixtureArguments(t, "statistic-get-all.json")
+	statistics := fixtureStatistics[json.RawMessage](t, "statistic-get-all.json")
 	var perPool int
 	for key := range statistics {
 		if strings.Contains(key, ".pool[") {
@@ -344,13 +407,6 @@ func TestPerPoolStatisticsAreNotDoubleCounted(t *testing.T) {
 	if perPool == 0 {
 		t.Fatal("fixture lost its per-pool statistics; this guard is now vacuous")
 	}
-	kea := healthyKea(t)
-	collector := newCollector(kea, quietLogger)
-
-	// Act
-	families := gather(t, collector)
-
-	// Assert
 	// One assigned-addresses series per subnet, never per pool.
 	subnets := map[string]struct{}{}
 	for key := range statistics {
@@ -358,14 +414,23 @@ func TestPerPoolStatisticsAreNotDoubleCounted(t *testing.T) {
 			subnets[key[:strings.Index(key, "]")]] = struct{}{}
 		}
 	}
+	wantSeries := len(subnets)
+	kea := healthyKea(t)
+	collector := newCollector(kea, testReport(quietLogger))
+
+	// Act
+	families := gather(t, collector)
+
+	// Assert
+	series := -1
 	for _, family := range families {
-		if family.GetName() != "kea_dhcp4_addresses_assigned" {
-			continue
+		if family.GetName() == "kea_dhcp4_addresses_assigned" {
+			series = len(family.GetMetric())
 		}
-		if len(family.GetMetric()) != len(subnets) {
-			t.Errorf("kea_dhcp4_addresses_assigned has %d series, want %d (one per subnet, per-pool keys excluded)",
-				len(family.GetMetric()), len(subnets))
-		}
+	}
+	if series != wantSeries {
+		t.Errorf("kea_dhcp4_addresses_assigned has %d series (-1: absent), want %d, one per subnet with per-pool keys excluded",
+			series, wantSeries)
 	}
 }
 
@@ -378,7 +443,7 @@ func TestConcurrentScrapesAreRaceFree(t *testing.T) {
 
 	// Arrange
 	kea := newFakeKea(fixture(t, "statistic-get-all.json"), nil)
-	collector := newCollector(kea, quietLogger)
+	collector := newCollector(kea, testReport(quietLogger))
 	const scrapes = 8
 
 	// Act
@@ -409,14 +474,69 @@ func TestUnparseableStatisticIsLoggedOnceNotDroppedSilently(t *testing.T) {
 	  "some-string-stat":[["not-a-number","2026-08-02 20:04:57"]]}}]`)
 	kea := newFakeKea(stats, fixture(t, "status-get.json"))
 	logger, logs := capturingLogger(slog.LevelDebug)
-	collector := newCollector(kea, logger)
+	collector := newCollector(kea, testReport(logger))
+	wantUnhandled := []string{"some-string-stat"}
 
 	// Act
 	collectAll(collector)
 
 	// Assert
-	if unhandled := loggedUnhandled(logs.String()); !slices.Equal(unhandled, []string{"some-string-stat"}) {
+	if unhandled := loggedUnhandled(logs.String()); !slices.Equal(unhandled, wantUnhandled) {
 		t.Errorf("logged unhandled statistics %v, want exactly some-string-stat once", unhandled)
+	}
+}
+
+func TestAMappedStatisticWithNoReadableValueIsNotExported(t *testing.T) {
+	// A mapped statistic whose newest sample is null has no value to report.
+	// Exporting it anyway would publish a confident 0, so it is left out,
+	// while its readable sibling still is exported.
+
+	// Arrange
+	stats := []byte(`[{"result":0,"arguments":{
+	  "subnet[1].assigned-addresses":[[null,"2026-08-02 20:04:57"]],
+	  "subnet[1].total-addresses":[[256,"2026-08-02 20:04:57"]]}}]`)
+	kea := newFakeKea(stats, fixture(t, "status-get.json"))
+	collector := newCollector(kea, testReport(quietLogger))
+	wantSeries := map[string]int{"kea_dhcp4_addresses_assigned": 0, "kea_dhcp4_addresses_capacity": 1}
+
+	// Act
+	families := gather(t, collector)
+
+	// Assert
+	series := map[string]int{}
+	for _, family := range families {
+		series[family.GetName()] = len(family.GetMetric())
+	}
+	for name, want := range wantSeries {
+		if series[name] != want {
+			t.Errorf("%s has %d series, want %d", name, series[name], want)
+		}
+	}
+}
+
+func TestUnhandledSetNotesEachKeyOnce(t *testing.T) {
+	// Each unhandled statistic is logged once, on the scrape that first
+	// reports it, and kea_exporter_unhandled_statistics counts distinct keys,
+	// not sightings. The zero value is an empty set.
+
+	// Arrange
+	var set unhandledSet
+	keys := []string{"reclaimed-leases", "reclaimed-leases", "v4-lease-reuses"}
+	wantNew := []bool{true, false, true}
+	const wantCount = 2
+
+	// Act
+	var gotNew []bool
+	for _, key := range keys {
+		gotNew = append(gotNew, set.note(key))
+	}
+
+	// Assert
+	if !slices.Equal(gotNew, wantNew) {
+		t.Errorf("note reported new = %v, want %v", gotNew, wantNew)
+	}
+	if got := set.count(); got != wantCount {
+		t.Errorf("count = %d, want %d distinct keys", got, wantCount)
 	}
 }
 
@@ -428,7 +548,7 @@ func TestUnhandledStatisticsAreCounted(t *testing.T) {
 	// Arrange
 	kea := healthyKea(t)
 	logger, logs := capturingLogger(slog.LevelDebug)
-	collector := newCollector(kea, logger)
+	collector := newCollector(kea, testReport(logger))
 
 	// Act
 	families := gather(t, collector)
@@ -450,8 +570,8 @@ func TestUnhandledStatisticsAreCounted(t *testing.T) {
 	if got == 0 {
 		t.Errorf("unhandled statistics = 0, but the fixture contains unmapped keys")
 	}
-	if want := float64(len(loggedUnhandled(logs.String()))); got != want {
-		t.Errorf("gauge = %v, but %v unhandled statistics were logged", got, want)
+	if logged := float64(len(loggedUnhandled(logs.String()))); got != logged {
+		t.Errorf("gauge = %v, but %v unhandled statistics were logged", got, logged)
 	}
 }
 
@@ -463,28 +583,28 @@ func TestCollectDoesNotDependOnAChannelBuffer(t *testing.T) {
 
 	// Arrange
 	kea := healthyKea(t)
-	collector := newCollector(kea, quietLogger)
-	ch := make(chan prometheus.Metric)
+	collector := newCollector(kea, testReport(quietLogger))
+	// A floor, not an equality: adding metrics is expected, losing them is a
+	// regression. emittedToday is what the real fixture produces today; raise
+	// it when metrics are added, since a floor below today's count silently
+	// tolerates losing them.
+	const emittedToday = 46
+	metrics := make(chan prometheus.Metric)
 	done := make(chan int, 1)
 	go func() {
 		count := 0
-		for range ch {
+		for range metrics {
 			count++
 		}
 		done <- count
 	}()
 
 	// Act
-	collector.Collect(ch)
-	close(ch)
+	collector.Collect(metrics)
+	close(metrics)
 	count := receive(t, done, "Collect to complete against an unbuffered channel")
 
 	// Assert
-	// A floor, not an equality: adding metrics is expected, losing them is a
-	// regression. emittedToday is what the real fixture produces today; raise
-	// it when metrics are added, since a floor below today's count silently
-	// tolerates losing them.
-	const emittedToday = 46
 	if count < emittedToday {
 		t.Errorf("collector emitted %d metrics, want at least %d", count, emittedToday)
 	}
@@ -497,10 +617,9 @@ func TestBuildInfoAndScrapeDurationAreExported(t *testing.T) {
 
 	// Arrange
 	kea := healthyKea(t)
-	collector := newCollector(kea, quietLogger)
-	// Per-collector, not a package global: nothing here is shared with any
-	// other test.
-	collector.build = buildID{version: "v1.2.3", revision: "cafebabe", goVersion: "go1.2.3"}
+	build := buildID{version: "v1.2.3", revision: "cafebabe", goVersion: "go1.2.3"}
+	collector := newCollector(kea, selfReport{log: quietLogger, build: build, now: stoppedClock})
+	wantBuildLabels := map[string]string{"version": "v1.2.3", "revision": "cafebabe", "goversion": "go1.2.3"}
 
 	// Act
 	families := gather(t, collector)
@@ -520,8 +639,7 @@ func TestBuildInfoAndScrapeDurationAreExported(t *testing.T) {
 			for _, label := range metrics[0].GetLabel() {
 				labels[label.GetName()] = label.GetValue()
 			}
-			want := map[string]string{"version": "v1.2.3", "revision": "cafebabe", "goversion": "go1.2.3"}
-			for name, value := range want {
+			for name, value := range wantBuildLabels {
 				if labels[name] != value {
 					t.Errorf("build_info %s = %q, want %q", name, labels[name], value)
 				}
@@ -531,11 +649,6 @@ func TestBuildInfoAndScrapeDurationAreExported(t *testing.T) {
 			}
 		case "kea_scrape_duration_seconds":
 			sawDuration = true
-			// Only that it is a real, non-negative measurement; an upper bound
-			// would make this flaky on a loaded machine.
-			if got := metrics[0].GetGauge().GetValue(); got < 0 {
-				t.Errorf("scrape duration = %v, want >= 0", got)
-			}
 		}
 	}
 	if !sawBuild {
@@ -546,26 +659,36 @@ func TestBuildInfoAndScrapeDurationAreExported(t *testing.T) {
 	}
 }
 
-func TestScrapeDurationIsEmittedEvenWhenKeaIsDown(t *testing.T) {
+func TestScrapeDurationSpansEveryCommand(t *testing.T) {
+	// kea_scrape_duration_seconds says whether the exporter or Kea is the
+	// slow part, so it runs from before the first command to after the last.
 	// A scrape that failed or timed out is exactly the one worth timing, so
 	// the measurement must not be conditional on success.
-
-	// Arrange
-	kea := newFakeKea(nil, nil)
-	collector := newCollector(kea, quietLogger)
-
-	// Act
-	metrics := collectAll(collector)
-
-	// Assert
-	var found bool
-	for _, metric := range metrics {
-		if strings.Contains(metric.Desc().String(), "kea_scrape_duration_seconds") {
-			found = true
-		}
+	tests := []struct {
+		name               string
+		statistics, status string // fixtures; empty fails the command
+	}{
+		{"Kea up", "statistic-get-all.json", "status-get.json"},
+		{"Kea down", "", ""},
 	}
-	if !found {
-		t.Error("no scrape duration emitted when every command failed")
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			// Arrange: every command takes one second of a clock that moves
+			// only then.
+			clock := &testClock{}
+			kea := newFakeKea(fixtureOrNone(t, testCase.statistics), fixtureOrNone(t, testCase.status))
+			kea.onCall = func(string) { clock.advance(time.Second) }
+			collector := newCollector(kea, selfReport{log: quietLogger, build: testBuild, now: clock.now})
+			want := float64(len(scrapeCommands))
+
+			// Act
+			got := sumFamily(t, collector, "kea_scrape_duration_seconds")
+
+			// Assert
+			if got != want {
+				t.Errorf("kea_scrape_duration_seconds = %v, want %v, one second per command", got, want)
+			}
+		})
 	}
 }
 
@@ -607,7 +730,7 @@ func TestExportedMetricSetIsExactlyTheContract(t *testing.T) {
 		"kea_up":                                       {},
 	}
 	kea := newFakeKea(fixture(t, "statistic-get-all-with-failures.json"), fixture(t, "status-get.json"))
-	collector := newCollector(kea, quietLogger)
+	collector := newCollector(kea, testReport(quietLogger))
 
 	// Act
 	families := gather(t, collector)
@@ -621,7 +744,7 @@ func TestExportedMetricSetIsExactlyTheContract(t *testing.T) {
 				labels = append(labels, label.GetName())
 			}
 		}
-		sort.Strings(labels)
+		slices.Sort(labels)
 		exported[family.GetName()] = labels
 	}
 	for name, want := range contract {
