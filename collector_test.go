@@ -201,8 +201,8 @@ func TestPacketTypesDoNotIncludeTheAggregate(t *testing.T) {
 	// pkt4-ack-sent. Emitting it as type="sent" makes sum() return double.
 
 	// Arrange
-	aggregate, ok := mostRecentValue(fixtureStatistics[json.RawMessage](t, "statistic-get-all.json")["pkt4-sent"])
-	if !ok {
+	aggregate, kind := newestSample(fixtureStatistics[json.RawMessage](t, "statistic-get-all.json")["pkt4-sent"])
+	if kind != sampleNumber {
 		t.Fatal("fixture has no pkt4-sent aggregate to guard against")
 	}
 	kea := healthyKea(t)
@@ -463,54 +463,75 @@ func TestConcurrentScrapesAreRaceFree(t *testing.T) {
 	}
 }
 
-func TestUnparseableStatisticIsLoggedOnceNotDroppedSilently(t *testing.T) {
-	// Kea also reports string- and duration-typed statistics. They cannot
-	// become a float, but an absent metric with nothing explaining why is a
-	// worse outcome than a one-line log.
+func TestAMappedStatisticWithNoValueIsLeftOutNotUnhandled(t *testing.T) {
+	// A mapped statistic with no value to report, which Kea writes as an
+	// empty sample list once its max-samples is set to 0, is left out:
+	// exporting it anyway would publish a confident 0. Its readable sibling
+	// still is exported. Its mapping is complete, so counting it as unhandled
+	// would send the reader looking for a gap that does not exist.
+	tests := []struct {
+		name, samples string
+	}{
+		{"empty sample list", `[]`},
+		{"null value", `[[null,"2026-08-02 20:04:57"]]`},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			// Arrange
+			stats := []byte(`[{"result":0,"arguments":{
+			  "subnet[1].assigned-addresses":` + testCase.samples + `,
+			  "subnet[1].total-addresses":[[256,"2026-08-02 20:04:57"]]}}]`)
+			kea := newFakeKea(stats, fixture(t, "status-get.json"))
+			logger, logs := capturingLogger(slog.LevelDebug)
+			collector := newCollector(kea, testReport(logger))
+			wantSeries := map[string]int{"kea_dhcp4_addresses_assigned": 0, "kea_dhcp4_addresses_capacity": 1}
 
-	// Arrange
-	stats := []byte(`[{"result":0,"arguments":{
-	  "pkt4-ack-sent":[[1,"2026-08-02 20:04:57"]],
-	  "some-string-stat":[["not-a-number","2026-08-02 20:04:57"]]}}]`)
-	kea := newFakeKea(stats, fixture(t, "status-get.json"))
-	logger, logs := capturingLogger(slog.LevelDebug)
-	collector := newCollector(kea, testReport(logger))
-	wantUnhandled := []string{"some-string-stat"}
+			// Act
+			families := gather(t, collector)
 
-	// Act
-	collectAll(collector)
-
-	// Assert
-	if unhandled := loggedUnhandled(logs.String()); !slices.Equal(unhandled, wantUnhandled) {
-		t.Errorf("logged unhandled statistics %v, want exactly some-string-stat once", unhandled)
+			// Assert
+			series := map[string]int{}
+			for _, family := range families {
+				series[family.GetName()] = len(family.GetMetric())
+			}
+			for name, want := range wantSeries {
+				if series[name] != want {
+					t.Errorf("%s has %d series, want %d", name, series[name], want)
+				}
+			}
+			if got := sumOf(families, "kea_exporter_unhandled_statistics"); got != 0 {
+				t.Errorf("kea_exporter_unhandled_statistics = %v, want 0 for a mapped statistic with no value", got)
+			}
+			if !strings.Contains(logs.String(), `msg="statistic has no value; not exported this scrape" statistic=subnet[1].assigned-addresses`) {
+				t.Errorf("log = %q, want the missing value named at debug", logs.String())
+			}
+		})
 	}
 }
 
-func TestAMappedStatisticWithNoReadableValueIsNotExported(t *testing.T) {
-	// A mapped statistic whose newest sample is null has no value to report.
-	// Exporting it anyway would publish a confident 0, so it is left out,
-	// while its readable sibling still is exported.
+func TestOnlyAMappedStatisticHasItsValueRead(t *testing.T) {
+	// A mapped statistic Kea now reports as something other than a number is
+	// drift worth counting. An ignored statistic is not exported whatever it
+	// holds, so its value type is no reason to report it.
 
 	// Arrange
 	stats := []byte(`[{"result":0,"arguments":{
-	  "subnet[1].assigned-addresses":[[null,"2026-08-02 20:04:57"]],
-	  "subnet[1].total-addresses":[[256,"2026-08-02 20:04:57"]]}}]`)
+	  "subnet[1].assigned-addresses":[["text","2026-08-02 20:04:57"]],
+	  "pkt4-received":[["text","2026-08-02 20:04:57"]]}}]`)
 	kea := newFakeKea(stats, fixture(t, "status-get.json"))
-	collector := newCollector(kea, testReport(quietLogger))
-	wantSeries := map[string]int{"kea_dhcp4_addresses_assigned": 0, "kea_dhcp4_addresses_capacity": 1}
+	logger, logs := capturingLogger(slog.LevelDebug)
+	collector := newCollector(kea, testReport(logger))
+	wantUnhandled := []string{"subnet[1].assigned-addresses"}
 
 	// Act
-	families := gather(t, collector)
+	unhandled := sumFamily(t, collector, "kea_exporter_unhandled_statistics")
 
 	// Assert
-	series := map[string]int{}
-	for _, family := range families {
-		series[family.GetName()] = len(family.GetMetric())
+	if unhandled != float64(len(wantUnhandled)) {
+		t.Errorf("kea_exporter_unhandled_statistics = %v, want %d", unhandled, len(wantUnhandled))
 	}
-	for name, want := range wantSeries {
-		if series[name] != want {
-			t.Errorf("%s has %d series, want %d", name, series[name], want)
-		}
+	if logged := loggedUnhandled(logs.String()); !slices.Equal(logged, wantUnhandled) {
+		t.Errorf("logged unhandled statistics %v, want %v", logged, wantUnhandled)
 	}
 }
 

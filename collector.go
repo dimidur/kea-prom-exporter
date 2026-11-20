@@ -67,8 +67,8 @@ type collector struct {
 	statErrorCount atomic.Uint64
 	haErrorCount   atomic.Uint64
 
-	// Stat keys without a mapping, each logged once, which keeps scrape noise
-	// low while still surfacing drift.
+	// Stat keys without a mapping, or whose value is not a number, each
+	// logged once, which keeps scrape noise low while still surfacing drift.
 	unhandled unhandledSet
 
 	// Built once per collector, not per statistic per scrape: it never
@@ -153,9 +153,10 @@ type descriptors struct {
 	buildInfo     *prometheus.Desc
 	scrapeSeconds *prometheus.Desc
 
-	// Count of statistics Kea reports that this exporter has no mapping for.
-	// The names are only logged, and only at debug, so a gauge makes drift
-	// after a Kea upgrade alertable without restarting at a higher log level.
+	// Count of statistics Kea reports that this exporter has no mapping for,
+	// or whose value is not a number. The names are only logged, and only at
+	// debug, so a gauge makes drift after a Kea upgrade alertable without
+	// restarting at a higher log level.
 	unhandledStats *prometheus.Desc
 }
 
@@ -231,7 +232,7 @@ func newDescriptors() descriptors {
 		"Duration of the exporter's collection for this scrape, including the Kea round trips.", nil)
 
 	set.unhandledStats = add("kea_exporter_unhandled_statistics",
-		"Number of distinct Kea statistics seen that this exporter has no mapping for.", nil)
+		"Number of distinct Kea statistics seen that this exporter has no mapping for, or whose value is not a number.", nil)
 	return set
 }
 
@@ -329,22 +330,12 @@ func callArguments[Arguments any](ctx context.Context, kea keaCaller, command st
 // and returns the error if the command failed or its reply did not decode.
 func (c *collector) collectStats(ctx context.Context, out chan<- prometheus.Metric) error {
 	// Kea returns: {"<stat-name>": [[value, "timestamp"], ...]}.
-	// Numeric values may decode as float64 or as JSON number.
 	stats, err := callArguments[map[string]json.RawMessage](ctx, c.kea, cmdStatisticGetAll)
 	if err != nil {
 		return err
 	}
-	for key, raw := range stats {
-		value, ok := mostRecentValue(raw)
-		if !ok {
-			// Kea also reports string- and duration-typed statistics. Route
-			// them through the same once-only log as unmapped keys: dropped
-			// silently, they would leave an absent metric with nothing
-			// anywhere explaining why.
-			c.noteUnhandled(key)
-			continue
-		}
-		c.emitStat(out, key, value)
+	for key, samples := range stats {
+		c.emitStat(out, key, samples)
 	}
 	return nil
 }
@@ -410,13 +401,15 @@ func resolveStat(stats map[statID]statMetric, key string) resolvedStat {
 	return resolvedStat{outcome: statEmit, id: id, metric: metric, labels: labels}
 }
 
-// emitStat translates one statistic into at most one metric.
-func (c *collector) emitStat(out chan<- prometheus.Metric, key string, value float64) {
-	c.emitResolved(out, key, value, resolveStat(c.stats, key))
+// emitStat translates one statistic, its samples as Kea reported them, into at
+// most one metric. What the key means is decided first, so only a mapped
+// statistic has its value read.
+func (c *collector) emitStat(out chan<- prometheus.Metric, key string, samples json.RawMessage) {
+	c.emitResolved(out, key, samples, resolveStat(c.stats, key))
 }
 
 // emitResolved carries out what resolveStat decided for key.
-func (c *collector) emitResolved(out chan<- prometheus.Metric, key string, value float64, resolved resolvedStat) {
+func (c *collector) emitResolved(out chan<- prometheus.Metric, key string, samples json.RawMessage, resolved resolvedStat) {
 	switch resolved.outcome {
 	case statSkip:
 		// Deliberately not exported: classifyStat ignores the key.
@@ -426,18 +419,40 @@ func (c *collector) emitResolved(out chan<- prometheus.Metric, key string, value
 	case statMissingDescriptor:
 		// classifyStat named an ID with no descriptor behind it. That is a bug
 		// in this package, not drift in Kea, so it must not be counted as an
-		// unhandled statistic: kea_exporter_unhandled_statistics means
-		// "Kea reports something we do not map", and mislabelling this as that
-		// sends the reader looking at the wrong system.
+		// unhandled statistic: kea_exporter_unhandled_statistics means "Kea
+		// reports something we do not map, or a value that is not a number",
+		// and mislabelling this as that sends the reader looking at the wrong
+		// system.
 		c.log.Error("statistic classified to an ID with no descriptor; this is an exporter bug",
 			"statistic", key, "id", int(resolved.id))
 	case statEmit:
-		out <- prometheus.MustNewConstMetric(resolved.metric.desc, resolved.metric.typ, value, resolved.labels...)
+		c.emitSample(out, key, samples, resolved)
 	}
 }
 
-// noteUnhandled records a statistic the exporter does not map, logging it the
-// first time it is seen.
+// emitSample sends the metric resolved describes for key, from the newest of
+// its samples.
+func (c *collector) emitSample(out chan<- prometheus.Metric, key string, samples json.RawMessage, resolved resolvedStat) {
+	value, kind := newestSample(samples)
+	switch kind {
+	case sampleNumber:
+		out <- prometheus.MustNewConstMetric(resolved.metric.desc, resolved.metric.typ, value, resolved.labels...)
+	case sampleMissing:
+		// The mapping is complete and there is simply no value this scrape,
+		// so it is left out rather than exported as 0, and not counted as
+		// unhandled. Logged every scrape, so the log shows when it returns.
+		c.log.Debug("statistic has no value; not exported this scrape", "statistic", key)
+	case sampleUnreadable:
+		// A mapped statistic Kea now reports as something other than a
+		// number, such as a string or a duration: drift the unhandled count
+		// exists to surface.
+		c.noteUnhandled(key)
+	}
+}
+
+// noteUnhandled records a statistic the exporter cannot export, because it
+// has no mapping for it or its value is not a number, logging it the first
+// time it is seen.
 func (c *collector) noteUnhandled(key string) {
 	if !c.unhandled.note(key) {
 		return
@@ -445,5 +460,5 @@ func (c *collector) noteUnhandled(key string) {
 	// Debug, not info: a stock Kea reports statistics this exporter does
 	// not map, and printing all of them on the first scrape buries anything
 	// that matters.
-	c.log.Debug("unhandled statistic; extend the collector to map it", "statistic", key)
+	c.log.Debug("unhandled statistic; extend the collector to handle it", "statistic", key)
 }

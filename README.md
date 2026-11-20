@@ -64,7 +64,7 @@ running the suite against that release, not editing the line.
 | `kea_command_up` | `command` | 1 when that specific command succeeded |
 | `kea_scrape_errors_total` | `command` | cumulative failures, per command |
 | `kea_scrape_duration_seconds` | *(none)* | time spent collecting from Kea, emitted even when the scrape failed |
-| `kea_exporter_unhandled_statistics` | *(none)* | count of Kea statistics with no mapping here |
+| `kea_exporter_unhandled_statistics` | *(none)* | count of Kea statistics with no mapping here, or whose value is not a number |
 | `kea_exporter_build_info` | `version`, `revision`, `goversion` | build identity (value always 1) |
 
 ### Counting failures without double-counting them
@@ -281,9 +281,10 @@ argument is refused with exit 2, as an unknown flag is.
 | `--version` | *(none)* | *(none)* | prints build identity and exits; deliberately has no env form |
 
 `--log-level=debug` additionally names each Kea statistic the exporter has no
-mapping for. The count is always exported as
-`kea_exporter_unhandled_statistics`, so drift after a Kea upgrade is visible
-without turning debug logging on.
+mapping for or whose value is not a number, and each mapped statistic left out
+of a scrape because Kea reported no value for it. The unhandled ones are always
+counted in `kea_exporter_unhandled_statistics`, so drift after a Kea upgrade is
+visible without turning debug logging on.
 
 On `SIGTERM` or `SIGINT` the exporter stops accepting connections and lets
 in-flight scrapes finish before exiting. The grace period is one effective
