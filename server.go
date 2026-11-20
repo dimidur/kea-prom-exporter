@@ -1,6 +1,6 @@
 package main
 
-// Process lifecycle: serving /metrics and draining on a signal.
+// Serving /metrics and draining on a signal.
 //
 // One reason to change: how the exporter serves and shuts down.
 
@@ -22,9 +22,13 @@ import (
 // indefinitely; a scraper sends its headers at once, so seconds are ample.
 const readHeaderTimeout = 5 * time.Second
 
-// buildServer returns the server for addr: /metrics serves reg, and a failure
-// to gather it is logged to logger.
-func buildServer(addr string, reg *prometheus.Registry, logger *slog.Logger) *http.Server {
+// buildServer returns the server: /metrics serves reg, and a failure to gather
+// it, like the server's own errors, is logged to logger. Writing a response
+// fails once writeTimeout has passed since its request was read, so a client
+// that stops reading cannot hold the response, or the collection it shares,
+// open for longer; it does not interrupt a gather in progress.
+func buildServer(reg *prometheus.Registry, logger *slog.Logger, writeTimeout time.Duration) *http.Server {
+	errorLog := slog.NewLogLogger(logger.Handler(), slog.LevelError)
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{
 		Registry: reg,
@@ -38,21 +42,28 @@ func buildServer(addr string, reg *prometheus.Registry, logger *slog.Logger) *ht
 		// 503, which reaches Prometheus as up=0, indistinguishable from Kea
 		// actually being down, and drops the per-command diagnostics with it.
 		//
-		// Joined scrapers observe the same snapshot and timestamp. At a scrape
-		// interval measured in tens of seconds that is not observable.
+		// Joined scrapers observe the same snapshot and timestamp, and a
+		// collection stays shared until every response using it is written.
+		// A client that stalls while reading would therefore hand later
+		// scrapers a stale snapshot; writeTimeout bounds how long that can
+		// last.
+		//
+		// client_golang marks the option experimental, so a bump of it is
+		// checked against what is described here.
 		CoalesceGather: true,
 		// Surfaces the reason behind promhttp_metric_handler_errors_total,
 		// which otherwise counts failures without ever saying why.
-		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
+		ErrorLog: errorLog,
 	}))
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintln(w, "kea-prom-exporter: see /metrics")
 	})
 
 	return &http.Server{
-		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: readHeaderTimeout,
+		WriteTimeout:      writeTimeout,
+		ErrorLog:          errorLog,
 	}
 }
 
@@ -64,24 +75,53 @@ func shutdownGrace(slowestScrape time.Duration) time.Duration {
 	return slowestScrape + time.Second
 }
 
-// serveUntilSignal runs srv until ctx is cancelled, then drains it within
-// grace.
+// httpServer is what serveUntilSignal needs from the server.
+type httpServer interface {
+	Serve() error
+	Shutdown(ctx context.Context) error
+}
+
+// listeningServer is an *http.Server and the listener it serves on.
+type listeningServer struct {
+	*http.Server
+	listener net.Listener
+}
+
+// Serve serves on the server's own listener.
+func (s listeningServer) Serve() error { return s.Server.Serve(s.listener) }
+
+// service is the assembled exporter: a server ready to serve, how long a
+// shutdown waits for it, and where both log.
+type service struct {
+	server httpServer
+	grace  time.Duration
+	log    *slog.Logger
+}
+
+// serviceFor serves reg on listener, logging to logger, for scrapes that take
+// at most slowestScrape. A shutdown waits shutdownGrace for them, and a
+// response may take the same span: the slowest scrape plus the time to write
+// it out.
+func serviceFor(reg *prometheus.Registry, listener net.Listener, logger *slog.Logger, slowestScrape time.Duration) service {
+	grace := shutdownGrace(slowestScrape)
+	return service{
+		server: listeningServer{Server: buildServer(reg, logger, grace), listener: listener},
+		grace:  grace,
+		log:    logger,
+	}
+}
+
+// serveUntilSignal serves until ctx is cancelled, then drains the server
+// within the grace.
 //
 // releaseSignals restores default signal handling once shutdown has begun, so
 // an impatient second SIGTERM kills the process immediately instead of being
-// swallowed. It may be nil.
-func serveUntilSignal(ctx context.Context, srv *http.Server, grace time.Duration, logger *slog.Logger, releaseSignals func()) error {
-	// Listen before announcing: srv.ListenAndServe binds inside the goroutine,
-	// so logging there prints a success line even when the bind fails.
-	listener, err := net.Listen("tcp", srv.Addr)
-	if err != nil {
-		return err
-	}
-	logger.Info("listening", "addr", listener.Addr().String())
-
-	serveErr := make(chan error, 1)
+// swallowed. It returns only after Serve has: net/http's Serve returns as soon
+// as Shutdown closes the listener, before in-flight requests drain.
+func (s service) serveUntilSignal(ctx context.Context, releaseSignals func()) error {
+	serveErr := make(chan error)
 	go func() {
-		err := srv.Serve(listener)
+		err := s.server.Serve()
 		if errors.Is(err, http.ErrServerClosed) {
 			err = nil
 		}
@@ -92,22 +132,32 @@ func serveUntilSignal(ctx context.Context, srv *http.Server, grace time.Duration
 	case err := <-serveErr:
 		return err
 	case <-ctx.Done():
-		if releaseSignals != nil {
-			releaseSignals()
-		}
-		logger.Info("shutting down", "grace", grace)
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), grace)
+		releaseSignals()
+		s.log.Info("shutting down", "grace", s.grace)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.grace)
 		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			// The grace expiring is the designed outcome of a grace period,
-			// not a process failure: exiting non-zero here would make every
-			// `docker stop` of a busy exporter look like a crash.
-			if errors.Is(err, context.DeadlineExceeded) {
-				logger.Warn("shutdown grace expired with requests still in flight", "grace", grace)
-				return nil
-			}
-			return err
+		shutdownErr := s.server.Shutdown(shutdownCtx)
+		graceExpired, err := shutdownOutcome(<-serveErr, shutdownErr)
+		if graceExpired {
+			s.log.Warn("shutdown grace expired with requests still in flight", "grace", s.grace)
 		}
-		return nil
+		return err
 	}
+}
+
+// shutdownOutcome is what a shutdown returns, given what Serve returned and
+// what Shutdown did, and whether the grace expired.
+//
+// A server that failed as the signal arrived has still failed. The grace
+// expiring is the designed outcome of a grace period, not a process failure:
+// exiting non-zero then would make every `docker stop` of a busy exporter look
+// like a crash.
+func shutdownOutcome(served, shutdownErr error) (graceExpired bool, err error) {
+	if served != nil {
+		return false, served
+	}
+	if errors.Is(shutdownErr, context.DeadlineExceeded) {
+		return true, nil
+	}
+	return false, shutdownErr
 }

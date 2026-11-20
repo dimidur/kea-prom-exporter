@@ -1,60 +1,19 @@
 package main
 
-// Tests for logging.go: how the process reports, and how it reports its way out.
+// Tests for logging.go: how the process reports.
 
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"log/slog"
-	"os"
 	"strings"
 	"testing"
 )
 
-func TestNewLoggerWritesToTheProcessSink(t *testing.T) {
-	// newLoggerTo is exercised thoroughly below, but newLogger -- the only
-	// path production takes -- was not. It is the adapter that supplies the
-	// sink, and pointing it at io.Discard left every other test green while
-	// the process logged nowhere. Swapping the seam is what observes it.
-
-	// Arrange
-	var buf bytes.Buffer
-	original := logSink
-	logSink = &buf
-	t.Cleanup(func() { logSink = original })
-
-	// Act
-	log, problems := newLogger("info", "text")
-	log.Info("hello from the process logger")
-
-	// Assert
-	if len(problems) != 0 {
-		t.Errorf("problems = %v, want none for a valid level and format", problems)
-	}
-	if !strings.Contains(buf.String(), "hello from the process logger") {
-		t.Errorf("newLogger did not write to the process sink; got %q", buf.String())
-	}
-}
-
-func TestProcessSinkIsStderr(t *testing.T) {
-	// The seam above is satisfied by any writer, so this pins which one
-	// production gets. Logs on stdout would interleave with what the process
-	// prints there, breaking --version for anything parsing it.
-
-	// Act + Assert
-	if logSink != io.Writer(os.Stderr) {
-		t.Errorf("logSink = %v, want os.Stderr", logSink)
-	}
-}
-
 func TestLogFormatSelectsTheHandler(t *testing.T) {
 	// Both handlers report the same level, so a test that only checks levels
-	// cannot tell them apart -- deleting the json branch's return, making json
-	// fall through to text, survived the whole suite. Reading what was written
-	// is the only thing that distinguishes them.
-
-	// Arrange
+	// cannot tell them apart: json falling through to text would pass it.
+	// Reading what was written is the only thing that distinguishes them.
 	cases := []struct {
 		name         string
 		format       string
@@ -64,39 +23,42 @@ func TestLogFormatSelectsTheHandler(t *testing.T) {
 		{"json emits json", "json", true, 0},
 		{"JSON is case-insensitive", "JSON", true, 0},
 		{"text emits logfmt", "text", false, 0},
+		{"TEXT is case-insensitive", "TEXT", false, 0},
+		{"Json in mixed case is json", "Json", true, 0},
+		{"Text in mixed case is text", "Text", false, 0},
 		{"an unrecognised format falls back to text", "yaml", false, 1},
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
 			// Arrange
-			var buf bytes.Buffer
-			logger, problems := newLoggerTo(&buf, "info", tc.format)
+			var output bytes.Buffer
 
 			// Act
+			logger, problems := newLogger(&output, "info", testCase.format)
 			logger.Info("hello", "key", "value")
 
 			// Assert
 			// An unrecognised format must be reported, not silently downgraded:
 			// that reporting is the whole reason newLogger returns problems.
-			if len(problems) != tc.wantProblems {
-				t.Errorf("problems = %v, want %d", problems, tc.wantProblems)
+			if len(problems) != testCase.wantProblems {
+				t.Errorf("problems = %v, want %d", problems, testCase.wantProblems)
 			}
 
-			line := strings.TrimSpace(buf.String())
+			line := strings.TrimSpace(output.String())
 			if line == "" {
 				t.Fatal("nothing was written")
 			}
 			var parsed map[string]any
 			isJSON := json.Unmarshal([]byte(line), &parsed) == nil
-			if isJSON != tc.wantJSON {
+			if isJSON != testCase.wantJSON {
 				t.Errorf("format %q produced JSON=%v, want %v; line was:\n  %s",
-					tc.format, isJSON, tc.wantJSON, line)
+					testCase.format, isJSON, testCase.wantJSON, line)
 			}
-			if tc.wantJSON && parsed["key"] != "value" {
+			if testCase.wantJSON && parsed["key"] != "value" {
 				t.Errorf("json output lost its attributes: %s", line)
 			}
-			if !tc.wantJSON && !strings.Contains(line, "key=value") {
+			if !testCase.wantJSON && !strings.Contains(line, "key=value") {
 				t.Errorf("text output is not logfmt: %s", line)
 			}
 		})
@@ -104,38 +66,42 @@ func TestLogFormatSelectsTheHandler(t *testing.T) {
 }
 
 func TestLogLevelThreshold(t *testing.T) {
-	// slog rejects "warning" -- the syslog and Python spelling, and a very
-	// likely operator typo. Falling back to info is fine; doing it silently is
-	// not, because the operator never learns the setting was ignored.
-
-	// Arrange
+	// The level is the lowest one logged, in either format. slog rejects
+	// "warning", the syslog and Python spelling and a very likely typo.
+	// Falling back to info is fine; doing it silently is not, because whoever
+	// set it never learns the setting was ignored.
+	formats := []string{"text", "json"}
 	cases := []struct {
 		level        string
-		wantDebug    bool
+		wantLowest   slog.Level
 		wantProblems int
 	}{
-		{"debug", true, 0},
-		{"DEBUG", true, 0},
-		{"info", false, 0},
-		{"warning", false, 1},
-		{"nonsense", false, 1},
+		{"debug", slog.LevelDebug, 0},
+		{"DEBUG", slog.LevelDebug, 0},
+		{"info", slog.LevelInfo, 0},
+		{"warn", slog.LevelWarn, 0},
+		{"error", slog.LevelError, 0},
+		{"warning", slog.LevelInfo, 1},
+		{"nonsense", slog.LevelInfo, 1},
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.level, func(t *testing.T) {
-			// Arrange
-			var buf bytes.Buffer
+	for _, format := range formats {
+		for _, testCase := range cases {
+			t.Run(format+" "+testCase.level, func(t *testing.T) {
+				// Arrange
+				var output bytes.Buffer
 
-			// Act
-			logger, problems := newLoggerTo(&buf, tc.level, "text")
+				// Act
+				logger, problems := newLogger(&output, testCase.level, format)
 
-			// Assert
-			if got := logger.Enabled(t.Context(), slog.LevelDebug); got != tc.wantDebug {
-				t.Errorf("debug enabled = %v, want %v", got, tc.wantDebug)
-			}
-			if len(problems) != tc.wantProblems {
-				t.Errorf("problems = %v, want %d", problems, tc.wantProblems)
-			}
-		})
+				// Assert
+				if !logger.Enabled(t.Context(), testCase.wantLowest) || logger.Enabled(t.Context(), testCase.wantLowest-1) {
+					t.Errorf("lowest level logged is not %v", testCase.wantLowest)
+				}
+				if len(problems) != testCase.wantProblems {
+					t.Errorf("problems = %v, want %d", problems, testCase.wantProblems)
+				}
+			})
+		}
 	}
 }

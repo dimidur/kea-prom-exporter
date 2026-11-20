@@ -35,17 +35,17 @@ func TestMostRecentValue(t *testing.T) {
 		{"empty inner sample", `[[]]`, 0, false},
 		{"not a list", `{"nope": 1}`, 0, false},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
 			// Arrange
-			raw := json.RawMessage(tc.in)
+			raw := json.RawMessage(testCase.in)
 
 			// Act
 			got, ok := mostRecentValue(raw)
 
 			// Assert
-			if ok != tc.ok || (ok && got != tc.want) {
-				t.Errorf("mostRecentValue(%s) = (%v, %v), want (%v, %v)", tc.in, got, ok, tc.want, tc.ok)
+			if ok != testCase.ok || (ok && got != testCase.want) {
+				t.Errorf("mostRecentValue(%s) = (%v, %v), want (%v, %v)", testCase.in, got, ok, testCase.want, testCase.ok)
 			}
 		})
 	}
@@ -73,7 +73,7 @@ func TestCommandIsValidJSONWhateverTheServiceName(t *testing.T) {
 	// a quote in it would change the command actually sent.
 
 	// Arrange
-	kea := &keaClient{url: "http://kea.example/", service: `dhcp4","injected":"`}
+	kea := newKeaClient(keaSettings{url: "http://kea.example/", service: `dhcp4","injected":"`}, nil)
 
 	// Act
 	req, cancel, err := kea.newRequest(t.Context(), "status-get")
@@ -101,10 +101,13 @@ func TestCommandIsValidJSONWhateverTheServiceName(t *testing.T) {
 
 func TestMalformedURLFailsTheCallBeforeAnythingIsSent(t *testing.T) {
 	// --kea-url is not parsed until the first scrape, so a typo in it must
-	// surface as a failed command that says what went wrong.
+	// surface as a failed command that says what went wrong, without
+	// anything being sent.
 
 	// Arrange
-	kea := &keaClient{url: "://no-scheme", service: supportedService}
+	var sent bool
+	transport := stubTransport{err: errNoKea, observe: func(*http.Request) { sent = true }}
+	kea := newKeaClient(keaSettings{url: "://no-scheme", service: supportedService}, transport)
 
 	// Act
 	_, err := kea.call(t.Context(), "status-get")
@@ -112,6 +115,9 @@ func TestMalformedURLFailsTheCallBeforeAnythingIsSent(t *testing.T) {
 	// Assert
 	if err == nil || !strings.Contains(err.Error(), "build request") {
 		t.Errorf("call error = %v, want it to report the unusable URL", err)
+	}
+	if sent {
+		t.Error("a request was sent although the URL could not be used")
 	}
 }
 
@@ -121,7 +127,7 @@ func TestRequestIsPostedAsJSONUnderItsOwnDeadline(t *testing.T) {
 	// holds the scrape forever.
 
 	// Arrange
-	kea := &keaClient{url: "http://kea.example/", service: supportedService, timeout: time.Minute}
+	kea := newKeaClient(keaSettings{url: "http://kea.example/", service: supportedService, timeout: time.Minute}, nil)
 	before := time.Now()
 
 	// Act
@@ -152,7 +158,7 @@ func TestCallersCancellationReachesTheRequest(t *testing.T) {
 	// fresh one, so a caller that gives up stops the request with it.
 
 	// Arrange
-	kea := &keaClient{url: "http://kea.example/", service: supportedService, timeout: time.Minute}
+	kea := newKeaClient(keaSettings{url: "http://kea.example/", service: supportedService, timeout: time.Minute}, nil)
 	parent, cancelParent := context.WithCancel(t.Context())
 	req, cancel, err := kea.newRequest(parent, "status-get")
 	if err != nil {
@@ -169,52 +175,6 @@ func TestCallersCancellationReachesTheRequest(t *testing.T) {
 	}
 }
 
-// trackedBody is a response body that records whether it was closed and how
-// much of it was still unread at that moment. A read after Close is what a
-// real response body refuses, so only bytes consumed before Close count.
-type trackedBody struct {
-	*strings.Reader
-	closed        bool
-	unreadAtClose int
-}
-
-func newTrackedBody(content string) *trackedBody {
-	return &trackedBody{Reader: strings.NewReader(content)}
-}
-
-func (b *trackedBody) Close() error {
-	if !b.closed {
-		b.unreadAtClose = b.Len()
-	}
-	b.closed = true
-	return nil
-}
-
-// stubTransport stands in for the network under an http.Client. A round trip
-// fails with the request context's error once that context is done, as a real
-// transport does, and with err when it is set; otherwise it answers with
-// status and body.
-type stubTransport struct {
-	status int
-	body   *trackedBody
-	err    error
-}
-
-func (s stubTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if err := req.Context().Err(); err != nil {
-		return nil, err
-	}
-	if s.err != nil {
-		return nil, s.err
-	}
-	return &http.Response{
-		StatusCode: s.status,
-		Header:     http.Header{},
-		Body:       s.body,
-		Request:    req,
-	}, nil
-}
-
 func TestTransportFailureNamesTheCommand(t *testing.T) {
 	// A refused connection or a timeout never reaches interpretResponse, so
 	// call itself must say which command failed and why; it is all the log
@@ -222,7 +182,7 @@ func TestTransportFailureNamesTheCommand(t *testing.T) {
 
 	// Arrange
 	refused := errors.New("connection refused")
-	kea := &keaClient{url: "http://kea.example/", client: &http.Client{Transport: stubTransport{err: refused}}}
+	kea := newKeaClient(keaSettings{url: "http://kea.example/"}, stubTransport{err: refused})
 
 	// Act
 	_, err := kea.call(t.Context(), cmdStatusGet)
@@ -245,7 +205,7 @@ func TestCallDrainsAndClosesTheReply(t *testing.T) {
 	// no more than errBodyLimit, so only the drain can consume them.
 	body := newTrackedBody(`[{"result":0,"arguments":{}}]` + strings.Repeat(" ", errBodyLimit))
 	transport := stubTransport{status: http.StatusOK, body: body}
-	kea := &keaClient{url: "http://kea.example/", client: &http.Client{Transport: transport}}
+	kea := newKeaClient(keaSettings{url: "http://kea.example/"}, transport)
 
 	// Act
 	_, err := kea.call(t.Context(), cmdStatusGet)
@@ -269,7 +229,7 @@ func TestCallHandsKeasReplyToInterpretResponse(t *testing.T) {
 
 	// Arrange
 	transport := stubTransport{status: http.StatusUnauthorized, body: newTrackedBody("credentials rejected\n")}
-	kea := &keaClient{url: "http://kea.example/", client: &http.Client{Transport: transport}}
+	kea := newKeaClient(keaSettings{url: "http://kea.example/"}, transport)
 
 	// Act
 	_, err := kea.call(t.Context(), "status-get")
@@ -318,20 +278,20 @@ func TestUnreadableReplyIsAnErrorThatSaysWhy(t *testing.T) {
 		{"error status with an empty body", http.StatusBadGateway, "", "HTTP 502"},
 		{"success status with a body that is not JSON", http.StatusOK, "<html>", "decode response"},
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
 			// Arrange
-			body := strings.NewReader(tc.body)
+			body := strings.NewReader(testCase.body)
 
 			// Act
-			_, err := interpretResponse("status-get", tc.status, body)
+			_, err := interpretResponse("status-get", testCase.status, body)
 
 			// Assert
 			if err == nil {
 				t.Fatal("the reply was accepted")
 			}
-			if !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "status-get") {
-				t.Errorf("error = %v, want it to name status-get and contain %q", err, tc.want)
+			if !strings.Contains(err.Error(), testCase.want) || !strings.Contains(err.Error(), "status-get") {
+				t.Errorf("error = %v, want it to name status-get and contain %q", err, testCase.want)
 			}
 		})
 	}
@@ -356,21 +316,21 @@ func TestOnlyA2xxStatusIsReadAsKeasReply(t *testing.T) {
 		{http.StatusMultipleChoices, false},
 		{http.StatusFound, false},
 	}
-	for _, tc := range tests {
-		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
+	for _, testCase := range tests {
+		t.Run(strconv.Itoa(testCase.status), func(t *testing.T) {
 			// Arrange
 			reply := strings.NewReader(`[{"result":0,"arguments":{}}]`)
 
 			// Act
-			_, err := interpretResponse("status-get", tc.status, reply)
+			_, err := interpretResponse("status-get", testCase.status, reply)
 
 			// Assert
 			switch {
-			case tc.accept && err != nil:
-				t.Errorf("HTTP %d refused: %v", tc.status, err)
-			case !tc.accept && err == nil:
-				t.Errorf("HTTP %d was read as Kea's reply", tc.status)
-			case !tc.accept && !strings.Contains(err.Error(), strconv.Itoa(tc.status)):
+			case testCase.accept && err != nil:
+				t.Errorf("HTTP %d refused: %v", testCase.status, err)
+			case !testCase.accept && err == nil:
+				t.Errorf("HTTP %d was read as Kea's reply", testCase.status)
+			case !testCase.accept && !strings.Contains(err.Error(), strconv.Itoa(testCase.status)):
 				t.Errorf("error %q does not name the status code", err)
 			}
 		})
@@ -393,26 +353,27 @@ func TestTimeoutFallsBackRatherThanExpiringImmediately(t *testing.T) {
 		// The boundary: one nanosecond is a real setting, however useless.
 		{"smallest positive", time.Nanosecond, time.Nanosecond},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
 			// Arrange
-			timeout := tc.in
+			timeout := testCase.in
 
 			// Act
 			got := effectiveTimeout(timeout)
 
 			// Assert
-			if got != tc.want {
-				t.Errorf("effectiveTimeout(%v) = %v, want %v", timeout, got, tc.want)
+			if got != testCase.want {
+				t.Errorf("effectiveTimeout(%v) = %v, want %v", timeout, got, testCase.want)
 			}
 		})
 	}
 }
 
 func TestNewKeaClientCarriesItsSettingsAndABackstop(t *testing.T) {
-	// The settings must reach the client unchanged, and the HTTP client's own
-	// limit must outlast the per-command deadline: a zero there would mean no
-	// limit at all for anything the deadline does not cover.
+	// The settings and the transport must reach the client unchanged, and the
+	// HTTP client's own limit must outlast the per-command deadline: a zero
+	// there would mean no limit at all for anything the deadline does not
+	// cover.
 	tests := []struct {
 		name        string
 		timeout     time.Duration
@@ -421,28 +382,30 @@ func TestNewKeaClientCarriesItsSettingsAndABackstop(t *testing.T) {
 		{"configured timeout", 3 * time.Second, 6 * time.Second},
 		{"unset timeout", 0, 2 * defaultKeaTimeout},
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
 			// Arrange
-			settings := keaClient{
+			settings := keaSettings{
 				url:      "http://kea.example:8001/",
 				user:     "exporter",
 				password: "kea-password",
 				service:  supportedService,
-				timeout:  tc.timeout,
+				timeout:  testCase.timeout,
 			}
+			transport := &stubTransport{status: http.StatusOK}
 
 			// Act
-			client := newKeaClient(settings)
+			client := newKeaClient(settings, transport)
 
 			// Assert
-			if client.client == nil || client.client.Timeout != tc.wantTimeout {
-				t.Fatalf("HTTP client = %+v, want a Timeout of %v", client.client, tc.wantTimeout)
+			if client.client == nil || client.client.Timeout != testCase.wantTimeout {
+				t.Fatalf("HTTP client = %+v, want a Timeout of %v", client.client, testCase.wantTimeout)
 			}
-			withoutHTTP := *client
-			withoutHTTP.client = nil
-			if withoutHTTP != settings {
-				t.Errorf("settings = %+v, want %+v carried unchanged", withoutHTTP, settings)
+			if client.client.Transport != transport {
+				t.Errorf("transport = %v, want the one passed in", client.client.Transport)
+			}
+			if client.keaSettings != settings {
+				t.Errorf("settings = %+v, want %+v carried unchanged", client.keaSettings, settings)
 			}
 		})
 	}
@@ -459,19 +422,19 @@ func TestKeaResultErrorIsSurfaced(t *testing.T) {
 		{"error", 1, "unable to forward command"},
 		{"unsupported command", 2, "'status-get' command not supported"},
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
 			// Arrange
-			reply := fmt.Sprintf(`[{"result":%d,"text":%q}]`, tc.result, tc.text)
+			reply := fmt.Sprintf(`[{"result":%d,"text":%q}]`, testCase.result, testCase.text)
 
 			// Act
 			_, err := interpretResponse("status-get", http.StatusOK, strings.NewReader(reply))
 
 			// Assert
 			if err == nil {
-				t.Fatalf("result=%d was accepted", tc.result)
+				t.Fatalf("result=%d was accepted", testCase.result)
 			}
-			if !strings.Contains(err.Error(), fmt.Sprintf("result=%d", tc.result)) || !strings.Contains(err.Error(), tc.text) {
+			if !strings.Contains(err.Error(), fmt.Sprintf("result=%d", testCase.result)) || !strings.Contains(err.Error(), testCase.text) {
 				t.Errorf("error drops Kea's own explanation: %v", err)
 			}
 		})
@@ -490,10 +453,10 @@ func TestBasicAuthIsSentOnlyWhenAUserIsConfigured(t *testing.T) {
 		{"credentials configured", "kea", "kea-password", true},
 		{"no user means no auth header", "", "kea-password", false},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
 			// Arrange
-			kea := &keaClient{url: "http://kea.example/", user: tc.user, password: tc.password}
+			kea := newKeaClient(keaSettings{url: "http://kea.example/", user: testCase.user, password: testCase.password}, nil)
 
 			// Act
 			req, cancel, err := kea.newRequest(t.Context(), "status-get")
@@ -504,11 +467,11 @@ func TestBasicAuthIsSentOnlyWhenAUserIsConfigured(t *testing.T) {
 
 			// Assert
 			gotUser, gotPassword, gotAuth := req.BasicAuth()
-			if gotAuth != tc.wantAuth {
-				t.Errorf("basic auth present = %v, want %v", gotAuth, tc.wantAuth)
+			if gotAuth != testCase.wantAuth {
+				t.Errorf("basic auth present = %v, want %v", gotAuth, testCase.wantAuth)
 			}
-			if gotAuth && (gotUser != tc.user || gotPassword != tc.password) {
-				t.Errorf("credentials = %q/%q, want %q/%q", gotUser, gotPassword, tc.user, tc.password)
+			if gotAuth && (gotUser != testCase.user || gotPassword != testCase.password) {
+				t.Errorf("credentials = %q/%q, want %q/%q", gotUser, gotPassword, testCase.user, testCase.password)
 			}
 		})
 	}

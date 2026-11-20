@@ -39,7 +39,7 @@ go build -o kea-prom-exporter .
 CI additionally runs formatting, lint and security checks, listed in `ci.yml`.
 Every one is expected to be silent; please keep them that way rather than
 adding suppressions, unless the finding is genuinely a false positive, in which
-case annotate it with the reason (each `#nosec` in the tree states its own).
+case annotate it, stating the reason in the annotation itself.
 Their versions are pinned under `.github/`; when reproducing a CI failure
 locally, run the pinned version rather than `@latest`.
 
@@ -99,7 +99,7 @@ func TestSomething(t *testing.T) {
     // Why this matters, in one or two lines.
 
     // Arrange
-    collector := newCollector(newFakeKea(statistics, status), quietLogger)
+    collector := newCollector(newFakeKea(statistics, status), testReport(quietLogger))
 
     // Act
     got := collectAll(collector)

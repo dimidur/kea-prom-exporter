@@ -26,26 +26,31 @@ type keaResponse struct {
 	Arguments json.RawMessage `json:"arguments,omitempty"`
 }
 
-// keaClient talks to one Kea control socket. Its fields other than client are
-// the Kea settings, and newKeaClient sets client. validateConfig decides which
-// settings are refused.
-type keaClient struct {
+// keaSettings is how to reach one Kea control socket. validateConfig decides
+// which settings are refused.
+type keaSettings struct {
 	url      string
 	user     string
 	password string
 	service  string
 	timeout  time.Duration
-	client   *http.Client
 }
 
-// newKeaClient returns a client with the given settings and an HTTP client of
-// its own; any client in settings is replaced. The timeout bounds each
+// keaClient talks to one Kea control socket.
+type keaClient struct {
+	keaSettings
+	client *http.Client
+}
+
+// newKeaClient returns a client for settings whose requests go through
+// transport; nil means http.DefaultTransport. The timeout bounds each
 // command, and the HTTP client's limit is twice that, a backstop for anything
 // the per-command deadline does not cover.
-func newKeaClient(settings keaClient) *keaClient {
-	client := settings
-	client.client = &http.Client{Timeout: 2 * effectiveTimeout(settings.timeout)}
-	return &client
+func newKeaClient(settings keaSettings, transport http.RoundTripper) *keaClient {
+	return &keaClient{
+		keaSettings: settings,
+		client:      &http.Client{Transport: transport, Timeout: 2 * effectiveTimeout(settings.timeout)},
+	}
 }
 
 // defaultKeaTimeout is the --kea-timeout default, and the fallback when the
@@ -126,8 +131,8 @@ func (k *keaClient) newRequest(ctx context.Context, command string) (*http.Reque
 func interpretResponse(command string, status int, body io.Reader) (*keaResponse, error) {
 	if status < 200 || status > 299 {
 		detail, _ := io.ReadAll(io.LimitReader(body, errBodyLimit))
-		if msg := strings.TrimSpace(string(detail)); msg != "" {
-			return nil, fmt.Errorf("kea call %q: HTTP %d: %s", command, status, msg)
+		if explanation := strings.TrimSpace(string(detail)); explanation != "" {
+			return nil, fmt.Errorf("kea call %q: HTTP %d: %s", command, status, explanation)
 		}
 		return nil, fmt.Errorf("kea call %q: HTTP %d", command, status)
 	}
@@ -159,7 +164,7 @@ func mostRecentValue(raw json.RawMessage) (float64, bool) {
 	}
 	// json.Unmarshal of `null` into a float64 succeeds and leaves 0, so a
 	// null sample would silently report zero rather than being skipped.
-	if string(bytes.TrimSpace(samples[0][0])) == "null" {
+	if string(samples[0][0]) == "null" {
 		return 0, false
 	}
 	var value float64

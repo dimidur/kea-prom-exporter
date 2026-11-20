@@ -2,7 +2,7 @@
 
 Why this exporter is shaped the way it is. Each claim here was read from the
 Kea source or measured against a running server, and several contradict the
-Kea ARM — the source wins.
+Kea ARM; the source wins.
 
 This is the reference the code points at. Code comments say what a line does
 and why it is local to that line; the derivations live here, so they are in
@@ -17,8 +17,8 @@ hold across the [supported Kea releases](../README.md#supported-kea-versions).
 `AllocEngine::allocateUnreservedLease4` counts a single failure in **two
 independent branches**:
 
-- `shared-network` **xor** `subnet` — where the lookup was scoped
-- `no-pools` **xor** `v4-allocation-fail` — why it failed
+- `shared-network` **xor** `subnet`: where the lookup was scoped
+- `no-pools` **xor** `v4-allocation-fail`: why it failed
 
 So `v4-allocation-fail` is **not** the total. It is the `else` of "no attempts
 were made", a peer of `no-pools`, which is why it is exported under the label
@@ -39,7 +39,7 @@ the by-cause total rather than isolating a classification-driven subset.
 Unlike the lease gauges, allocation failures are read from the **global**
 statistics. Kea initialises the names in its `dhcp4_statistics` set to zero at
 startup, and the per-subnet `subnet[N].v4-allocation-fail*` observations are
-not among them — they spring into existence on the first failure.
+not among them: they spring into existence on the first failure.
 
 Exporting only the per-subnet form therefore left a healthy server with **no
 series at all**, so an alert could not distinguish "no failures" from "exporter
@@ -48,7 +48,7 @@ than pretended away.
 
 ## Drop reasons are an exact partition
 
-Kea records a specific reason and bumps the total alongside it —
+Kea records a specific reason and bumps the total alongside it:
 `Dhcpv4Srv::processPacket` carries the comment *"Specific drop cause stat was
 increased by accept\* methods"*. Several sites bump the total, and each records
 a reason at the same time, which is what keeps the partition exact:
@@ -70,7 +70,7 @@ it types the packet, while `Dhcpv4Srv::acceptServerId` bumps the same statistic
 
 A live hot-standby standby shows the consequence: 98,836 `pkt4-not-for-us` with
 every typed counter at zero. Two earlier versions of this exporter asserted such
-a relation — first as an equality, then as a band — and the capture disproved
+a relation, first as an equality and then as a band, and the capture disproved
 both.
 
 ## Declined addresses are a subset of assigned
@@ -86,7 +86,7 @@ event, so the global is the cross-subnet sum. Exporting both would double any
 `sum()`. The per-subnet form is exported, being strictly more informative.
 
 The same applies to `pkt4-received` and `pkt4-sent`: they are grand totals, not
-packet types — `pkt4-sent` equals `pkt4-offer-sent + pkt4-ack-sent` exactly.
+packet types. `pkt4-sent` equals `pkt4-offer-sent + pkt4-ack-sent` exactly.
 Exporting them beside the per-type series made
 `sum(kea_dhcp4_packets_sent_total)` return double.
 
@@ -94,7 +94,7 @@ Exporting them beside the per-type series made
 
 `HAImpl::commandProcessed` builds each entry of `high-availability` from
 exactly two keys, `ha-servers` and `ha-mode`. There is no name, no index, and
-no identifier of any kind — in the response or in the configuration. Stork
+no identifier of any kind, in the response or in the configuration. Stork
 synthesises one by naming a relationship after a single peer
 (`DetectHAServices`).
 
@@ -111,8 +111,8 @@ relationships"*, backed by `HARelationshipMapper::map` throwing on the repeated
 key underneath it.
 
 `min()` over two names drawn from a daemon-globally-unique set is therefore
-itself unique, and — because both nodes of a pair compute it over the same two
-strings — identical from both sides. That is what lets the two exporters' views
+itself unique, and, because both nodes of a pair compute it over the same two
+strings, identical from both sides. That is what lets the two exporters' views
 of one relationship be joined, which a peer-derived label cannot do.
 
 Stork reaches the same "name it after one real member" conclusion but can
@@ -144,8 +144,8 @@ there is and must not be suppressed.
 `CommunicationState::isCommunicationInterrupted` is exactly
 `getDurationInMillisecs() > getMaxResponseDelay()`, and `max-response-delay`
 defaults to 60000 ms. So `communication-interrupted: true` implies `age >= 60`
-at default configuration — a fixture claiming otherwise is describing a server
-that cannot exist.
+at default configuration, and a fixture claiming otherwise is describing a
+server that cannot exist.
 
 ### `ha-mode` reports the first relationship's mode
 
@@ -163,7 +163,7 @@ time of writing.
 ## Design consequences
 
 **A duplicate label set fails the whole scrape.** Prometheus fails the entire
-`Gather` on a duplicate series, not the one metric — so `/metrics` answers 500
+`Gather` on a duplicate series, not the one metric, so `/metrics` answers 500
 and every metric is lost, including the subnet gauges that have nothing to do
 with HA. This is why identities are de-duplicated even though Kea's own
 uniqueness rule makes collisions impossible: the exporter parses JSON, and the
@@ -174,12 +174,15 @@ itself, document where it does not.** The `last-state` gate is deliberately not
 hardened against a Kea reporting a state it should not, because getting that
 wrong costs one series rather than the scrape.
 
-**A label-arity mismatch kills the process.** Passing the wrong number of label
-values panics inside `MustNewConstMetric`, and `Registry.Gather` runs
-collectors *without* recovering — so the panic is not a failed scrape, it is a
-dead exporter. This is why `classifyStat` returns label values as a slice
-rather than a string plus a "has a label" flag: the arity then has exactly one
-source, checked in one place.
+**A label-arity mismatch fails every scrape.** Passing the wrong number of label
+values panics inside `MustNewConstMetric`. `Registry.Gather` recovers a panic
+raised on the goroutine running `Collect` (client_golang's `safeCollect`) and
+returns it as a gather error, so `/metrics` answers 500 and the whole scrape is
+lost, `kea_up` included, for as long as Kea reports that statistic. The process
+keeps running and logs the panic. A panic on a goroutine that `Collect` starts
+is not recovered and kills the process; the collector starts none. This is why
+`classifyStat` returns label values as a slice rather than a string plus a "has
+a label" flag: the arity then has exactly one source, checked in one place.
 
 **Table entries are shared, not copied.** The mapping tables are package-level,
 so their label slices are handed out by reference. One `append` at a call site

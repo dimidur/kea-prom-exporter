@@ -29,25 +29,22 @@ func (id buildID) versionLine() string {
 	return fmt.Sprintf("kea-prom-exporter %s (revision %s, %s)", id.version, id.revision, id.goVersion)
 }
 
-// readBuildInfo is a seam, not indirection for its own sake. resolveIdentity
-// is the only production path to resolveFrom, and without the seam a test
-// could not see it: a body of
-// `resolveFrom(injectedVersion, injectedRevision, nil, false)`, which drops
-// VCS stamping outright, would pass every test that only reaches resolveFrom.
-var readBuildInfo = debug.ReadBuildInfo
-
-// resolveIdentity takes the injected values as parameters rather than reading
-// the package variables, so it is exercisable from a test without mutating
-// global state, which is a data race the moment any test runs in parallel.
-func resolveIdentity(injectedVersion, injectedRevision string) buildID {
-	info, ok := readBuildInfo()
-	return resolveFrom(injectedVersion, injectedRevision, info, ok)
+// buildSource is where the identity of a binary comes from: the version and
+// revision injected at build time, and the build info Go stamped into it.
+type buildSource struct {
+	version, revision string
+	readInfo          func() (*debug.BuildInfo, bool)
 }
 
-// resolveFrom is the whole of the logic, with the build info passed in.
-// debug.ReadBuildInfo reports whatever stamped *this* binary, and `go test`
-// does not stamp VCS data into a test binary, so through resolveIdentity
-// alone the -dirty suffix and the revision lookup could not be tested.
+// resolve reads the build info and resolves the identity from it and the
+// injected version and revision.
+func (s buildSource) resolve() buildID {
+	info, ok := s.readInfo()
+	return resolveFrom(s.version, s.revision, info, ok)
+}
+
+// resolveFrom resolves the identity from the injected version and revision
+// and the build info Go stamped into the binary.
 func resolveFrom(injectedVersion, injectedRevision string, info *debug.BuildInfo, ok bool) buildID {
 	id := buildID{version: injectedVersion, revision: injectedRevision, goVersion: runtime.Version()}
 
@@ -88,5 +85,3 @@ func resolveFrom(injectedVersion, injectedRevision string, info *debug.BuildInfo
 	}
 	return id
 }
-
-func buildIdentity() buildID { return resolveIdentity(version, revision) }
