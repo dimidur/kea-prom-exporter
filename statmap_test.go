@@ -641,7 +641,7 @@ func TestFixturesKeepKeasSampleShape(t *testing.T) {
 				}
 				var value int
 				if err := json.Unmarshal(samples[0][0], &value); err != nil || value < 0 {
-					continue // string, null, or float statistic
+					continue // a string (including a duration), a float, or a negative value
 				}
 				if len(samples) != samplesFor(value) {
 					t.Errorf("%s has %d samples for value %d, want %d; Kea records one sample per increment capped at 20",
@@ -736,6 +736,9 @@ func TestMissingDescriptorIsAnExporterBugNotKeaDrift(t *testing.T) {
 	// kea_exporter_unhandled_statistics would send the reader to look at the
 	// wrong system, so it is logged as a bug and deliberately not counted.
 
+	// A statistic's samples as Kea reports them, holding the value 1.
+	oneSample := json.RawMessage(`[[1, "2026-08-02 20:04:57"]]`)
+
 	t.Run("resolveStat names the missing descriptor", func(t *testing.T) {
 		// Arrange: a descriptor table without the one the classifier routes
 		// pkt4-discover-received to.
@@ -760,7 +763,7 @@ func TestMissingDescriptorIsAnExporterBugNotKeaDrift(t *testing.T) {
 		wantLogged := []string{"exporter bug", "statistic=pkt4-discover-received", fmt.Sprintf("id=%d", int(statPacketsReceived))}
 
 		// Act
-		collector.emitResolved(emitted, "pkt4-discover-received", 1, missing)
+		collector.emitResolved(emitted, "pkt4-discover-received", oneSample, missing)
 
 		// Assert
 		for _, want := range wantLogged {
@@ -783,7 +786,7 @@ func TestMissingDescriptorIsAnExporterBugNotKeaDrift(t *testing.T) {
 		emitted := make(chan prometheus.Metric, 1)
 
 		// Act
-		collector.emitResolved(emitted, "pkt4-discover-received", 1, resolvedStat{})
+		collector.emitResolved(emitted, "pkt4-discover-received", oneSample, resolvedStat{})
 
 		// Assert
 		if !strings.Contains(logs.String(), "exporter bug") {

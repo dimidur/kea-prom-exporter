@@ -15,25 +15,31 @@ import (
 
 // Tests for kea.go: the control-socket client and its wire shapes.
 
-func TestMostRecentValue(t *testing.T) {
+func TestNewestSample(t *testing.T) {
 	// Kea reports each statistic as [value, timestamp] samples, newest first.
-	// The newest is the value; anything that is not a usable sample must be
-	// refused rather than read as one.
+	// The newest is the value. Anything that is not a usable sample must be
+	// refused rather than read as one. No value at all, as an empty list or a
+	// null, stays distinct from an unreadable one: a mapped statistic with no
+	// value is simply left out, while one whose value is not a number is
+	// counted as drift.
 	cases := []struct {
-		name string
-		in   string
-		want float64
-		ok   bool
+		name     string
+		in       string
+		want     float64
+		wantKind sampleKind
 	}{
-		{"kea sample shape", `[[42, "2026-08-02 20:04:57.000000"]]`, 42, true},
-		{"first sample is taken (Kea reports newest first)", `[[7, "2026-08-02 20:04:57"], [3, "2026-08-02 19:00:00"]]`, 7, true},
-		{"float value", `[[1.5, "2026-08-02 20:04:57"]]`, 1.5, true},
-		{"empty list", `[]`, 0, false},
+		{"kea sample shape", `[[42, "2026-08-02 20:04:57.000000"]]`, 42, sampleNumber},
+		{"first sample is taken (Kea reports newest first)", `[[7, "2026-08-02 20:04:57"], [3, "2026-08-02 19:00:00"]]`, 7, sampleNumber},
+		{"float value", `[[1.5, "2026-08-02 20:04:57"]]`, 1.5, sampleNumber},
+		// json.Unmarshal of null into a float64 succeeds and leaves 0, so a
+		// null read as a number would be a confident zero.
+		{"null value", `[[null, "2026-08-02 20:04:57"]]`, 0, sampleMissing},
+		{"string value", `[["text", "2026-08-02 20:04:57"]]`, 0, sampleUnreadable},
+		{"empty list", `[]`, 0, sampleMissing},
 		// An empty inner sample indexes out of range without the length
-		// guard, and Registry.Gather does not recover: the process dies on
-		// the scrape rather than reporting a bad value.
-		{"empty inner sample", `[[]]`, 0, false},
-		{"not a list", `{"nope": 1}`, 0, false},
+		// guard, and the panic fails every scrape that reaches it.
+		{"empty inner sample", `[[]]`, 0, sampleUnreadable},
+		{"not a list", `{"nope": 1}`, 0, sampleUnreadable},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -41,30 +47,13 @@ func TestMostRecentValue(t *testing.T) {
 			raw := json.RawMessage(testCase.in)
 
 			// Act
-			got, ok := mostRecentValue(raw)
+			got, kind := newestSample(raw)
 
 			// Assert
-			if ok != testCase.ok || (ok && got != testCase.want) {
-				t.Errorf("mostRecentValue(%s) = (%v, %v), want (%v, %v)", testCase.in, got, ok, testCase.want, testCase.ok)
+			if kind != testCase.wantKind || got != testCase.want {
+				t.Errorf("newestSample(%s) = (%v, %v), want (%v, %v)", testCase.in, got, kind, testCase.want, testCase.wantKind)
 			}
 		})
-	}
-}
-
-func TestNullSampleIsSkippedRatherThanReportedAsZero(t *testing.T) {
-	// Kea emits `[[null, "<ts>"]]` for a statistic it has no value for yet.
-	// json.Unmarshal of null into a float64 succeeds and leaves 0, so without
-	// an explicit guard the exporter reports a confident zero.
-
-	// Arrange
-	const nullSample = `[[null, "2026-08-02 20:04:57"]]`
-
-	// Act
-	got, ok := mostRecentValue(json.RawMessage(nullSample))
-
-	// Assert
-	if ok {
-		t.Errorf("mostRecentValue(null sample) = (%v, true), want ok=false", got)
 	}
 }
 
