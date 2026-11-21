@@ -12,7 +12,8 @@ Prometheus and alertable like anything else.
 **Kea 3.2.0** hot-standby HA pair: every metric below returns real data. The
 one path not exercised against real hardware is **multiple HA relationships**
 (hub-and-spoke), which needs a topology this project has no lab for; it is
-covered by constructed `status-get` payloads only, shaped to the ARM's example.
+covered by constructed `status-get` payloads only, shaped to the example in the
+Kea Administrator Reference Manual (ARM).
 The scope is a headline metric set rather than full statistic coverage; see
 the roadmap.
 
@@ -25,9 +26,7 @@ says how those are derived.
 
 ### Supported Kea versions
 
-**Kea 3.2.x**, verified against 3.2.0. This is the set the source comments
-mean when they say a Kea symbol or behaviour holds "across the supported
-releases".
+**Kea 3.2.x**, verified against 3.2.0.
 
 Only **stable** releases are in scope. ISC ships odd minor versions (3.1, 3.3)
 as [development releases][isc-versions] that are EOL as soon as the next stable
@@ -47,7 +46,7 @@ running the suite against that release, not editing the line.
 | --- | --- | --- |
 | `kea_dhcp4_addresses_assigned` | `subnet` | leases currently issued |
 | `kea_dhcp4_addresses_capacity` | `subnet` | pool size |
-| `kea_dhcp4_addresses_declined` | `subnet` | addresses withdrawn by a DHCPDECLINE |
+| `kea_dhcp4_addresses_declined` | `subnet` | addresses currently declined |
 | `kea_dhcp4_packets_received_total` | `type` | DHCPv4 packets in, by op |
 | `kea_dhcp4_packets_sent_total` | `type` | DHCPv4 packets out, by op |
 | `kea_dhcp4_packets_dropped_total` | *(none)* | inbound packets dropped, **total** |
@@ -57,8 +56,8 @@ running the suite against that release, not editing the line.
 | `kea_dhcp4_ha_enabled` | *(none)* | 1 when Kea reports an HA relationship, 0 when the hook is not loaded |
 | `kea_dhcp4_ha_local_state_info` | `relationship`, `peer`, `state`, `role`, `mode` | HA state of this peer |
 | `kea_dhcp4_ha_partner_state_info` | `relationship`, `peer`, `state`, `role` | HA state of the partner; **absent until in touch** |
-| `kea_dhcp4_ha_partner_in_touch` | `relationship`, `peer` | 1 once the partner has been contacted |
-| `kea_dhcp4_ha_partner_last_contact_seconds` | `relationship`, `peer` | seconds since last partner heartbeat; **absent until in touch** |
+| `kea_dhcp4_ha_partner_in_touch` | `relationship`, `peer` | 1 once Kea has a state for the partner, including `unavailable` |
+| `kea_dhcp4_ha_partner_last_contact_seconds` | `relationship`, `peer` | seconds since the last successful heartbeat to the partner; **absent until in touch** |
 | `kea_dhcp4_ha_communication_interrupted` | `relationship`, `peer` | 1 when HA communication is broken |
 | `kea_up` | *(none)* | 1 only when **every** control command succeeded |
 | `kea_command_up` | `command` | 1 when that specific command succeeded |
@@ -73,15 +72,13 @@ Kea records one event in several statistics at once, so some of these metrics
 deliberately do **not** share a label. Reading them as if they did doubles the
 numbers.
 
-What follows is the summary for whoever reads these metrics. The derivations
-behind it, which Kea symbol each claim comes from and where the ARM contradicts
-the source, are in [docs/kea-behaviour.md](docs/kea-behaviour.md).
+What follows are the rules for whoever reads these metrics. Why the exporter is
+built to them is in [docs/design.md](docs/design.md).
 
-**Allocation failures.** Kea counts a single failure in two independent branches
-(`AllocEngine::allocateUnreservedLease4` in [`alloc_engine.cc`][alloc-engine]):
-`shared-network` **xor** `subnet`, then `no-pools` **xor** `attempts-exhausted`.
-Scope and cause are therefore two *different* partitions of the same events, and
-each sums to the real total on its own:
+**Allocation failures.** Kea counts a single failure twice: once by scope
+(`shared-network` or `subnet`) and once by cause (`no-pools` or
+`attempts-exhausted`). Scope and cause are two *different* partitions of the
+same events, and each sums to the real total on its own:
 
 ```promql
 # Either of these is the real failure rate. Adding them together is not.
@@ -93,42 +90,31 @@ sum by (cause) (rate(kea_dhcp4_allocation_failures_by_cause_total[5m]))
 ```
 
 `attempts-exhausted` is this exporter's label for Kea's `v4-allocation-fail`.
-Note Kea's own ARM calls that statistic the *"number of total address allocation
-failures"*, which the source contradicts: it is the `else` branch of
-`total_attempts == 0`, i.e. a peer of `no-pools`, not their sum. The label name
-says what it actually counts.
+Despite what Kea's ARM says, that statistic is not the total: it is a peer of
+`no-pools`, counting failures after at least one allocation attempt.
 
-Several statistics are deliberately **not** exported, each because exporting it
-would double something already counted: the `pkt4-received` / `pkt4-sent` grand
-totals, the server-wide `assigned-addresses` and `declined-addresses` (sums of
-their per-subnet forms), and the allocation-failure cases below.
-`v4-allocation-fail-classes` counts failures where the client belonged to any
-class, but `Dhcpv4Exchange::classifyPacket` adds the `ALL` class to every
-packet ([`dhcp4_srv.cc`][dhcp4-srv]), so it tracks the by-cause total rather
-than isolating anything. And the per-subnet `subnet[N].v4-allocation-fail*`
-keys duplicate the globals shown here; the globals are used because Kea does
-not create the per-subnet ones until the first failure, so a healthy server
-would otherwise export no series at all.
+Several statistics are deliberately **not** exported (why is in
+[docs/design.md](docs/design.md)):
 
-**Dropped packets.** The reasons *are* an exact partition of the total: Kea
-records a reason, then bumps the drop alongside it; see the *"Specific drop
-cause stat was increased by accept\* methods"* comment in
-`Dhcpv4Srv::processPacket` ([`dhcp4_srv.cc`][dhcp4-srv]). Several sites bump the
-total; each records a reason at the same time, which is what keeps the partition
-exact, so the two agree:
+- the `pkt4-received` / `pkt4-sent` grand totals;
+- the server-wide `assigned-addresses` and `declined-addresses`;
+- the per-pool statistics;
+- `v4-allocation-fail-classes`;
+- the per-subnet `subnet[N].v4-allocation-fail*` keys: the allocation-failure
+  metrics are server-wide.
+
+**Dropped packets.** The reasons sum to the total:
 
 ```promql
 sum(kea_dhcp4_packets_dropped_by_reason_total) == kea_dhcp4_packets_dropped_total
 ```
 
-Use one or the other, never their sum. The total exists separately because it
-stays correct when a Kea release adds a reason this exporter does not yet know.
+Use one or the other, never their sum, and alert on the total.
 
 **Declined addresses.** `kea_dhcp4_addresses_declined` is a subset of
-`kea_dhcp4_addresses_assigned`, not a sibling of it. `Dhcpv4Srv::declineLease`
-([`dhcp4_srv.cc`][dhcp4-srv]) deliberately keeps declined leases counted as
-assigned so that pool utilisation stays meaningful, so `assigned / capacity` is
-already right and `assigned + declined` is not.
+`kea_dhcp4_addresses_assigned`, not a sibling of it: Kea keeps declined leases
+counted as assigned. `assigned / capacity` is already right, and
+`assigned + declined` is not.
 
 ### HA
 
@@ -137,36 +123,34 @@ Every HA metric except `kea_dhcp4_ha_enabled` carries the labels
 series per relationship. `kea_dhcp4_ha_enabled` stays unlabelled: it describes
 the daemon, not a relationship.
 
-`kea_dhcp4_ha_partner_last_contact_seconds` is deliberately **absent** rather
-than 0 before first contact: Kea reports age 0 in that state, which reads on a
-dashboard as "contacted 0 seconds ago". Pair it with
-`kea_dhcp4_ha_partner_in_touch`. `kea_dhcp4_ha_partner_state_info` is absent in
-the same situation and for the same reason: Kea reports the partner's state as
-an empty string until it has heard from it, and `state=""` is a worse lie than
-no series at all. Note that `unavailable` **is** a real state and is exported.
+`kea_dhcp4_ha_partner_last_contact_seconds` and
+`kea_dhcp4_ha_partner_state_info` are deliberately **absent** until Kea has a
+state for the partner, rather than 0 and an empty state. Pair them with
+`kea_dhcp4_ha_partner_in_touch`, which is 1 from then on, until Kea's HA
+service restarts.
+
+Kea records the partner as `unavailable` after a failed exchange with it, such
+as a heartbeat, and that state is exported: it is the one to alert on. A
+partner never reached shows it too, with the age counted from the HA service's
+start.
 
 **`relationship` and `peer`.** Kea supports several HA relationships per daemon
-(hub-and-spoke), and all of them are exported. It does not, however, give them
-names: at [Kea 3.2.0][ha-impl] each entry in `high-availability` is built from
-just `ha-servers` and `ha-mode`, with no identifier of its own. Both labels are
-therefore derived from the server names Kea does report:
+(hub-and-spoke), and all of them are exported. Kea gives them no names, so both
+labels are derived from the server names it does report:
 
 - **`relationship`** is the lower of the two names, so that **both nodes of a
   pair compute the same value**. It is unique per relationship, so it alone
   tells one relationship from another.
 - **`peer`** is the partner's `server-name`. It names the *other* end, so a
-  sample carrying `peer=X` was observed from X's partner. It is the thing
-  `relationship` deliberately hides, which is why both exist rather than one.
+  sample carrying `peer=X` was observed from X's partner. On the node whose
+  name sorts lower, it is the name `relationship` does not show; on the other
+  node the two are equal.
 
-Both are well-defined because Kea requires peer names to be unique across every
-relationship on a daemon, and [says so when rejecting a config][ha-unique]:
-*"server names must be unique for different relationships"*. `relationship` is
-consequently unique, and the lower-of-two rule makes it agree across both
-nodes.
-
-That last property matters when you run one exporter per Kea node, which is the
-normal deployment. Each node sees the *other* as its peer, so `peer` alone
-differs between the two views of one relationship and cannot join them:
+Why the lower name is unique and agrees across both nodes is in
+[docs/design.md](docs/design.md#ha-relationship-labels). That agreement matters
+when you run one exporter per Kea node, which is the normal deployment. Each
+node sees the *other* as its peer, so `peer` alone differs between the two
+views of one relationship and cannot join them:
 
 ```promql
 # one relationship, two exporters: same relationship, different peer
@@ -177,38 +161,20 @@ max by (relationship) (kea_dhcp4_ha_communication_interrupted)  # one series per
 ```
 
 A relationship is consequently named after one of its two members, which from
-the other member's point of view is the far server. [Stork][stork-svc] names a
-relationship after one real member too, though it can afford an asymmetric name
-because it [reconciles the two sides by scanning both][stork-status]; a
-Prometheus label cannot do a set-membership match, which is why this uses the
-lower of the pair rather than the local name. Alerting is unaffected either
-way, since you almost always want to know *which* node lost contact, and that
-is per-`instance` anyway.
+the other member's point of view is the far server. Alerting is unaffected,
+since you almost always want to know *which* node lost contact, and that is
+per-`instance` anyway.
 
-On a backup server or in `passive-backup` mode Kea omits the partner half of
-the response entirely, so the partner metrics are **absent** rather than 0, and
-both labels fall back to the local server's name. **The join property does not
-hold there**: with no partner name to compare against, each node names the
-relationship after itself, so the two views do not share a `relationship`
-value. This applies to every member in `passive-backup` mode, and to a backup
-peer inside an otherwise ordinary hot-standby or load-balancing relationship.
+On a backup server or in `passive-backup` mode the partner metrics are
+**absent** rather than 0, and both labels fall back to the local server's name.
+**The join property does not hold there**: each node names the relationship
+after itself, so the two views do not share a `relationship` value. This
+applies to every member in `passive-backup` mode, and to a backup peer inside
+an otherwise ordinary hot-standby or load-balancing relationship.
 
-**Caveat on `mode`, latent.** Kea fills in `ha-mode` for every relationship
-from the *first* relationship's configuration (`HAImpl::commandProcessed` calls
-`config_->get()`, which returns the first element). Today that is harmless: Kea
-only permits multiple relationships when [every one of them is
-hot-standby][ha-validate], so all the modes are equal and relationship 0's is
-always the right answer. The label becomes wrong only if Kea lifts that
-restriction. It is recorded here so the cause is known if it ever does, not
-because the `mode` label is currently untrustworthy.
-
-[alloc-engine]: https://github.com/isc-projects/kea/blob/Kea-3.2.0/src/lib/dhcpsrv/alloc_engine.cc
-[dhcp4-srv]: https://github.com/isc-projects/kea/blob/Kea-3.2.0/src/bin/dhcp4/dhcp4_srv.cc
-[ha-impl]: https://github.com/isc-projects/kea/blob/Kea-3.2.0/src/hooks/dhcp/high_availability/ha_impl.cc
-[ha-unique]: https://github.com/isc-projects/kea/blob/Kea-3.2.0/src/hooks/dhcp/high_availability/ha_config_parser.cc
-[ha-validate]: https://github.com/isc-projects/kea/blob/Kea-3.2.0/src/hooks/dhcp/high_availability/ha_config_parser.cc
-[stork-svc]: https://github.com/isc-projects/stork/blob/v2.5.0/backend/server/daemons/kea/service.go
-[stork-status]: https://github.com/isc-projects/stork/blob/v2.5.0/backend/server/daemons/kea/status.go
+**Caveat on `mode`, latent.** Every relationship reports the *first*
+relationship's mode, which is harmless today
+([docs/design.md](docs/design.md#ha-relationship-labels)).
 
 ### Build identity
 
@@ -221,10 +187,14 @@ when the working tree had uncommitted changes.
 
 On each `/metrics` request the exporter POSTs `statistic-get-all` and
 `status-get` to the `kea-dhcp4` HTTP control socket and translates the replies.
+Requests that arrive while a round is in progress share it.
 
 **Unknown statistic keys are logged once and ignored, never fatal.** A future
 Kea release that adds statistics degrades to *missing* metrics rather than *no*
-metrics, and `kea_exporter_unhandled_statistics` counts them.
+metrics, and `kea_exporter_unhandled_statistics` counts them. A stock Kea
+already reports some statistics this exporter does not map, and more with each
+subnet, so compare the count against your server's own baseline rather than
+alerting on it being above 0.
 
 Extending coverage starts with a row in one of the tables in
 [`statmap.go`](statmap.go), whose comments list what else a new metric needs.
@@ -282,7 +252,7 @@ argument is refused with exit 2, as an unknown flag is.
 
 `--log-level=debug` additionally names each Kea statistic the exporter has no
 mapping for or whose value is not a number, and each mapped statistic left out
-of a scrape because Kea reported no value for it. The unhandled ones are always
+of a scrape because its value was empty or null. The unhandled ones are always
 counted in `kea_exporter_unhandled_statistics`, so drift after a Kea upgrade is
 visible without turning debug logging on.
 

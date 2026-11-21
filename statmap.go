@@ -7,8 +7,8 @@ package main
 // different reason: what a scrape produces.
 //
 // Why a given statistic is exported, ignored, or split across two metrics is
-// in docs/kea-behaviour.md. The comments below say only what is needed to
-// edit a row correctly.
+// in docs/design.md. The comments below say only what is needed to edit a row
+// correctly.
 
 import (
 	"slices"
@@ -59,35 +59,30 @@ type statTarget struct {
 // and in collector.go a descriptor field built with add in newDescriptors and
 // a statMetrics row. The tables remove the branching, not the wiring.
 var exactStats = map[string]statTarget{
-	// Grand totals, not packet types; exporting them beside the per-type
-	// series doubles sum().
-	"pkt4-received": {id: statIgnored},
-	"pkt4-sent":     {id: statIgnored},
-
-	// Duplicates of the subnet[N] equivalents, which are exported instead.
+	// Grand totals, and totals of the per-subnet series exported instead
+	// (docs/design.md, "Totals of other series are not exported").
+	"pkt4-received":      {id: statIgnored},
+	"pkt4-sent":          {id: statIgnored},
 	"assigned-addresses": {id: statIgnored},
 	"declined-addresses": {id: statIgnored},
 
-	// The GLOBAL keys, unlike the lease gauges above: Kea does not create the
-	// per-subnet ones until the first failure. Two metrics, not one labelled
-	// metric, because scope and cause are separate partitions of the same
-	// events and would double-count under a single label.
+	// Exported from the server-wide keys, where the address gauges come from
+	// the per-subnet ones, and as two metrics rather than one labelled metric
+	// (docs/design.md, "Allocation failures are two metrics").
 	"v4-allocation-fail-shared-network": {id: statAllocFailByScope, extra: []string{"shared-network"}},
 	"v4-allocation-fail-subnet":         {id: statAllocFailByScope, extra: []string{"subnet"}},
 	"v4-allocation-fail-no-pools":       {id: statAllocFailByCause, extra: []string{"no-pools"}},
 	"v4-allocation-fail":                {id: statAllocFailByCause, extra: []string{"attempts-exhausted"}},
 
-	// Tracks the by-cause total rather than a class-driven subset, because
-	// Kea classes every packet as ALL.
+	// Counts the same failures as the by-cause metric (docs/design.md,
+	// "Allocation failures are two metrics").
 	"v4-allocation-fail-classes": {id: statIgnored},
 
-	// The total. Kea records a reason alongside it, so the reasons below are
-	// an exact partition: sum(reasons) == total.
+	// The total, and below it the reasons that sum to it, as their own metric
+	// rather than a label on the total (docs/design.md, "Drop reasons and the
+	// drop total").
 	"pkt4-receive-drop": {id: statPacketsDropped},
 
-	// The reasons, as their own metric rather than a label on the total: the
-	// total stays correct when a Kea release adds a reason this exporter does
-	// not know, and adding the two together double-counts.
 	"pkt4-queue-full":        {id: statDropReason, extra: []string{"queue-full"}},
 	"pkt4-parse-failed":      {id: statDropReason, extra: []string{"parse-failed"}},
 	"pkt4-processing-failed": {id: statDropReason, extra: []string{"processing-failed"}},
@@ -109,8 +104,8 @@ var subnetStats = map[string]statTarget{
 	"total-addresses":    {id: statAddressesCapacity},
 	"declined-addresses": {id: statAddressesDeclined},
 
-	// Per-subnet allocation failures duplicate the globals above, which are
-	// the ones exported; see the note there for why.
+	// Per-subnet allocation failures: the server-wide ones are exported
+	// instead (docs/design.md, "Allocation failures are two metrics").
 	"v4-allocation-fail-shared-network": {id: statIgnored},
 	"v4-allocation-fail-subnet":         {id: statIgnored},
 	"v4-allocation-fail-no-pools":       {id: statIgnored},
@@ -132,14 +127,14 @@ var packetStats = map[string]statTarget{
 // classifyStat resolves a Kea statistic name to what it maps onto and the
 // label values that accompany it, nil for an unlabelled metric. Labels are
 // a slice so the arity has one source; getting it wrong fails every scrape
-// rather than one series (docs/kea-behaviour.md).
+// rather than one series (docs/design.md, "Defensive choices").
 //
 // It never returns an error: an unrecognised key is statUnmapped, which the
 // caller logs once and counts.
 func classifyStat(key string) (statID, []string) {
 	if target, ok := exactStats[key]; ok {
-		// Cloned: the table's slice is shared, and one append at a call site
-		// would corrupt it process-wide.
+		// Cloned: the table's slice is shared, and an in-place write at a call
+		// site, such as an index assignment, would corrupt it process-wide.
 		return target.id, slices.Clone(target.extra)
 	}
 	if strings.HasPrefix(key, "subnet[") {
@@ -154,20 +149,19 @@ func classifyStat(key string) (statID, []string) {
 // classifySubnetStat handles `subnet[N].<suffix>`, and recognises then drops
 // the `subnet[N].pool[M].<suffix>` form Kea 3.x reports alongside it.
 func classifySubnetStat(key string) (statID, []string) {
-	end := strings.Index(key, "]")
 	// A malformed key is unmapped rather than silently skipped: it means Kea
 	// emitted a shape this parser does not understand, which is exactly the
-	// drift the unmapped path exists to surface.
-	if end < 0 || end+2 > len(key) {
+	// drift the unmapped path exists to surface (docs/design.md, "Defensive
+	// choices"). The ID ends at the first "]", and a "." must follow it.
+	subnetID, afterID, closed := strings.Cut(strings.TrimPrefix(key, "subnet["), "]")
+	rest, dotted := strings.CutPrefix(afterID, ".")
+	if !closed || !dotted {
 		return statUnmapped, nil
 	}
-	subnetID := key[len("subnet["):end]
-	rest := key[end+2:]
 
-	// Per-pool keys coexist with their per-subnet equivalents on 3.x and are
-	// dropped to avoid double-counting. This also swallows unrecognised
-	// per-pool suffixes, the one place statIgnored is broader than a
-	// considered omission.
+	// Per-pool keys are dropped (docs/design.md, "Totals of other series are
+	// not exported"). This also swallows unrecognised per-pool suffixes, the
+	// one place statIgnored is broader than a considered omission.
 	if strings.HasPrefix(rest, "pool[") {
 		return statIgnored, nil
 	}
@@ -187,10 +181,10 @@ func classifySubnetStat(key string) (statID, []string) {
 // classifyPacketStat handles `pkt4-<op>-received` and `pkt4-<op>-sent`; the
 // label is the operation, e.g. "discover" or "lease-query".
 func classifyPacketStat(key string) (statID, []string) {
-	operation := strings.TrimPrefix(key, "pkt4-")
+	rest := strings.TrimPrefix(key, "pkt4-")
 	for suffix, target := range packetStats {
-		if strings.HasSuffix(operation, suffix) {
-			return target.id, []string{strings.TrimSuffix(operation, suffix)}
+		if operation, found := strings.CutSuffix(rest, suffix); found {
+			return target.id, []string{operation}
 		}
 	}
 	return statUnmapped, nil

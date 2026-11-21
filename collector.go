@@ -6,9 +6,6 @@ package main
 // One reason to change: what a scrape produces, meaning the metrics it exports
 // (added, renamed or relabelled) and the Kea commands it sends to get them.
 // Which Kea statistic feeds which metric is statmap.go.
-//
-// Kea symbols named below hold across the supported Kea releases; the
-// supported set is in README.md.
 
 import (
 	"context"
@@ -177,18 +174,13 @@ func newDescriptors() descriptors {
 	set.scrapeErrors = add("kea_scrape_errors_total", "Cumulative scrape errors since exporter start, by command.",
 		[]string{"command"})
 
-	// Dhcpv4Srv::declineLease leaves a declined lease counted in
-	// assigned-addresses so that pool utilisation stays meaningful, which is
-	// why assigned/capacity is already correct and assigned+declined
-	// over-counts. The HELP text carries the consequence; the citation stays
-	// here rather than in it, since HELP ships on every scrape.
 	set.addressesAssigned = add(namespace+"_addresses_assigned",
-		"Currently assigned IPv4 addresses in the pool. Includes declined addresses: Kea keeps them assigned so pool-utilisation stays meaningful, so do not add "+namespace+"_addresses_declined to this.",
+		"Currently assigned IPv4 addresses in the subnet. Includes declined addresses: Kea keeps them assigned so pool-utilisation stays meaningful, so do not add "+namespace+"_addresses_declined to this.",
 		[]string{"subnet"})
 	set.addressesCapacity = add(namespace+"_addresses_capacity",
-		"Pool size: total IPv4 addresses available in the subnet.", []string{"subnet"})
+		"Pool size: total IPv4 addresses in the subnet's pools.", []string{"subnet"})
 	set.addressesDeclined = add(namespace+"_addresses_declined",
-		"Addresses currently withdrawn from the pool by a DHCPDECLINE.", []string{"subnet"})
+		"Addresses currently declined, and so withdrawn from use.", []string{"subnet"})
 
 	set.pkt4Received = add(namespace+"_packets_received_total", "Total DHCPv4 packets received by type.",
 		[]string{"type"})
@@ -215,13 +207,13 @@ func newDescriptors() descriptors {
 	set.haLocalState = add(namespace+"_ha_local_state_info",
 		"HA state of this peer (info-metric; value always 1; state in label).", haLabels("state", "role", "mode"))
 	set.haPartnerState = add(namespace+"_ha_partner_state_info",
-		"HA state of the partner as last reported to this peer (info-metric; value always 1). Absent until the partner has been contacted at least once, because Kea reports an empty state until then.",
+		"HA state of the partner as this peer last recorded it (info-metric; value always 1). Absent until Kea has a state for the partner, because it reports an empty state until then.",
 		haLabels("state", "role"))
 	set.haPartnerAge = add(namespace+"_ha_partner_last_contact_seconds",
-		"Seconds since the last successful heartbeat from the HA partner. Absent until the partner has been contacted at least once.",
+		"Seconds since this peer's last successful heartbeat to the HA partner, or since the HA service started if none has succeeded. Absent until Kea has a state for the partner.",
 		haLabels())
 	set.haPartnerInTouch = add(namespace+"_ha_partner_in_touch",
-		"1 once this peer has been in contact with its HA partner, else 0.", haLabels())
+		"1 once Kea has a state for the HA partner, including unavailable after a failed heartbeat, else 0.", haLabels())
 	set.haCommBroken = add(namespace+"_ha_communication_interrupted",
 		"1 if HA communication with the partner is interrupted, else 0.", haLabels())
 

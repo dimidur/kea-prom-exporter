@@ -168,18 +168,16 @@ func newestSample(raw json.RawMessage) (float64, sampleKind) {
 	if err := json.Unmarshal(raw, &samples); err != nil {
 		return 0, sampleUnreadable
 	}
-	// Kea reports an empty list once statistic-sample-count-set has set the
-	// statistic's max-samples to 0, until its next update
-	// (Observation::setMaxSampleCountInternal).
+	// An empty list or a null is no value: docs/design.md, "Statistics the
+	// exporter cannot export".
 	if len(samples) == 0 {
 		return 0, sampleMissing
 	}
 	if len(samples[0]) == 0 {
 		return 0, sampleUnreadable
 	}
-	// Kea never writes null: Observation::getJSON gives every value a type.
-	// json.Unmarshal of null into a float64 succeeds and leaves 0, though, so
-	// a null from anything else would read as a confident zero.
+	// json.Unmarshal of null into a float64 succeeds and leaves 0, so a null
+	// from anything but Kea would otherwise read as a confident zero.
 	if string(samples[0][0]) == "null" {
 		return 0, sampleMissing
 	}

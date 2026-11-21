@@ -16,9 +16,6 @@ import (
 )
 
 // Tests for statmap.go: the statistic-name mapping.
-//
-// Kea symbols named below hold across the supported Kea releases; the
-// supported set is in README.md.
 
 func TestClassifyStat(t *testing.T) {
 	// classifyStat is a pure function of the key, so the mapping can be pinned
@@ -34,12 +31,10 @@ func TestClassifyStat(t *testing.T) {
 		{"subnet capacity", "subnet[1].total-addresses", statAddressesCapacity, []string{"1"}},
 		{"multi-digit subnet id", "subnet[42].assigned-addresses", statAddressesAssigned, []string{"42"}},
 
-		// Per-pool keys coexist with per-subnet ones on Kea 3.x; counting both
-		// would inflate utilisation.
+		// docs/design.md, "Totals of other series are not exported".
 		{"per-pool is ignored", "subnet[1].pool[0].assigned-addresses", statIgnored, nil},
 
-		// Kea's grand totals equal the sum of the per-type series, so
-		// exporting them as a type doubled any sum().
+		// docs/design.md, "Totals of other series are not exported".
 		{"received aggregate is ignored", "pkt4-received", statIgnored, nil},
 		{"sent aggregate is ignored", "pkt4-sent", statIgnored, nil},
 
@@ -58,36 +53,31 @@ func TestClassifyStat(t *testing.T) {
 		// emitted something this parser does not understand.
 		{"subnet with no closing bracket", "subnet[1.assigned-addresses", statUnmapped, nil},
 		{"subnet truncated after bracket", "subnet[1]", statUnmapped, nil},
+		{"subnet with no dot after the bracket", "subnet[1]_assigned-addresses", statUnmapped, nil},
+		{"pool-like key with no dot after the bracket", "subnet[1]_pool[0].assigned-addresses", statUnmapped, nil},
+		{"subnet id containing a bracket", "subnet[1]].assigned-addresses", statUnmapped, nil},
 
 		// An empty subnet id still yields one label, because the descriptor
 		// has one either way; passing zero would panic in Gather.
 		{"empty subnet id", "subnet[].assigned-addresses", statAddressesAssigned, []string{""}},
 
-		// Kea increments the global and the subnet[N] form of these for the
-		// same event, so the global is a sum across subnets. Exporting both
-		// would double any sum(); the per-subnet form is kept.
+		// docs/design.md, "Totals of other series are not exported".
 		{"global assigned is the subnet sum", "assigned-addresses", statIgnored, nil},
 		{"global declined is the subnet sum", "declined-addresses", statIgnored, nil},
 
-		// Two partitions of one event, hence two metrics: scope and cause each
-		// sum to the real total, and classes overlaps both.
-		// Taken from the global keys, because Kea does not create the
-		// per-subnet ones until the first failure, and a healthy server would
-		// otherwise export no series at all.
+		// docs/design.md, "Allocation failures are two metrics".
 		{"alloc fail scope shared-network", "v4-allocation-fail-shared-network", statAllocFailByScope, []string{"shared-network"}},
 		{"alloc fail scope subnet", "v4-allocation-fail-subnet", statAllocFailByScope, []string{"subnet"}},
 		{"alloc fail cause no-pools", "v4-allocation-fail-no-pools", statAllocFailByCause, []string{"no-pools"}},
 		{"alloc fail cause exhausted", "v4-allocation-fail", statAllocFailByCause, []string{"attempts-exhausted"}},
 		{"per-subnet alloc fail duplicates the global", "subnet[1].v4-allocation-fail", statIgnored, nil},
 
-		// Kea adds the ALL class to every packet, so this counts essentially
-		// every failure rather than a classification-driven subset.
+		// docs/design.md, "Allocation failures are two metrics".
 		{"alloc fail classes is not exported", "v4-allocation-fail-classes", statIgnored, nil},
 
 		{"declined per subnet", "subnet[1].declined-addresses", statAddressesDeclined, []string{"1"}},
 
-		// The reasons are an exact partition of the total: Kea records the
-		// reason, then its caller bumps the drop.
+		// docs/design.md, "Drop reasons and the drop total".
 		{"drop total", "pkt4-receive-drop", statPacketsDropped, nil},
 		{"drop reason queue-full", "pkt4-queue-full", statDropReason, []string{"queue-full"}},
 		{"rfc-violation is a drop reason too", "pkt4-rfc-violation", statDropReason, []string{"rfc-violation"}},
@@ -366,17 +356,16 @@ func TestTablesAndClassifierAgree(t *testing.T) {
 }
 
 func TestAllocationFailureMetricsAgainstAFailingServer(t *testing.T) {
-	// The captured fixture cannot cover this: Kea only creates the
-	// allocation-failure statistics once a failure has happened, so a healthy
-	// capture has them at zero and the per-subnet ones absent entirely. This
-	// fixture is derived from the real capture and constructed so both
-	// partitions sum to the same real total (10), which is the property the
-	// two-metric split exists to preserve.
+	// The captured fixture cannot cover this: a healthy server has no
+	// allocation failures to report (docs/design.md, "Allocation failures are
+	// two metrics"). This fixture is derived from the real capture and
+	// constructed so both partitions sum to the same real total (10), which is
+	// the property the two-metric split exists to preserve.
 
 	// Arrange: the collector and the expected exposition. The Act is the
 	// Gather inside CollectAndCompare below, which is where an arity mismatch
-	// would surface the way it does in production: a panic in a goroutine
-	// nothing recovers.
+	// would surface the way it does in production: a panic that Gather
+	// recovers and returns as an error.
 	kea := newFakeKea(fixture(t, "statistic-get-all-with-failures.json"), fixture(t, "status-get.json"))
 	collector := newCollector(kea, testReport(quietLogger))
 	expected := `
@@ -393,7 +382,7 @@ kea_dhcp4_allocation_failures_by_scope_total{scope="subnet"} 6
 	// (4+6 == 3+7) is pinned by it. Declined addresses are non-zero here, so
 	// their golden pins the value and not merely the presence of the family.
 	declined := `
-# HELP kea_dhcp4_addresses_declined Addresses currently withdrawn from the pool by a DHCPDECLINE.
+# HELP kea_dhcp4_addresses_declined Addresses currently declined, and so withdrawn from use.
 # TYPE kea_dhcp4_addresses_declined gauge
 kea_dhcp4_addresses_declined{subnet="1"} 2
 `
@@ -411,10 +400,11 @@ kea_dhcp4_addresses_declined{subnet="1"} 2
 
 func TestFixtureCarriesThePerSubnetAllocationFailKeys(t *testing.T) {
 	// The derived fixture exists for the subnet[N].v4-allocation-fail* keys,
-	// the ones Kea does not create until a failure happens. They are
-	// deliberately ignored rather than exported, so nothing in the output
-	// would notice if they vanished from the file; the fixture's own content
-	// has to be checked, as the per-pool guard in collector_test.go does.
+	// which a healthy capture lacks (docs/design.md, "Allocation failures are
+	// two metrics"). They are deliberately ignored rather than exported, so
+	// nothing in the output would notice if they vanished from the file; the
+	// fixture's own content has to be checked, as the per-pool guard in
+	// collector_test.go does.
 
 	// Arrange
 	statistics := fixtureStatistics[json.RawMessage](t, "statistic-get-all-with-failures.json")
@@ -491,10 +481,9 @@ func TestTablesWithoutExtraSupportDoNotUseIt(t *testing.T) {
 }
 
 func TestDropReasonsSumToTheDropTotal(t *testing.T) {
-	// Kea records a reason and bumps the drop alongside it, as in
-	// Dhcpv4Srv::processPacket, so the two must agree exactly. Several sites
-	// bump the total and each records a reason at the same time. If they
-	// diverge, either Kea changed or a reason is mapped onto the wrong metric.
+	// The drop reasons sum to the drop total (docs/design.md, "Drop reasons
+	// and the drop total"), so the two must agree. If they diverge, either Kea
+	// changed or a reason is mapped onto the wrong metric.
 	//
 	// The real capture is the evidence about Kea, and the derived one
 	// exercises reasons the capture leaves at zero.
@@ -535,11 +524,10 @@ func assertDropReasonsSumToTotal(t *testing.T, fixtureName string) {
 func TestDropMetricsAgainstRealKeaOutput(t *testing.T) {
 	// The evidence about Kea has to come from Kea. The real capture carries a
 	// live instance of the invariant (pkt4-service-disabled 4 alongside
-	// pkt4-receive-drop 4) and every drop reason, because Kea initialises
-	// every name in its dhcp4_statistics set to 0 at startup.
-	// Pinning the whole family here is what catches a reason mapped to the
-	// wrong metric or spelled wrong, which a fixture built to satisfy a sum
-	// cannot.
+	// pkt4-receive-drop 4) and every drop reason: Kea reports each from
+	// startup, at 0, so any capture has them all. Pinning the whole family
+	// here is what catches a reason mapped to the wrong metric or spelled
+	// wrong, which a fixture built to satisfy a sum cannot.
 
 	// Arrange
 	kea := healthyKea(t)
@@ -653,11 +641,9 @@ func TestFixturesKeepKeasSampleShape(t *testing.T) {
 }
 
 func TestAllocationFailureSeriesExistOnAHealthyServer(t *testing.T) {
-	// This is why the globals are used instead of the per-subnet keys. Kea
-	// does not create subnet[N].v4-allocation-fail* until something fails, so
-	// exporting only those would leave a healthy server with no series at
-	// all, and an alert cannot tell "no failures" from "exporter broken" when
-	// the series is simply absent.
+	// A healthy server must still export the allocation-failure series, or an
+	// alert cannot tell "no failures" from "exporter broken"
+	// (docs/design.md, "Allocation failures are two metrics").
 	//
 	// The real capture is a healthy server, so it is the right evidence.
 
@@ -799,17 +785,11 @@ func TestMissingDescriptorIsAnExporterBugNotKeaDrift(t *testing.T) {
 }
 
 func TestDropReasonsPartitionTheDropTotalOnRealCaptures(t *testing.T) {
-	// Kea records a drop reason and then its caller bumps pkt4-receive-drop,
-	// so the reasons sum to the total. This holds on every real capture,
-	// including a hot-standby standby whose HA hook drops every packet.
-	//
-	// No relation is asserted between pkt4-received and the typed counters.
-	// The gap between them is not the set of drops occurring before typing,
-	// and no fixed "pre-typing" set exists: HAImpl::buffer4Receive drops
-	// not-for-us in the buffer4_receive callout, which Dhcpv4Srv::processPacket
-	// runs before it types the packet, while Dhcpv4Srv::acceptServerId bumps
-	// the same statistic after typing. The live standby capture shows the
-	// consequence: 98836 pkt4-not-for-us with every typed counter at zero.
+	// The drop reasons sum to the total on every capture, real and derived,
+	// including a hot-standby standby that drops every packet. Between
+	// packets received and the typed counters, the only relation asserted is
+	// that the typed counters never exceed packets received (docs/design.md,
+	// "Drop reasons and the drop total").
 	for _, name := range []string{
 		"statistic-get-all.json",
 		"statistic-get-all-with-failures.json",
@@ -879,10 +859,10 @@ kea_dhcp4_ha_enabled 1
 # HELP kea_dhcp4_ha_local_state_info HA state of this peer (info-metric; value always 1; state in label).
 # TYPE kea_dhcp4_ha_local_state_info gauge
 kea_dhcp4_ha_local_state_info{mode="hot-standby",peer="kea-primary",relationship="kea-primary",role="standby",state="hot-standby"} 1
-# HELP kea_dhcp4_ha_partner_in_touch 1 once this peer has been in contact with its HA partner, else 0.
+# HELP kea_dhcp4_ha_partner_in_touch 1 once Kea has a state for the HA partner, including unavailable after a failed heartbeat, else 0.
 # TYPE kea_dhcp4_ha_partner_in_touch gauge
 kea_dhcp4_ha_partner_in_touch{peer="kea-primary",relationship="kea-primary"} 1
-# HELP kea_dhcp4_ha_partner_last_contact_seconds Seconds since the last successful heartbeat from the HA partner. Absent until the partner has been contacted at least once.
+# HELP kea_dhcp4_ha_partner_last_contact_seconds Seconds since this peer's last successful heartbeat to the HA partner, or since the HA service started if none has succeeded. Absent until Kea has a state for the partner.
 # TYPE kea_dhcp4_ha_partner_last_contact_seconds gauge
 kea_dhcp4_ha_partner_last_contact_seconds{peer="kea-primary",relationship="kea-primary"} 0
 `

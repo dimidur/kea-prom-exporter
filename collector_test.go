@@ -61,10 +61,10 @@ func TestCollectAgainstRealKeaOutput(t *testing.T) {
 	kea := healthyKea(t)
 	collector := newCollector(kea, testReport(quietLogger))
 	subnetExpected := `
-# HELP kea_dhcp4_addresses_assigned Currently assigned IPv4 addresses in the pool. Includes declined addresses: Kea keeps them assigned so pool-utilisation stays meaningful, so do not add kea_dhcp4_addresses_declined to this.
+# HELP kea_dhcp4_addresses_assigned Currently assigned IPv4 addresses in the subnet. Includes declined addresses: Kea keeps them assigned so pool-utilisation stays meaningful, so do not add kea_dhcp4_addresses_declined to this.
 # TYPE kea_dhcp4_addresses_assigned gauge
 kea_dhcp4_addresses_assigned{subnet="1"} 23
-# HELP kea_dhcp4_addresses_capacity Pool size: total IPv4 addresses available in the subnet.
+# HELP kea_dhcp4_addresses_capacity Pool size: total IPv4 addresses in the subnet's pools.
 # TYPE kea_dhcp4_addresses_capacity gauge
 kea_dhcp4_addresses_capacity{subnet="1"} 121
 `
@@ -78,10 +78,10 @@ kea_dhcp4_ha_enabled 1
 # HELP kea_dhcp4_ha_local_state_info HA state of this peer (info-metric; value always 1; state in label).
 # TYPE kea_dhcp4_ha_local_state_info gauge
 kea_dhcp4_ha_local_state_info{mode="hot-standby",peer="kea-standby",relationship="kea-primary",role="primary",state="hot-standby"} 1
-# HELP kea_dhcp4_ha_partner_in_touch 1 once this peer has been in contact with its HA partner, else 0.
+# HELP kea_dhcp4_ha_partner_in_touch 1 once Kea has a state for the HA partner, including unavailable after a failed heartbeat, else 0.
 # TYPE kea_dhcp4_ha_partner_in_touch gauge
 kea_dhcp4_ha_partner_in_touch{peer="kea-standby",relationship="kea-primary"} 1
-# HELP kea_dhcp4_ha_partner_last_contact_seconds Seconds since the last successful heartbeat from the HA partner. Absent until the partner has been contacted at least once.
+# HELP kea_dhcp4_ha_partner_last_contact_seconds Seconds since this peer's last successful heartbeat to the HA partner, or since the HA service started if none has succeeded. Absent until Kea has a state for the partner.
 # TYPE kea_dhcp4_ha_partner_last_contact_seconds gauge
 kea_dhcp4_ha_partner_last_contact_seconds{peer="kea-standby",relationship="kea-primary"} 2
 `
@@ -197,8 +197,10 @@ func TestMaxScrapeDurationFollowsScrapeCommands(t *testing.T) {
 }
 
 func TestPacketTypesDoNotIncludeTheAggregate(t *testing.T) {
-	// Kea reports pkt4-sent as the grand total alongside pkt4-offer-sent and
-	// pkt4-ack-sent. Emitting it as type="sent" makes sum() return double.
+	// pkt4-sent is the total of the per-type series (docs/design.md, "Totals of
+	// other series are not exported"), so emitting it as type="sent" would
+	// double sum(). This capture sent only offers and ACKs, so there the
+	// per-type series sum to exactly the total.
 
 	// Arrange
 	aggregate, kind := newestSample(fixtureStatistics[json.RawMessage](t, "statistic-get-all.json")["pkt4-sent"])
@@ -227,7 +229,7 @@ func TestPacketTypesDoNotIncludeTheAggregate(t *testing.T) {
 		}
 	}
 	if sum != aggregate {
-		t.Errorf("per-type packets sum to %v, Kea's aggregate is %v; they must agree", sum, aggregate)
+		t.Errorf("per-type packets sum to %v, Kea's aggregate is %v; on this capture they agree", sum, aggregate)
 	}
 }
 
@@ -392,9 +394,8 @@ func TestUndecodableStatisticsFailTheScrape(t *testing.T) {
 }
 
 func TestPerPoolStatisticsAreNotDoubleCounted(t *testing.T) {
-	// Kea 3.x reports both subnet[N].assigned-addresses and
-	// subnet[N].pool[M].assigned-addresses. Counting both would inflate
-	// utilisation; the per-pool keys must be skipped.
+	// The per-pool keys must be skipped (docs/design.md, "Totals of other
+	// series are not exported").
 
 	// Arrange
 	statistics := fixtureStatistics[json.RawMessage](t, "statistic-get-all.json")
@@ -447,15 +448,11 @@ func TestConcurrentScrapesAreRaceFree(t *testing.T) {
 	const scrapes = 8
 
 	// Act
-	var wg sync.WaitGroup
+	var running sync.WaitGroup
 	for range scrapes {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			collectAll(collector)
-		}()
+		running.Go(func() { collectAll(collector) })
 	}
-	wg.Wait()
+	running.Wait()
 
 	// Assert
 	if got := collector.haErrorCount.Load(); got != scrapes {
@@ -464,11 +461,11 @@ func TestConcurrentScrapesAreRaceFree(t *testing.T) {
 }
 
 func TestAMappedStatisticWithNoValueIsLeftOutNotUnhandled(t *testing.T) {
-	// A mapped statistic with no value to report, which Kea writes as an
-	// empty sample list once its max-samples is set to 0, is left out:
-	// exporting it anyway would publish a confident 0. Its readable sibling
-	// still is exported. Its mapping is complete, so counting it as unhandled
-	// would send the reader looking for a gap that does not exist.
+	// A mapped statistic with no value to report (docs/design.md, "Statistics
+	// the exporter cannot export") is left out: exporting it anyway would
+	// publish a confident 0. Its readable sibling still is exported. Its
+	// mapping is complete, so counting it as unhandled would send the reader
+	// looking for a gap that does not exist.
 	tests := []struct {
 		name, samples string
 	}{
@@ -532,6 +529,27 @@ func TestOnlyAMappedStatisticHasItsValueRead(t *testing.T) {
 	}
 	if logged := loggedUnhandled(logs.String()); !slices.Equal(logged, wantUnhandled) {
 		t.Errorf("logged unhandled statistics %v, want %v", logged, wantUnhandled)
+	}
+}
+
+func TestAMalformedSubnetKeyDoesNotFailTheScrape(t *testing.T) {
+	// A key that only resembles subnet[N].<name> is unhandled, not read as
+	// one, which would duplicate the real key's series and fail the scrape
+	// (docs/design.md, "Defensive choices").
+
+	// Arrange
+	stats := []byte(`[{"result":0,"arguments":{
+	  "subnet[1].assigned-addresses":[[23,"2026-08-02 20:04:57"]],
+	  "subnet[1]_assigned-addresses":[[23,"2026-08-02 20:04:57"]]}}]`)
+	kea := newFakeKea(stats, fixture(t, "status-get.json"))
+	collector := newCollector(kea, testReport(quietLogger))
+
+	// Act
+	unhandled := sumFamily(t, collector, "kea_exporter_unhandled_statistics")
+
+	// Assert
+	if unhandled != 1 {
+		t.Errorf("kea_exporter_unhandled_statistics = %v, want 1 for the malformed key", unhandled)
 	}
 }
 
@@ -720,11 +738,6 @@ func TestExportedMetricSetIsExactlyTheContract(t *testing.T) {
 	// added or removed elsewhere fails none of them. This pins the whole set,
 	// so a change to it has to be a deliberate edit here rather than a side
 	// effect noticed after release.
-	//
-	// The fixture is the one carrying allocation failures, because Kea does
-	// not create the per-subnet v4-allocation-fail* observations until a lease
-	// request actually fails: a healthy-server fixture would leave those
-	// families out of the contract entirely.
 
 	// Arrange
 	contract := map[string][]string{
@@ -750,7 +763,7 @@ func TestExportedMetricSetIsExactlyTheContract(t *testing.T) {
 		"kea_scrape_errors_total":                      {"command"},
 		"kea_up":                                       {},
 	}
-	kea := newFakeKea(fixture(t, "statistic-get-all-with-failures.json"), fixture(t, "status-get.json"))
+	kea := healthyKea(t)
 	collector := newCollector(kea, testReport(quietLogger))
 
 	// Act

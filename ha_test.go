@@ -11,33 +11,21 @@ import (
 // Tests for ha.go: the HA part of a scrape, from the status-get payload to the
 // HA metrics it yields.
 //
-// Kea symbols named below hold across the supported Kea releases; the
-// supported set is in README.md.
+// The hand-written payloads below follow the constraints in CONTRIBUTING.md,
+// under "Tests without a Kea instance".
 
 func TestEveryHARelationshipIsExported(t *testing.T) {
 	// A daemon can hold several HA relationships (hub-and-spoke), and every
 	// one is exported, told apart by its labels. The two below differ in
 	// every field, so exporting one twice or dropping either is visible.
 
-	// Arrange: the shape HAImpl::commandProcessed builds, a list of
-	// {ha-servers, ha-mode} with no relationship identifier of its own.
+	// Arrange: a list of {ha-servers, ha-mode} with no relationship
+	// identifier of its own, which is all Kea reports.
 	//
-	// Config-time constraints shape the payload:
-	//
-	//  - Server names are unique across ALL relationships, so the hub carries
-	//    a different this-server-name in each. HAConfigParser::parseOne
-	//    rejects a duplicate with "server names must be unique for different
-	//    relationships".
-	//  - With more than one relationship, every one must be hot-standby
-	//    (HAConfigParser::validateRelationships), so neither is
-	//    load-balancing.
-	//
-	// Roles follow the ARM too: the central server is the standby in every
-	// relationship and each branch is the primary. And communication-
-	// interrupted is only true where age exceeds max-response-delay, since
-	// CommunicationState::isCommunicationInterrupted is exactly
-	// `getDurationInMillisecs() > getMaxResponseDelay()`, whose default is
-	// 60000ms.
+	// It follows the constraints in CONTRIBUTING.md, "Tests without a Kea
+	// instance": the hub carries a different server name in each
+	// relationship, and both are hot-standby. Roles follow the ARM too: the central server is the standby in every
+	// relationship and each branch is the primary.
 	status := []byte(`[{"result":0,"arguments":{"high-availability":[
 	  {"ha-mode":"hot-standby","ha-servers":{
 	   "local":{"role":"standby","state":"hot-standby","server-name":"server2"},
@@ -58,7 +46,7 @@ func TestEveryHARelationshipIsExported(t *testing.T) {
 # TYPE kea_dhcp4_ha_communication_interrupted gauge
 kea_dhcp4_ha_communication_interrupted{peer="server1",relationship="server1"} 0
 kea_dhcp4_ha_communication_interrupted{peer="server3",relationship="server3"} 1
-# HELP kea_dhcp4_ha_partner_last_contact_seconds Seconds since the last successful heartbeat from the HA partner. Absent until the partner has been contacted at least once.
+# HELP kea_dhcp4_ha_partner_last_contact_seconds Seconds since this peer's last successful heartbeat to the HA partner, or since the HA service started if none has succeeded. Absent until Kea has a state for the partner.
 # TYPE kea_dhcp4_ha_partner_last_contact_seconds gauge
 kea_dhcp4_ha_partner_last_contact_seconds{peer="server1",relationship="server1"} 2
 kea_dhcp4_ha_partner_last_contact_seconds{peer="server3",relationship="server3"} 94
@@ -97,7 +85,7 @@ func TestRelationshipLabelIsIdenticalFromBothPeers(t *testing.T) {
 			// The relationship label is the same string in both subtests;
 			// only peer flips. That is the property being pinned.
 			expected := `
-# HELP kea_dhcp4_ha_partner_in_touch 1 once this peer has been in contact with its HA partner, else 0.
+# HELP kea_dhcp4_ha_partner_in_touch 1 once Kea has a state for the HA partner, including unavailable after a failed heartbeat, else 0.
 # TYPE kea_dhcp4_ha_partner_in_touch gauge
 kea_dhcp4_ha_partner_in_touch{peer="` + testCase.wantPeer + `",relationship="kea-primary"} 1
 `
@@ -120,7 +108,7 @@ func TestPartnerStateAndRoleAreExported(t *testing.T) {
 	collector := newCollector(kea, testReport(quietLogger))
 
 	expected := `
-# HELP kea_dhcp4_ha_partner_state_info HA state of the partner as last reported to this peer (info-metric; value always 1). Absent until the partner has been contacted at least once, because Kea reports an empty state until then.
+# HELP kea_dhcp4_ha_partner_state_info HA state of the partner as this peer last recorded it (info-metric; value always 1). Absent until Kea has a state for the partner, because it reports an empty state until then.
 # TYPE kea_dhcp4_ha_partner_state_info gauge
 kea_dhcp4_ha_partner_state_info{peer="kea-standby",relationship="kea-primary",role="standby",state="hot-standby"} 1
 `
@@ -133,11 +121,9 @@ kea_dhcp4_ha_partner_state_info{peer="kea-standby",relationship="kea-primary",ro
 }
 
 func TestPartnerStateIsOmittedWhenKeaReportsItEmpty(t *testing.T) {
-	// The CommunicationState constructor starts partner_state_ at -1 and
-	// stateToString rejects it, so getReport's try/catch writes last-state:""
-	// for a partner never contacted. Exporting that yields state="", the
-	// same class of falsehood as reporting age 0 as "contacted 0 seconds
-	// ago". The metric is withheld instead.
+	// Kea reports last-state:"" until it has a state for the partner
+	// (docs/design.md, "Partner metrics before Kea has a partner state").
+	// Exporting that yields state="", so the metric is withheld instead.
 
 	// Arrange
 	status := []byte(`[{"result":0,"arguments":{"high-availability":[{"ha-mode":"hot-standby",
@@ -157,26 +143,20 @@ func TestPartnerStateIsOmittedWhenKeaReportsItEmpty(t *testing.T) {
 }
 
 func TestUnavailablePartnerStateIsStillExported(t *testing.T) {
-	// "unavailable" is a real HA state (HA_UNAVAILABLE_ST,
-	// stateToString) that Kea reports once it has decided the partner is
-	// gone. It is the most alertable partner state there is, and the one most
-	// at risk from a gate written slightly too broadly.
-	//
-	// in-touch is true here, not false: getReport derives it from
-	// getPartnerState() > 0 and HA_UNAVAILABLE_ST is a large positive
-	// constant. This test does not distinguish the last-state gate from an
-	// in-touch gate, and no test can, because the two are equivalent for
-	// every input Kea can produce; see the gate in ha.go.
+	// "unavailable" is a real HA state that Kea records after a failed
+	// heartbeat, with in-touch true. It is the most alertable partner state
+	// there is, and the one most at risk from a gate written slightly too
+	// broadly. The last-state gate and the in-touch gate are the same
+	// condition (docs/design.md, "Partner metrics before Kea has a partner
+	// state"), so no test can tell them apart.
 
-	// Arrange: the partner-down fixture, which is the situation producing
-	// this state: every path concluding the partner is gone calls
-	// CommunicationState::setPartnerUnavailable, which writes exactly
-	// "unavailable".
+	// Arrange: the partner-down fixture, a capture of the situation that
+	// produces this state.
 	kea := newFakeKea(fixture(t, "statistic-get-all-standby.json"), fixture(t, "status-get-partner-down.json"))
 	collector := newCollector(kea, testReport(quietLogger))
 
 	expected := `
-# HELP kea_dhcp4_ha_partner_state_info HA state of the partner as last reported to this peer (info-metric; value always 1). Absent until the partner has been contacted at least once, because Kea reports an empty state until then.
+# HELP kea_dhcp4_ha_partner_state_info HA state of the partner as this peer last recorded it (info-metric; value always 1). Absent until Kea has a state for the partner, because it reports an empty state until then.
 # TYPE kea_dhcp4_ha_partner_state_info gauge
 kea_dhcp4_ha_partner_state_info{peer="kea-primary",relationship="kea-primary",role="primary",state="unavailable"} 1
 `
@@ -189,12 +169,11 @@ kea_dhcp4_ha_partner_state_info{peer="kea-primary",relationship="kea-primary",ro
 }
 
 func TestBackupServerHasNoPartnerMetrics(t *testing.T) {
-	// HAService::processStatusGet returns before setting the remote half in
-	// passive-backup mode and on a backup server. Decoding it into a value
-	// struct would make that indistinguishable from a partner reporting
-	// zeroes, so the exporter would claim communication is fine with a
-	// partner that does not exist. Local state is still exported, labelled
-	// with the only name Kea gave.
+	// Kea omits the remote half in passive-backup mode and on a backup server
+	// (see haRemote in ha.go). Decoding it into a value struct would make that
+	// indistinguishable from a partner reporting zeroes, so the exporter would
+	// claim communication is fine with a partner that does not exist. Local
+	// state is still exported, labelled with the only name Kea gave.
 
 	// Arrange
 	status := []byte(`[{"result":0,"arguments":{"high-availability":[{"ha-mode":"passive-backup",
@@ -247,8 +226,8 @@ func TestIdentityDerivesLabelsFromWhicheverNamesKeaGave(t *testing.T) {
 	}{
 		{"local sorts first", "alpha", "zulu", "alpha", "zulu"},
 		{"remote sorts first", "zulu", "alpha", "alpha", "alpha"},
-		// Kea omits the remote block for a backup server or passive-backup
-		// mode, so the local name is the only one there is.
+		// No remote block, as on a backup server (see haRemote in ha.go): the
+		// local name is the only one.
 		{"remote block omitted", "solo", "-", "solo", "solo"},
 		// A remote block present but unnamed must behave like an omitted one.
 		// Falling through instead would yield min("solo", "") == "", which
@@ -277,14 +256,10 @@ func TestIdentityDerivesLabelsFromWhicheverNamesKeaGave(t *testing.T) {
 }
 
 func TestCollidingIdentitiesDoNotDestroyTheWholeScrape(t *testing.T) {
-	// Kea's own loader makes these inputs impossible: peer names are unique
-	// across a daemon's relationships or the hook does not load (see the
-	// citations on identity). They are still worth defending against, because
-	// a duplicate label set does not fail one metric: it fails the entire
-	// Gather. A single unexpected field would take /metrics to 500 and take
-	// the subnet gauges down with it, so the failure mode is total, not
-	// local. Each subtest is a distinct way two relationships can arrive at
-	// the same label pair.
+	// Kea refuses a configuration that would produce these inputs, but they
+	// are defended against anyway (docs/design.md, "Defensive choices"). Each
+	// subtest is a distinct way two relationships can arrive at the same
+	// label pair.
 	//
 	// The subnet assertion is the point of the test: it proves an HA oddity
 	// does not cost the metrics that have nothing to do with HA.
@@ -358,11 +333,11 @@ kea_dhcp4_ha_partner_last_contact_seconds{peer="0",relationship="0"} 2`,
 			kea := newFakeKea(fixture(t, "statistic-get-all.json"), []byte(testCase.status))
 			collector := newCollector(kea, testReport(quietLogger))
 			subnets := `
-# HELP kea_dhcp4_addresses_assigned Currently assigned IPv4 addresses in the pool. Includes declined addresses: Kea keeps them assigned so pool-utilisation stays meaningful, so do not add kea_dhcp4_addresses_declined to this.
+# HELP kea_dhcp4_addresses_assigned Currently assigned IPv4 addresses in the subnet. Includes declined addresses: Kea keeps them assigned so pool-utilisation stays meaningful, so do not add kea_dhcp4_addresses_declined to this.
 # TYPE kea_dhcp4_addresses_assigned gauge
 kea_dhcp4_addresses_assigned{subnet="1"} 23
 `
-			partner := "\n# HELP kea_dhcp4_ha_partner_last_contact_seconds Seconds since the last successful heartbeat from the HA partner. Absent until the partner has been contacted at least once.\n" +
+			partner := "\n# HELP kea_dhcp4_ha_partner_last_contact_seconds Seconds since this peer's last successful heartbeat to the HA partner, or since the HA service started if none has succeeded. Absent until Kea has a state for the partner.\n" +
 				"# TYPE kea_dhcp4_ha_partner_last_contact_seconds gauge\n" + testCase.want + "\n"
 			local := "\n# HELP kea_dhcp4_ha_local_state_info HA state of this peer (info-metric; value always 1; state in label).\n" +
 				"# TYPE kea_dhcp4_ha_local_state_info gauge\n" + testCase.wantLocal + "\n"
@@ -434,7 +409,7 @@ kea_dhcp4_ha_communication_interrupted{peer="kea-primary",relationship="kea-prim
 # HELP kea_dhcp4_ha_local_state_info HA state of this peer (info-metric; value always 1; state in label).
 # TYPE kea_dhcp4_ha_local_state_info gauge
 kea_dhcp4_ha_local_state_info{mode="hot-standby",peer="kea-primary",relationship="kea-primary",role="standby",state="partner-down"} 1
-# HELP kea_dhcp4_ha_partner_last_contact_seconds Seconds since the last successful heartbeat from the HA partner. Absent until the partner has been contacted at least once.
+# HELP kea_dhcp4_ha_partner_last_contact_seconds Seconds since this peer's last successful heartbeat to the HA partner, or since the HA service started if none has succeeded. Absent until Kea has a state for the partner.
 # TYPE kea_dhcp4_ha_partner_last_contact_seconds gauge
 kea_dhcp4_ha_partner_last_contact_seconds{peer="kea-primary",relationship="kea-primary"} 73
 `
@@ -490,9 +465,8 @@ kea_dhcp4_ha_enabled 0
 }
 
 func TestPartnerAgeIsAbsentUntilInTouch(t *testing.T) {
-	// Kea reports age 0 when it has never reached the partner. Exported
-	// unconditionally, that reads as "contacted 0 seconds ago", the inverse
-	// of the truth, so the gauge is withheld until in-touch is true.
+	// The partner age is withheld until in-touch is true (docs/design.md,
+	// "Partner metrics before Kea has a partner state").
 
 	// Arrange
 	status := []byte(`[{"result":0,"arguments":{"high-availability":[{"ha-mode":"hot-standby",
@@ -501,7 +475,7 @@ func TestPartnerAgeIsAbsentUntilInTouch(t *testing.T) {
 	kea := newFakeKea(fixture(t, "statistic-get-all.json"), status)
 	collector := newCollector(kea, testReport(quietLogger))
 	expected := `
-# HELP kea_dhcp4_ha_partner_in_touch 1 once this peer has been in contact with its HA partner, else 0.
+# HELP kea_dhcp4_ha_partner_in_touch 1 once Kea has a state for the HA partner, including unavailable after a failed heartbeat, else 0.
 # TYPE kea_dhcp4_ha_partner_in_touch gauge
 kea_dhcp4_ha_partner_in_touch{peer="b",relationship="a"} 0
 `
