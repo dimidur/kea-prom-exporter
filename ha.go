@@ -7,8 +7,8 @@ package main
 // separately from the core statistics, hence its own file. Which HA metrics
 // are emitted, and when, follows that shape.
 //
-// Why the labels are derived the way they are, and what Kea guarantees about
-// them, is in docs/kea-behaviour.md.
+// Why the labels are derived the way they are is in docs/design.md, under "HA
+// relationship labels".
 
 import (
 	"context"
@@ -68,7 +68,8 @@ type haStatus struct {
 // identity derives the two labels every relationship-scoped HA metric
 // carries: relationship, the lower of the two server names, and peer, the
 // partner's. Kea's uniqueness rule is what makes min() a stable, unique key
-// that both nodes of a pair agree on; see docs/kea-behaviour.md.
+// that both nodes of a pair agree on (docs/design.md, "HA relationship
+// labels").
 //
 // With no remote half there is no pair to choose from and both fall back to
 // the local name; haIdentities keeps those distinct.
@@ -85,10 +86,8 @@ func (r haRelationship) identity() (relationship, peer string) {
 }
 
 // haIdentities derives the label pair for every relationship and guarantees
-// the pairs are distinct. Kea's own uniqueness rule makes collisions
-// impossible, so this is a defence against input that did not come from a
-// healthy Kea: a duplicate label set fails the whole Gather, taking every
-// metric with it rather than one. See docs/kea-behaviour.md.
+// the pairs are distinct, against input that did not come from a healthy Kea
+// (docs/design.md, "Defensive choices").
 func haIdentities(relationships []haRelationship) []haIdentity {
 	out := make([]haIdentity, len(relationships))
 	seen := make(map[haIdentity]bool, len(relationships))
@@ -137,8 +136,8 @@ func (c *collector) collectHA(ctx context.Context, out chan<- prometheus.Metric)
 // identity.
 func (c *collector) emitRelationship(out chan<- prometheus.Metric, status haRelationship, identity haIdentity) {
 	// Kea reports the first relationship's ha-mode in every entry, which is
-	// harmless only because Kea requires them all to match. Latent, not
-	// live; see docs/kea-behaviour.md.
+	// harmless only because Kea requires them all to match (docs/design.md,
+	// "HA relationship labels").
 	out <- prometheus.MustNewConstMetric(
 		c.haLocalState, prometheus.GaugeValue, 1,
 		identity.relationship, identity.peer, status.HAServers.Local.State, status.HAServers.Local.Role, status.HAMode)
@@ -155,10 +154,9 @@ func (c *collector) emitRelationship(out chan<- prometheus.Metric, status haRela
 func (c *collector) emitPartner(out chan<- prometheus.Metric, remote *haRemote, identity haIdentity) {
 	relationship, peer := identity.relationship, identity.peer
 
-	// Kea reports age 0 when it has never reached the partner, which exported
-	// unconditionally reads as "contacted 0 seconds ago", the inverse of the
-	// truth. The gauge is emitted only when it means something, alongside an
-	// explicit in-touch signal.
+	// The age is emitted only once the partner is in touch, alongside an
+	// explicit in-touch signal (docs/design.md, "Partner metrics before Kea
+	// has a partner state").
 	inTouch := 0.0
 	if remote.InTouch {
 		inTouch = 1
@@ -168,11 +166,9 @@ func (c *collector) emitPartner(out chan<- prometheus.Metric, remote *haRemote, 
 	out <- prometheus.MustNewConstMetric(
 		c.haPartnerInTouch, prometheus.GaugeValue, inTouch, relationship, peer)
 
-	// Kea reports last-state as "" until the partner is first contacted, and
-	// state="" is the same falsehood as the age 0 above. Gate on the field
-	// this metric reads rather than on in-touch; the two are equivalent. Note
-	// "unavailable" is a real state, not an absence; see
-	// docs/kea-behaviour.md.
+	// The state is emitted only once it is not empty; this gate and the one
+	// on in-touch above are the same condition (docs/design.md, "Partner
+	// metrics before Kea has a partner state").
 	if remote.LastState != "" {
 		out <- prometheus.MustNewConstMetric(
 			c.haPartnerState, prometheus.GaugeValue, 1,

@@ -51,42 +51,49 @@ real output is what this exporter gets wrong if it gets anything wrong, and
 hand-written JSON tends to encode the author's assumptions rather than the
 daemon's behaviour.
 
-Before constructing or editing one, read
-[docs/kea-behaviour.md](docs/kea-behaviour.md). It records what Kea actually
-guarantees, including the constraints that make a plausible-looking payload
-one the daemon would refuse to start with.
+Before constructing or editing one, read [docs/design.md](docs/design.md): it
+says what the exporter relies on in Kea's output.
 
 If you add support for statistics that the existing fixtures don't contain,
 please add a fixture captured from a real Kea rather than composing one by hand.
 
 There is one carve-out, and it is narrow. Some statistics only appear once
-something has gone wrong (Kea does not create the per-subnet
-`v4-allocation-fail*` observations until a lease request actually fails), and
-inducing that on a production DHCP server to take a capture is not reasonable.
-`testdata/statistic-get-all-with-failures.json` covers those. It is *derived
-from* the real capture rather than written from scratch: the same keys, the
-same sample shape and history, with the failure counters raised to values that
-satisfy the relationships Kea's source guarantees. If you need to extend it,
-derive it the same way; do not hand-write a fresh document, because the failure
-mode is exactly the one this section warns about: a fixture that encodes what
-you believe instead of what the daemon does.
+something has gone wrong (the per-subnet allocation failures appear only after
+a lease request fails), and inducing that on a production DHCP server to take
+a capture is not reasonable. `testdata/statistic-get-all-with-failures.json`
+covers those. It is *derived from* the real capture rather than written from
+scratch: the same sample shape, with the per-subnet allocation-failure keys
+added and counters raised to values that keep the exporter's invariants: both
+allocation-failure partitions sum to the same total, and the drop reasons sum
+to the drop total. It does not satisfy every constraint Kea has: it counts
+failures in both scopes for its one subnet, which one Kea configuration would
+not. If you need to extend it, derive it the same way; do not hand-write a
+fresh document, because the failure mode is exactly the one this section warns
+about: a fixture that encodes what you believe instead of what the daemon does.
 
-The same carve-out covers the inline `status-get` payloads in `ha_test.go`, for
-HA topologies that cannot be captured either: a downed partner, a backup
-server, and a hub with several relationships. **Check them against the Kea
-source before trusting them**: a payload the daemon would reject makes a test
-that passes while proving nothing. These constraints are easy to violate and
-are enforced at config time, not in the `status-get` response:
+The same carve-out covers `testdata/status-get-partner-down.json`, derived
+from the standby capture, and the inline `status-get` payloads in `ha_test.go`,
+for HA topologies that cannot be captured either: a downed partner, a backup
+server, and a hub with several relationships. **Check them against what Kea
+accepts before trusting them**: a payload the daemon would reject makes a test
+that passes while proving nothing. Two constraints are enforced at config time,
+not in the `status-get` response:
 
-- Server names must be unique across *all* relationships
-  (`HAConfigParser::parseOne`, `HARelationshipMapper::map`).
-- More than one relationship requires *every* one to be hot-standby
-  (`HAConfigParser::validateRelationships`).
+- Server names must be unique across *all* relationships.
+- More than one relationship requires *every* one to be hot-standby.
 
-Shape a new HA payload on the ARM's hub-and-spoke example and satisfy yourself
-the daemon would accept it. Cite Kea by symbol name rather than line number:
-line numbers rot silently and a stale-but-precise-looking citation is worse
-than none.
+Two fields of one partner also have to agree: with the partner in touch,
+`communication-interrupted: true` needs an `age` of at least
+`max-response-delay` divided by 1000 and rounded down (60 by default).
+
+Shape a new HA payload on the hub-and-spoke example in the Kea Administrator
+Reference Manual (ARM) and satisfy yourself the daemon would accept it.
+
+## Documentation
+
+A design decision goes in [docs/design.md](docs/design.md): what the exporter
+does, and what in Kea's output it relies on, not how Kea works inside. Code and
+test comments point to its heading rather than repeat it.
 
 ## Test style
 
@@ -117,16 +124,20 @@ first: break the code it guards and watch it go red.
 
 ## Things worth knowing before changing the collector
 
-- **`Collect` can run concurrently.** Prometheus calls it once per scrape and
-  scrapes can overlap. Per-collector state must be safe under that: the scrape
-  error counter is `atomic.Uint64` for exactly this reason, and there is a test
-  that fails under `-race` if it regresses.
+- **`Collect` can run concurrently.** The Prometheus collector contract allows
+  it, even though the server here makes overlapping scrapes share one call.
+  Per-collector state must be safe under that: the scrape error counter is
+  `atomic.Uint64` for exactly this reason, and there is a test that fails under
+  `-race` if it regresses.
+- **`Collect` must not start goroutines.** A panic inside `Collect` fails that
+  scrape, and any sharing it; a panic on a goroutine it starts is not recovered
+  and kills the exporter.
 - **Unknown statistics must never fail a scrape.** They are logged once and
   skipped. A Kea release that adds statistics should cost you *missing* metrics,
   never *no* metrics.
-- **Per-subnet and per-pool statistics coexist in Kea 3.x.** `subnet[N].x` and
-  `subnet[N].pool[M].x` both appear; counting both double-counts utilisation.
-  A test guards this against a fixture that really does contain per-pool keys.
+- **Per-pool statistics stay ignored.** A test guards this against a fixture
+  that really does contain them. Why they are a breakdown of the per-subnet
+  ones is in [docs/design.md](docs/design.md#totals-of-other-series-are-not-exported).
 - **Metric names are an API.** Renaming one breaks dashboards and alerts
   downstream, so treat it as a breaking change.
 
