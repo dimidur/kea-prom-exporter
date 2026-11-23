@@ -53,7 +53,7 @@ RUN GOTOOLCHAIN="go$(awk '$1 == "go" {print $2}' go.mod)" \
 # /etc/passwd entry, not 65534/nobody, which is the shared NFS-anonymous uid
 # that a dozen unrelated things already map to. Kubernetes runAsNonRoot and
 # PodSecurity `restricted` reject an image whose user is root.
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:8ce6dd87e9823c5b48dcfb2c8604714ccb351ce59607327bcc4957448da279b5
 COPY --from=build /out/kea-prom-exporter /kea-prom-exporter
 # Default Prometheus port for Kea exporters (matches the mweinelt
 # heritage). Override with --listen or LISTEN env var.
