@@ -70,11 +70,12 @@
     },
     {
       "customType": "regex",
-      "description": "The Kea the compatibility check runs against, and the version README names as tested: one dependency in two places, so they move in one pull request.",
+      "description": "The Kea the compatibility check runs against, and every place README names it as tested: one dependency in several places, so they move in one pull request.",
       "managerFilePatterns": ["/^\\.github/workflows/compat\\.yml$/", "/^README\\.md$/"],
       "matchStrings": [
         "KEA_IMAGE: jonasal/kea-dhcp4:(?<currentValue>\\d+\\.\\d+\\.\\d+)@(?<currentDigest>sha256:[a-f0-9]{64})",
-        "tested against \\*\\*Kea (?<currentValue>\\d+\\.\\d+\\.\\d+)\\*\\*"
+        "tested against \\*\\*Kea (?<currentValue>\\d+\\.\\d+\\.\\d+)\\*\\*",
+        "img\\.shields\\.io/badge/tested%20with%20Kea-(?<currentValue>\\d+\\.\\d+\\.\\d+)-"
       ],
       "depNameTemplate": "jonasal/kea-dhcp4",
       "datasourceTemplate": "docker"

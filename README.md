@@ -1,5 +1,7 @@
 # kea-prom-exporter
 
+[![Tested with Kea](https://img.shields.io/badge/tested%20with%20Kea-3.2.1-blue)](docs/design.md#compatibility-is-checked-against-a-real-kea)
+
 Prometheus exporter for **ISC Kea DHCP 3.x**, written in Go.
 
 Surfaces lease-pool utilisation, packet counters and, the reason this exists,
