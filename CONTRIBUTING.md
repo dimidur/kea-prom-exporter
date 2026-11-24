@@ -31,7 +31,7 @@ newer local Go runs as itself, and `go test` fails on it; run with
 
 ```bash
 go mod tidy   # CI runs this and fails if it produces a diff
-go vet ./...
+go vet -tags compat ./...
 go test -race ./...
 go build -o kea-prom-exporter .
 ```
@@ -88,6 +88,19 @@ Two fields of one partner also have to agree: with the partner in touch,
 
 Shape a new HA payload on the hub-and-spoke example in the Kea Administrator
 Reference Manual (ARM) and satisfy yourself the daemon would accept it.
+
+## Tests against a real Kea
+
+`compat_test.go` runs only with `-tags compat`, against a running Kea.
+`.github/compat/kea.sh` starts and stops one in Docker as the `compat` workflow
+does; its header lists the variables it and the test read, and the `env` block
+of `compat.yml` has their values.
+
+Mapping a statistic listed in `unmappedStatistics`, in `contract_test.go`,
+means removing it from that list in the same change.
+
+A fix for a break the check found comes with a unit test that reproduces it,
+built from the replies the failing run saved as its `kea-replies` artifact.
 
 ## Documentation
 

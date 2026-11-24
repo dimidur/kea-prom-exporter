@@ -433,22 +433,19 @@ func TestIgnoredStatisticsAreNotReportedAsUnmapped(t *testing.T) {
 	kea := newFakeKea(fixture(t, "statistic-get-all-with-failures.json"), fixture(t, "status-get.json"))
 	logger, logs := capturingLogger(slog.LevelDebug)
 	collector := newCollector(kea, testReport(logger))
-	// The families the exporter does not map yet, each in a global and a
-	// subnet[N] form. The key set rather than the count: a count stays green
-	// when one key is reclassified and another appears.
-	want := slices.Sorted(slices.Values([]string{
-		"cumulative-assigned-addresses", "reclaimed-declined-addresses",
-		"reclaimed-leases", "v4-lease-reuses", "v4-reservation-conflicts",
-		"subnet[1].cumulative-assigned-addresses", "subnet[1].reclaimed-declined-addresses",
-		"subnet[1].reclaimed-leases", "subnet[1].v4-lease-reuses",
-		"subnet[1].v4-reservation-conflicts",
-	}))
+	// The key set rather than the count: a count stays green when one key is
+	// reclassified and another appears. The fixture has one subnet, so each
+	// listed statistic is logged once.
+	want := slices.Sorted(slices.Values(unmappedStatistics))
 
 	// Act
 	unhandled := sumFamily(t, collector, "kea_exporter_unhandled_statistics")
 
 	// Assert
-	got := loggedUnhandled(logs.String())
+	var got []string
+	for _, key := range loggedUnhandled(logs.String()) {
+		got = append(got, unmappedForm(key))
+	}
 	slices.Sort(got)
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("unmapped set is\n  %v\nwant\n  %v", got, want)

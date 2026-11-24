@@ -1,0 +1,41 @@
+{
+  "Dhcp4": {
+    "interfaces-config": {
+      "interfaces": ["eth0"],
+      "dhcp-socket-type": "udp"
+    },
+    "lease-database": {
+      "type": "memfile",
+      "persist": false
+    },
+    "control-sockets": [
+      {
+        "socket-type": "http",
+        "socket-address": "0.0.0.0",
+        "socket-port": 8001,
+        "authentication": {
+          "type": "basic",
+          "realm": "kea-compat",
+          "directory": "/kea/config",
+          "clients": [
+            {
+              "user-file": "control-user",
+              "password-file": "control-password"
+            }
+          ]
+        }
+      }
+    ],
+    "subnet4": [
+      {
+        "id": 1,
+        "subnet": "192.0.2.0/24",
+        "pools": [
+          {
+            "pool": "192.0.2.10 - 192.0.2.20"
+          }
+        ]
+      }
+    ]
+  }
+}
