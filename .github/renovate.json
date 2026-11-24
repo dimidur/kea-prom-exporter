@@ -40,6 +40,22 @@
       "matchDepTypes": ["uses-with"],
       "matchPackageNames": ["ghcr.io/renovatebot/renovate"],
       "pinDigests": false
+    },
+    {
+      "description": "The supported Kea is the latest stable 3.x release: ISC's odd minors are development releases, and the -alpine tags are a different image.",
+      "matchPackageNames": ["jonasal/kea-dhcp4"],
+      "allowedVersions": "/^3\\.\\d*[02468]\\.\\d+$/"
+    },
+    {
+      "description": "The compatibility check on a Kea update tests the new Kea against current main, so the pull request follows main.",
+      "matchPackageNames": ["jonasal/kea-dhcp4"],
+      "rebaseWhen": "behind-base-branch"
+    },
+    {
+      "description": "README names the tested Kea by version alone, so there is no digest there to pin.",
+      "matchFileNames": ["README.md"],
+      "matchPackageNames": ["jonasal/kea-dhcp4"],
+      "pinDigests": false
     }
   ],
   "customManagers": [
@@ -51,6 +67,17 @@
         "go run (?<depName>[^@\\s]+?)/cmd/[^@\\s]+@(?<currentValue>v\\d+\\.\\d+\\.\\d+)"
       ],
       "datasourceTemplate": "go"
+    },
+    {
+      "customType": "regex",
+      "description": "The Kea the compatibility check runs against, and the version README names as tested: one dependency in two places, so they move in one pull request.",
+      "managerFilePatterns": ["/^\\.github/workflows/compat\\.yml$/", "/^README\\.md$/"],
+      "matchStrings": [
+        "KEA_IMAGE: jonasal/kea-dhcp4:(?<currentValue>\\d+\\.\\d+\\.\\d+)@(?<currentDigest>sha256:[a-f0-9]{64})",
+        "tested against \\*\\*Kea (?<currentValue>\\d+\\.\\d+\\.\\d+)\\*\\*"
+      ],
+      "depNameTemplate": "jonasal/kea-dhcp4",
+      "datasourceTemplate": "docker"
     }
   ]
 }

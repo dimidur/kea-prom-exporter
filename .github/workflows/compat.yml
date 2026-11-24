@@ -1,0 +1,127 @@
+---
+name: compat
+
+# Runs the compatibility check: the exporter against the Kea that KEA_IMAGE
+# pins. When it runs, and why: docs/design.md, "Compatibility is checked
+# against a real Kea".
+
+"on":
+  workflow_call:
+  pull_request:
+    branches: [main]
+    paths:
+      - compat_test.go
+      - contract_test.go
+      - .github/compat/**
+      - .github/workflows/compat.yml
+
+permissions:
+  contents: read
+
+env:
+  # The supported Kea; .github/renovate.json moves this pin.
+  KEA_IMAGE: jonasal/kea-dhcp4:3.2.1@sha256:a0cc33221c70e03f3a8a3e50290d6b24d84eae5b8122eeecae90e51fa8941084
+  KEA_COMPAT_URL: http://127.0.0.1:8001/
+  KEA_COMPAT_USER: exporter
+
+jobs:
+  compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      kea: ${{ steps.kea.outcome }}
+      test: ${{ steps.test.outcome }}
+      replies: ${{ steps.save.outputs.replies }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5  # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Building the test and pulling Kea are steps of their own, so a module
+      # or registry failure is not reported as Kea's.
+      - name: build the test
+        run: go test -tags compat -c -o "$RUNNER_TEMP/compat.test" .
+      - name: pull Kea
+        run: docker pull --quiet "$KEA_IMAGE"
+
+      - name: start Kea
+        id: kea
+        run: |
+          password=$(openssl rand -hex 16)
+          echo "::add-mask::$password"
+          echo "KEA_COMPAT_PASSWORD=$password" >> "$GITHUB_ENV"
+          KEA_COMPAT_PASSWORD=$password .github/compat/kea.sh start
+
+      - name: compatibility test
+        id: test
+        run: '"$RUNNER_TEMP/compat.test" -test.run "^TestCompat$" -test.count=1 -test.v'
+
+      - name: save Kea's log and replies
+        id: save
+        if: always() && steps.kea.outcome != 'skipped'
+        run: |
+          .github/compat/kea.sh save "$RUNNER_TEMP/kea"
+          if [ -f "$RUNNER_TEMP/kea/statistic-get-all.json" ]; then
+            echo replies=true >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        if: always() && steps.kea.outcome != 'skipped'
+        with:
+          name: kea-replies
+          path: ${{ runner.temp }}/kea
+          if-no-files-found: ignore
+          overwrite: true
+
+      - name: Kea log
+        if: failure() && steps.kea.outcome != 'skipped'
+        run: docker logs kea
+
+  # A Kea update that fails the check gets an issue, once per version. Renovate
+  # names the branch after the dependency, so a pull request that only bumps an
+  # action pinned in this file does not count. Only starting Kea and the test
+  # itself are Kea's failures; the steps around them are not.
+  report:
+    needs: compat
+    if: >-
+      failure()
+      && (needs.compat.outputs.kea == 'failure' || needs.compat.outputs.test == 'failure')
+      && github.event_name == 'pull_request'
+      && startsWith(github.head_ref, 'renovate/jonasal-kea-dhcp4-')
+      && github.event.pull_request.head.repo.full_name == github.repository
+    concurrency:
+      group: compat-report-${{ github.head_ref }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: open an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPLIES: ${{ needs.compat.outputs.replies }}
+        run: |
+          version=${KEA_IMAGE#*:}
+          version=${version%%@*}
+          title="Kea $version fails the compatibility check"
+          # Listed rather than searched: the search index can lag behind an
+          # issue opened moments ago.
+          existing=$(gh issue list --state all --limit 1000 --json number,title \
+            | jq -r --arg title "$title" '[.[] | select(.title == $title)][0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "issue #$existing already reports this version"
+            exit 0
+          fi
+          if [ "$REPLIES" = true ]; then
+            next='The run saved the replies of that Kea in its kea-replies artifact;'
+            next+=' the fix adds a unit test that reproduces the failure from them.'
+          else
+            next='The run saved no replies of that Kea; its log is in the run.'
+          fi
+          gh issue create --title "$title" \
+            --body "$(printf 'The compatibility check fails against Kea %s in %s.\n\nRun: %s\n\n%s\n' \
+              "$version" "$PR_URL" "$RUN_URL" "$next")"

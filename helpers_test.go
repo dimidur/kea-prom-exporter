@@ -432,7 +432,7 @@ func (f *fakeKea) recorded() []recordedCall {
 // reports them.
 func loggedUnhandled(logs string) []string {
 	var keys []string
-	for _, line := range strings.Split(logs, "\n") {
+	for line := range strings.SplitSeq(logs, "\n") {
 		if !strings.Contains(line, "unhandled statistic") {
 			continue
 		}

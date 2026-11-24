@@ -24,19 +24,15 @@ captured without breaking a production DHCP server (allocation failures, a
 downed partner, a hub), the payload is constructed instead, and CONTRIBUTING
 says how those are derived.
 
-### Supported Kea versions
+### Supported Kea version
 
-**Kea 3.2.x**, verified against 3.2.0.
+The latest stable Kea **3.x** release, currently tested against **Kea 3.2.1**.
+How CI checks it, and why, is in
+[docs/design.md](docs/design.md#compatibility-is-checked-against-a-real-kea).
 
-Only **stable** releases are in scope. ISC ships odd minor versions (3.1, 3.3)
-as [development releases][isc-versions] that are EOL as soon as the next stable
-lands; even minors are the stable line. A newer version number is therefore not
-automatically a newer supported release: 3.3.0 is a development branch, while
-3.2.x is current stable and 3.0.x is LTS.
-
-Other stable branches are **untested, not unsupported**: nothing is known to
-break on 3.0.x, it simply has not been exercised. Widening this list means
-running the suite against that release, not editing the line.
+Stable means an even minor version. ISC ships odd minors (3.1, 3.3) as
+[development releases][isc-versions] that are EOL as soon as the next stable
+lands, so a 3.3 is not supported even while it is newer than 3.2.
 
 [isc-versions]: https://kb.isc.org/docs/aa-00896
 
@@ -348,7 +344,7 @@ Grouped by milestone rather than date.
 
 ### Contributions welcome
 
-- [ ] TLS to the Kea control socket (Kea 3.1.x supports `socket-type: https`
+- [ ] TLS to the Kea control socket (Kea 3.x supports `socket-type: https`
   with mutual TLS).
 - [ ] Schema-driven metric mapping, so new Kea statistics don't need a
   recompile.

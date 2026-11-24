@@ -102,3 +102,26 @@ defends where a bad field would cost more than itself:
 
 Where a bad field costs only itself, it is documented rather than defended: a
 partner state Kea should not report costs one series.
+
+## Compatibility is checked against a real Kea
+
+The unit tests run on captures from one Kea release, so what a new release
+changes is exactly what they cannot see. The compatibility check
+(`.github/workflows/compat.yml`) runs the exporter against a real Kea instead,
+and holds it to the properties the exporter depends on rather than to
+particular numbers.
+
+- **One version.** The supported Kea is pinned by digest as well as version,
+  so the check is reproducible. Renovate moves the pin within 3.x only:
+  supporting Kea 4 is a decision to make, not an update to take.
+- **When.** On the Renovate pull request that moves the pin, which tests the
+  new Kea against current `main`, and on a pull request that changes the check
+  itself. Not on other pull requests: supporting a new Kea is a task of its
+  own, and must not block unrelated work. Before every release, against the Kea
+  the tagged tree pins, so a regression in the exporter cannot reach a release.
+- **What a failure means.** On a Renovate pull request, a break the new Kea
+  brings: the check opens an issue, and the fix comes with a unit test, so the
+  corrected behaviour stays tested after the pin moves on.
+- **What it leaves out.** The Kea under test has one subnet and no HA hook, so
+  the values of the allocation-failure and HA metrics stay covered by the unit
+  tests alone.

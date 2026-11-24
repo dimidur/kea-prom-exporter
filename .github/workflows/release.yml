@@ -14,10 +14,20 @@ jobs:
     permissions:
       contents: read
 
+  # The tagged tree against the Kea it pins (docs/design.md, "Compatibility is
+  # checked against a real Kea"). The called workflow's issue job needs
+  # issues: write to be granted here, but it runs only on a Renovate pull
+  # request, never on a release.
+  compat:
+    uses: ./.github/workflows/compat.yml
+    permissions:
+      contents: read
+      issues: write
+
   # This job is the one with Docker Hub credentials in scope, so the SHA pins
   # below matter most here.
   publish:
-    needs: verify
+    needs: [verify, compat]
     # Tags only. On a workflow_dispatch the semver patterns do not match, so
     # metadata-action emits an empty (or "latest") version and the image would
     # claim a build identity it does not have.
@@ -53,8 +63,8 @@ jobs:
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
             REVISION=${{ github.sha }}
-          # arm64 included so this can run on the Pi hosting the Kea peer it
-          # watches, not only on an amd64 box.
+          # arm64 included so the exporter can run beside Kea on an arm64 host
+          # such as a Raspberry Pi, not only on an amd64 box.
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
