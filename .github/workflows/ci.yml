@@ -27,6 +27,8 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    outputs:
+      raised: ${{ steps.raise.outputs.raised }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5  # v7.1.0
@@ -72,12 +74,82 @@ jobs:
       # concurrently when scrapes overlap, which is exactly where a race in
       # this exporter would live.
       - name: test
-        run: go test -race -v ./...
+        run: go test -race -v -coverprofile=coverage.out ./...
+
+      - name: coverage ratchet
+        run: scripts/coverage-ratchet.sh check --reuse
 
       - name: build (host arch)
         run: >-
           CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"
           -o /tmp/kea-prom-exporter .
+
+      # Last, so only a green job on main raises the floors. The raised
+      # baseline goes to raise-floors, which pushes it.
+      - name: raise the coverage floors
+        id: raise
+        if: >-
+          github.event_name == 'push' && github.ref == 'refs/heads/main'
+          && github.repository == 'dimidur/kea-prom-exporter'
+        run: |
+          scripts/coverage-ratchet.sh bump --reuse
+          if ! git diff --quiet -- coverage-baseline.json; then
+            echo "raised=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.raise.outputs.raised == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: coverage-baseline
+          path: coverage-baseline.json
+          retention-days: 1
+
+  # The coverage bot's token can push to main past its ruleset, so it lives in
+  # a job of its own, where no code the tests run can reach it. Why the floors
+  # are raised this way: docs/design.md, "Coverage is held to a ratchet".
+  raise-floors:
+    needs: test
+    if: needs.test.outputs.raised == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # A persisted workflow token would be sent with the push in place of the
+      # bot's.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: coverage-baseline
+          path: ${{ runner.temp }}/floors
+      - id: coverage-bot
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc  # v3.4.0
+        with:
+          client-id: ${{ secrets.COVERAGE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.COVERAGE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+      - name: push the raised floors
+        env:
+          GH_TOKEN: ${{ steps.coverage-bot.outputs.token }}
+          BOT: ${{ steps.coverage-bot.outputs.app-slug }}[bot]
+        run: |
+          cp "$RUNNER_TEMP/floors/coverage-baseline.json" coverage-baseline.json
+          id=$(gh api "users/$BOT" --jq .id)
+          git config user.name "$BOT"
+          git config user.email "$id+$BOT@users.noreply.github.com"
+          gh auth setup-git
+          git add coverage-baseline.json
+          git commit -m "ci: raise the coverage floors [skip ci]"
+          if git push origin HEAD:main; then
+            exit 0
+          fi
+          git fetch --quiet origin main
+          landed=$(git rev-parse --verify origin/main)
+          measured=$(git rev-parse --verify HEAD~1)
+          if [ "$landed" != "$measured" ]; then
+            echo "::notice::main moved on during this run; its next run raises the floors"
+            exit 0
+          fi
+          echo "::error::main rejected the coverage bot's push of the raised floors"
+          exit 1
 
   docs:
     runs-on: ubuntu-latest

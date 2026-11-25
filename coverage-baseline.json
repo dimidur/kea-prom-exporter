@@ -1,0 +1,39 @@
+{
+  "buffer": 2,
+  "cap": 90,
+  "files": {
+    "buildinfo.go": {
+      "statements": 90
+    },
+    "collector.go": {
+      "statements": 90
+    },
+    "config.go": {
+      "statements": 90
+    },
+    "ha.go": {
+      "statements": 90
+    },
+    "kea.go": {
+      "statements": 90
+    },
+    "logging.go": {
+      "statements": 90
+    },
+    "run.go": {
+      "statements": 90
+    },
+    "secret.go": {
+      "statements": 90
+    },
+    "server.go": {
+      "statements": 90
+    },
+    "statmap.go": {
+      "statements": 90
+    }
+  },
+  "totals": {
+    "statements": 90
+  }
+}
