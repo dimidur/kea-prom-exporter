@@ -20,6 +20,9 @@
     "logging.go": {
       "statements": 90
     },
+    "main.go": {
+      "statements": 48
+    },
     "run.go": {
       "statements": 90
     },
