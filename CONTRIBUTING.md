@@ -43,6 +43,10 @@ case annotate it, stating the reason in the annotation itself.
 Their versions are pinned under `.github/`; when reproducing a CI failure
 locally, run the pinned version rather than `@latest`.
 
+A change that drops statement coverage below a floor in
+`coverage-baseline.json` fails; add tests rather than lower a floor.
+`scripts/coverage-ratchet.sh` runs the same check locally.
+
 ## Tests without a Kea instance
 
 `testdata/` holds **real** `statistic-get-all` and `status-get` responses

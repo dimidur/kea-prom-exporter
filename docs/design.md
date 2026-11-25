@@ -125,3 +125,27 @@ particular numbers.
 - **What it leaves out.** The Kea under test has one subnet and no HA hook, so
   the values of the allocation-failure and HA metrics stay covered by the unit
   tests alone.
+
+## Coverage is held to a ratchet
+
+Coverage that is only reported drifts down one untested branch at a time. The
+ratchet (`scripts/coverage-ratchet.sh`) holds every file, and the total, to a
+floor that only rises.
+
+- **Floors with slack.** A floor sits 2 points below the coverage that set it
+  and never above 90. It catches a file losing its tests without demanding
+  full coverage of every change; on a small file, 2 points is less than one
+  statement.
+- **Only `main` raises them.** After a merge, `main` raises the floors once its
+  test job is green, so a raised floor only ever reflects merged code. A pull
+  request is checked against the floors in its tree and normally leaves them
+  alone; editing them needs a strong reason, stated for review.
+- **A bot commits the raised floors.** `main` accepts only commits that passed
+  the required checks, which a commit made by the run cannot have yet. A
+  dedicated GitHub App on the ruleset's bypass list, with no permission beyond
+  the repository contents, pushes the new `coverage-baseline.json` with
+  `[skip ci]`. Its token is minted in a job of its own, so no code the tests
+  run can read it.
+- **A rejected push fails the run.** The one rejection tolerated is `main`
+  having moved on during the run, since the run for that merge raises the
+  floors. Any other would leave the floors stale with nothing to show for it.

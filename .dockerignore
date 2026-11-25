@@ -16,3 +16,5 @@ kea-prom-exporter-*
 .markdownlint-cli2.jsonc
 cspell.json
 LICENSE
+scripts
+coverage-baseline.json
