@@ -85,7 +85,7 @@ jobs:
           -o /tmp/kea-prom-exporter .
 
       # Last, so only a green job on main raises the floors. The raised
-      # baseline goes to raise-floors, which pushes it.
+      # baseline goes to raise-floors, which commits it.
       - name: raise the coverage floors
         id: raise
         if: >-
@@ -103,19 +103,16 @@ jobs:
           path: coverage-baseline.json
           retention-days: 1
 
-  # The coverage bot's token can push to main past its ruleset, so it lives in
-  # a job of its own, where no code the tests run can reach it. Why the floors
-  # are raised this way: docs/design.md, "Coverage is held to a ratchet".
+  # The coverage bot commits the raised floors to main. Why it does so from a
+  # job of its own: docs/design.md, "Coverage is held to a ratchet".
   raise-floors:
     needs: test
     if: needs.test.outputs.raised == 'true'
     runs-on: ubuntu-latest
+    # Nothing here uses the workflow's token: the artifact comes from this run,
+    # and the commit is made with the bot's.
+    permissions: {}
     steps:
-      # A persisted workflow token would be sent with the push in place of the
-      # bot's.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: coverage-baseline
@@ -126,29 +123,34 @@ jobs:
           client-id: ${{ secrets.COVERAGE_BOT_CLIENT_ID }}
           private-key: ${{ secrets.COVERAGE_BOT_PRIVATE_KEY }}
           permission-contents: write
-      - name: push the raised floors
+      # The commit is made on top of the commit the floors were measured on,
+      # and GitHub refuses it if main has moved on since.
+      - name: commit the raised floors
         env:
           GH_TOKEN: ${{ steps.coverage-bot.outputs.token }}
-          BOT: ${{ steps.coverage-bot.outputs.app-slug }}[bot]
         run: |
-          cp "$RUNNER_TEMP/floors/coverage-baseline.json" coverage-baseline.json
-          id=$(gh api "users/$BOT" --jq .id)
-          git config user.name "$BOT"
-          git config user.email "$id+$BOT@users.noreply.github.com"
-          gh auth setup-git
-          git add coverage-baseline.json
-          git commit -m "ci: raise the coverage floors [skip ci]"
-          if git push origin HEAD:main; then
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" --arg measured "$GITHUB_SHA" \
+            --rawfile floors "$RUNNER_TEMP/floors/coverage-baseline.json" '
+            { query: ("mutation($input: CreateCommitOnBranchInput!) {"
+                      + " createCommitOnBranch(input: $input) { commit { oid } } }"),
+              variables: { input: {
+                branch: { repositoryNameWithOwner: $repo, branchName: "main" },
+                expectedHeadOid: $measured,
+                message: { headline: "ci: raise the coverage floors [skip ci]" },
+                fileChanges: { additions: [
+                  { path: "coverage-baseline.json", contents: ($floors | @base64) } ] } } } }
+          ' > "$RUNNER_TEMP/commit.json"
+          if gh api graphql --input "$RUNNER_TEMP/commit.json" \
+            --jq '.data.createCommitOnBranch.commit.oid'; then
             exit 0
           fi
-          git fetch --quiet origin main
-          landed=$(git rev-parse --verify origin/main)
-          measured=$(git rev-parse --verify HEAD~1)
-          if [ "$landed" != "$measured" ]; then
+          landed=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [ "$landed" != "$GITHUB_SHA" ]; then
             echo "::notice::main moved on during this run; its next run raises the floors"
             exit 0
           fi
-          echo "::error::main rejected the coverage bot's push of the raised floors"
+          echo "::error::main rejected the coverage bot's commit of the raised floors"
           exit 1
 
   docs:

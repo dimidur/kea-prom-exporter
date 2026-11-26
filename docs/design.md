@@ -143,9 +143,15 @@ floor that only rises.
 - **A bot commits the raised floors.** `main` accepts only commits that passed
   the required checks, which a commit made by the run cannot have yet. A
   dedicated GitHub App on the ruleset's bypass list, with no permission beyond
-  the repository contents, pushes the new `coverage-baseline.json` with
-  `[skip ci]`. Its token is minted in a job of its own, so no code the tests
-  run can read it.
-- **A rejected push fails the run.** The one rejection tolerated is `main`
+  the repository contents, commits the new `coverage-baseline.json` with
+  `[skip ci]`. It does so through the GraphQL `createCommitOnBranch` mutation
+  rather than `git push`: GitHub signs such commits, and the mutation takes no
+  author, so a request authenticated as the app gets a verified bot signature
+  ([mutation][create-commit], [bot signatures][bot-signatures]). Its token is
+  minted in a job of its own, so no code the tests run can read it.
+- **A rejected commit fails the run.** The one rejection tolerated is `main`
   having moved on during the run, since the run for that merge raises the
   floors. Any other would leave the floors stale with nothing to show for it.
+
+[create-commit]: https://docs.github.com/en/graphql/reference/commits#mutation-createcommitonbranch
+[bot-signatures]: https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification#signature-verification-for-bots
