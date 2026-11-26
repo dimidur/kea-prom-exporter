@@ -38,6 +38,7 @@
     "nonroot",
     "promhttp",
     "promlint",
+    "rawfile",
     "renovatebot",
     "securego",
     "slurpfile",
