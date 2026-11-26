@@ -71,6 +71,16 @@
     },
     {
       "customType": "regex",
+      "description": "The shellcheck release file CI downloads: its version and SHA-256 move together.",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": [
+        "SHELLCHECK_VERSION: (?<currentValue>v\\d+\\.\\d+\\.\\d+)\\s+SHELLCHECK_SHA256: (?<currentDigest>[a-f0-9]{64})"
+      ],
+      "depNameTemplate": "koalaman/shellcheck",
+      "datasourceTemplate": "github-release-attachments"
+    },
+    {
+      "customType": "regex",
       "description": "The Kea the compatibility check runs against, and every place README names it as tested: one dependency in several places, so they move in one pull request.",
       "managerFilePatterns": ["/^\\.github/workflows/compat\\.yml$/", "/^README\\.md$/"],
       "matchStrings": [

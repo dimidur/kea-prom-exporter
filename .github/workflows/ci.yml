@@ -293,14 +293,61 @@ jobs:
       - name: yamllint
         run: '"$RUNNER_TEMP/yamllint/bin/yamllint" --strict .'
 
+  # Workflows and shell scripts. actionlint runs shellcheck on every
+  # workflow's inline scripts, so both use the one pinned below.
+  workflows-and-scripts:
+    runs-on: ubuntu-latest
+    env:
+      # The release file for linux.x86_64, pinned by its SHA-256.
+      SHELLCHECK_VERSION: v0.11.0
+      SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      # No Go cache: it would share test's key and could be saved from this
+      # job, which builds actionlint only.
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5  # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      # The runner's own shellcheck changes with the runner image.
+      - name: install shellcheck
+        run: |
+          asset="shellcheck-$SHELLCHECK_VERSION.linux.x86_64.tar.xz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$asset" \
+            "https://github.com/koalaman/shellcheck/releases/download/$SHELLCHECK_VERSION/$asset"
+          echo "$SHELLCHECK_SHA256  $RUNNER_TEMP/$asset" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/shellcheck-$SHELLCHECK_VERSION" >> "$GITHUB_PATH"
+      - name: actionlint
+        run: |
+          shellcheck --version
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color
+      # Every tracked .sh file, with all optional checks on.
+      - name: shellcheck
+        run: |
+          mapfile -t scripts < <(git ls-files '*.sh')
+          if [ "${#scripts[@]}" -eq 0 ]; then
+            echo "::error::no shell scripts found to check"
+            exit 1
+          fi
+          shellcheck --enable=all "${scripts[@]}"
+
   security:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      # A cache key of its own: setup-go keys the cache on the hash of these
+      # files alone, and test's default, go.sum, would give both jobs one
+      # cache, saved by whichever finished first.
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5  # v7.1.0
         with:
           go-version-file: go.mod
           cache: true
+          cache-dependency-path: |
+            go.mod
+            go.sum
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
       - name: gosec
