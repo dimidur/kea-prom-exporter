@@ -142,16 +142,23 @@ floor that only rises.
   alone; editing them needs a strong reason, stated for review.
 - **A bot commits the raised floors.** `main` accepts only commits that passed
   the required checks, which a commit made by the run cannot have yet. A
-  dedicated GitHub App on the ruleset's bypass list, with no permission beyond
-  the repository contents, commits the new `coverage-baseline.json` with
-  `[skip ci]`. It does so through the GraphQL `createCommitOnBranch` mutation
-  rather than `git push`: GitHub signs such commits, and the mutation takes no
-  author, so a request authenticated as the app gets a verified bot signature
-  ([mutation][create-commit], [bot signatures][bot-signatures]). Its token is
-  minted in a job of its own, so no code the tests run can read it.
+  dedicated GitHub App, with no permission beyond the repository contents,
+  commits the new `coverage-baseline.json` with `[skip ci]`. It may bypass
+  only the required checks: deletion, force-pushes and unsigned commits are
+  refused by a ruleset with no bypass at all. It commits through the GraphQL
+  `createCommitOnBranch` mutation rather than `git push`: GitHub signs such
+  commits, and the mutation takes no author, so a request authenticated as
+  the app gets a verified bot signature ([mutation][create-commit],
+  [bot signatures][bot-signatures]). Its key is a secret of an environment
+  only `main` may use, and its token is minted in a job of its own, so no
+  other branch's workflow and no code the tests run can reach it.
 - **A rejected commit fails the run.** The one rejection tolerated is `main`
   having moved on during the run, since the run for that merge raises the
   floors. Any other would leave the floors stale with nothing to show for it.
+- **The badge reads GitHub Pages.** It shows measured coverage, since a floor
+  only says how far coverage may fall. Each run on `main` whose test job is
+  green publishes its total there; storing it in the repository instead would
+  mean a commit after every merge that moves coverage at all.
 
 [create-commit]: https://docs.github.com/en/graphql/reference/commits#mutation-createcommitonbranch
 [bot-signatures]: https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification#signature-verification-for-bots

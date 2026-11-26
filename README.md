@@ -1,5 +1,9 @@
 # kea-prom-exporter
 
+[![CI](https://github.com/dimidur/kea-prom-exporter/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dimidur/kea-prom-exporter/actions/workflows/ci.yml?query=branch%3Amain)
+[![Version](https://img.shields.io/github/v/tag/dimidur/kea-prom-exporter?sort=semver&label=version)](https://github.com/dimidur/kea-prom-exporter/tags)
+[![Docker pulls](https://img.shields.io/docker/pulls/dimidur/kea-prom-exporter?label=docker%20pulls)](https://hub.docker.com/r/dimidur/kea-prom-exporter)
+[![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fdimidur.github.io%2Fkea-prom-exporter%2Fcoverage.json)](docs/design.md#coverage-is-held-to-a-ratchet)
 [![Tested with Kea](https://img.shields.io/badge/tested%20with%20Kea-3.2.1-blue)](docs/design.md#compatibility-is-checked-against-a-real-kea)
 
 Prometheus exporter for **ISC Kea DHCP 3.x**, written in Go.

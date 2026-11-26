@@ -8,11 +8,15 @@ name: release
 
 jobs:
   # Every gate in ci.yml runs against the tagged tree before anything is
-  # published.
+  # published. The called workflow's coverage-badge job needs pages and
+  # id-token write to be granted here, but it runs only on a push to main,
+  # never on a release.
   verify:
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
+      pages: write
+      id-token: write
 
   # The tagged tree against the Kea it pins (docs/design.md, "Compatibility is
   # checked against a real Kea"). The called workflow's issue job needs
