@@ -156,9 +156,10 @@ floor that only rises.
   having moved on during the run, since the run for that merge raises the
   floors. Any other would leave the floors stale with nothing to show for it.
 - **The badge reads GitHub Pages.** It shows measured coverage, since a floor
-  only says how far coverage may fall. Each run on `main` whose test job is
-  green publishes its total there; storing it in the repository instead would
-  mean a commit after every merge that moves coverage at all.
+  only says how far coverage may fall. A run on `main` whose test job is green
+  publishes its total there, unless a newer merge has landed meanwhile, whose
+  own run publishes instead; storing it in the repository instead would mean a
+  commit after every merge that moves coverage at all.
 
 [create-commit]: https://docs.github.com/en/graphql/reference/commits#mutation-createcommitonbranch
 [bot-signatures]: https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification#signature-verification-for-bots
