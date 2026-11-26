@@ -7,6 +7,7 @@
     ":semanticCommitTypeAll(build)"
   ],
   "osvVulnerabilityAlerts": true,
+  "labels": ["dependencies"],
   "prHourlyLimit": 0,
   "postUpdateOptions": ["gomodTidy", "gomodUpdateImportPaths"],
   "pip-compile": {

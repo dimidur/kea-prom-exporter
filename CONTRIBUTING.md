@@ -160,7 +160,9 @@ first: break the code it guards and watch it go red.
 
 ## Releases
 
-Maintainer only: tag `vX.Y.Z` and CI builds and publishes multi-arch images.
+Maintainer only: a release is cut by tagging `vX.Y.Z`. Whoever merges a pull
+request labels it with its category from `.github/release.yml` first, since
+the release notes are sorted by those labels; Renovate labels its own.
 
 ## License
 

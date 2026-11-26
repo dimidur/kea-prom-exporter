@@ -265,29 +265,40 @@ cannot hold up the others.
 
 ## Docker
 
+Released images are on Docker Hub as
+[`dimidur/kea-prom-exporter`](https://hub.docker.com/r/dimidur/kea-prom-exporter),
+for `linux/amd64` and `linux/arm64`. Each stable release is tagged with its
+version (`0.3.0`) and its minor line (`0.3`), and `latest` moves to each stable
+release as it is published; a prerelease (`1.2.0-rc1`) gets only its own tag.
+Pin a version. Releases after 0.3.0 have
+[release notes](https://github.com/dimidur/kea-prom-exporter/releases) saying
+what each one changed.
+
 The image runs as **uid 65532** (`nonroot`), so a mounted password file must be
 readable by that user; a `0600` file owned by your account is not.
 
 ```bash
-docker build -t kea-prom-exporter:dev .
+VERSION=0.3.0                  # the release to run
 chmod 0644 kea-password        # or: chown 65532 kea-password
 docker run --rm -p 9547:9547 \
   -e KEA_URL=http://host.docker.internal:8001/ \
   -e KEA_USER=kea-ops \
   -e KEA_PASSWORD_FILE=/run/secrets/kea-password \
   -v ./kea-password:/run/secrets/kea-password:ro \
-  kea-prom-exporter:dev
+  "dimidur/kea-prom-exporter:$VERSION"
 ```
 
 Under Kubernetes `PodSecurity: restricted` no `securityContext` override is
 needed; the image already declares a non-root user.
 
-Multi-arch build:
+To build the image yourself, `docker build -t kea-prom-exporter:dev .` and run
+that tag instead. Multi-arch build:
 
 ```bash
+REGISTRY=registry.example.com/you   # where your build goes, not Docker Hub's
 docker buildx build --platform linux/amd64,linux/arm64 \
-  --build-arg VERSION=0.1.0 --build-arg REVISION="$(git rev-parse HEAD)" \
-  -t dimidur/kea-prom-exporter:0.1.0 --push .
+  --build-arg VERSION=dev --build-arg REVISION="$(git rev-parse HEAD)" \
+  -t "$REGISTRY/kea-prom-exporter:dev" --push .
 ```
 
 Without those build args the image reports `version=dev revision=unknown`:
