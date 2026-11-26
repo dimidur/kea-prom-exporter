@@ -7,7 +7,7 @@
 # cap and buffer are kept in the baseline.
 #
 # Usage:
-#   scripts/coverage-ratchet.sh [check|seed|bump] [--reuse]
+#   scripts/coverage-ratchet.sh [check|seed|bump|total] [--reuse]
 #
 # check   fail if coverage is more than 0.05 points below a recorded floor
 #         (the default); a file with no floor yet counts only in the total
@@ -15,9 +15,11 @@
 # bump    raise the floors the current run clears by more than the buffer,
 #         give a file with no floor yet its floor, and drop the floors of
 #         files that are gone
+# total   print only the run's total statement coverage, in percent,
+#         rounded to 2 decimals
 # --reuse read the profile the last run wrote instead of running the tests,
-#         so a CI job runs the tests once and then checks and bumps from
-#         them; without a profile, the tests run anyway
+#         so a CI job runs the tests once and reuses them for every mode;
+#         without a profile, the tests run anyway, their output on stderr
 #
 # The profile is coverage.out at the repository root, or RATCHET_PROFILE.
 # Exit status: 1 when check fails or the tests it runs fail, 2 on a usage
@@ -25,11 +27,11 @@
 set -euo pipefail
 shopt -s inherit_errexit
 
-usage="usage: $0 [check|seed|bump] [--reuse]"
+usage="usage: $0 [check|seed|bump|total] [--reuse]"
 mode="${1:-check}"
 reuse="${2:-}"
 case "${mode}" in
-check | seed | bump) ;;
+check | seed | bump | total) ;;
 *)
 	echo "${usage}" >&2
 	exit 2
@@ -48,7 +50,7 @@ trap 'rm -f "${current}"' EXIT
 
 if [[ "${reuse}" != "--reuse" || ! -f "${profile}" ]]; then
 	echo "[ratchet] running the unit tests with coverage..." >&2
-	(cd "${root}" && go test -count=1 -coverprofile="${profile}" ./...)
+	(cd "${root}" && go test -count=1 -coverprofile="${profile}" ./... >&2)
 fi
 module="$(cd "${root}" && go list -m)"
 
@@ -136,8 +138,12 @@ ratchet_check() {
 		echo "${failures}"
 		exit 1
 	fi
-	total="$(jq -r '.totals.statements * 100 | round / 100' "${current}")"
+	total="$(ratchet_total)"
 	echo "coverage ratchet OK total statements ${total}% (floors held)"
+}
+
+ratchet_total() {
+	jq -r '.totals.statements * 100 | round / 100' "${current}"
 }
 
 ratchet_bump() {
