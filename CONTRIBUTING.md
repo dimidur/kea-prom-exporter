@@ -112,6 +112,11 @@ A design decision goes in [docs/design.md](docs/design.md): what the exporter
 does, and what in Kea's output it relies on, not how Kea works inside. Code and
 test comments point to its heading rather than repeat it.
 
+README.md is also the Docker Hub overview, published from each stable release
+tag. Write its relative links inline, `[text](docs/design.md)`: a
+reference-style or HTML link stays relative there and breaks. Keep it well
+under 25,000 bytes, Docker Hub's limit, past which it is cut short.
+
 ## Test style
 
 Every test opens with a comment stating the behaviour under test and why it is
