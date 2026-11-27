@@ -28,8 +28,8 @@ jobs:
       contents: read
       issues: write
 
-  # This job is the one with Docker Hub credentials in scope, so the SHA pins
-  # below matter most here.
+  # This job and overview hold Docker Hub credentials, so the SHA pins in them
+  # matter most.
   publish:
     needs: [verify, compat]
     # Tags only. On a workflow_dispatch the semver patterns do not match, so
@@ -37,10 +37,15 @@ jobs:
     # identity it does not have.
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    # The Docker Hub tokens are secrets of this environment, which only v* tags
+    # may use; a tag ruleset limits who can create those.
+    environment: dockerhub
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1  # v4.4.0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
@@ -79,6 +84,37 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # The Docker Hub overview is the README of the tag just published, with
+  # relative links made absolute to that tag. A job of its own, so a failure
+  # here neither holds back the release notes nor needs the images rebuilt to
+  # retry. Its own token, because the description API needs the delete scope,
+  # which pushing does not.
+  overview:
+    needs: publish
+    # Hub keeps one overview per repository, and it describes `latest`, which a
+    # prerelease does not move.
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    runs-on: ubuntu-latest
+    # The Docker Hub tokens are secrets of this environment, which only v* tags
+    # may use; a tag ruleset limits who can create those.
+    environment: dockerhub
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa  # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_DESCRIPTION_TOKEN }}
+          # Docker Hub's limit is 100 bytes, which the GitHub description exceeds.
+          short-description: >-
+            Prometheus exporter for ISC Kea DHCP 3.x: lease pools, packet
+            counters and HA peer state.
+          enable-url-completion: true
 
   # Notes come from GitHub's own generator, sorted by the pull request labels
   # listed in .github/release.yml. Runs after publish, so a release is only
