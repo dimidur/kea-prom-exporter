@@ -122,12 +122,18 @@ jobs:
     needs: test
     if: needs.test.outputs.floors-changed == 'true'
     runs-on: ubuntu-latest
-    # Nothing here uses the workflow's token: the artifact comes from this run,
-    # and the commit is made with the bot's.
-    permissions: {}
+    # The workflow's token only checks out the measured commit, for the
+    # scripts and the baseline the floors are checked against; the commit is
+    # made with the bot's.
+    permissions:
+      contents: read
     # The bot's key is a secret of this environment, which only main may use.
     environment: coverage-bot
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-cli
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: coverage-baseline
@@ -138,35 +144,12 @@ jobs:
           client-id: ${{ secrets.COVERAGE_BOT_CLIENT_ID }}
           private-key: ${{ secrets.COVERAGE_BOT_PRIVATE_KEY }}
           permission-contents: write
-      # The commit is made on top of the commit the floors were measured on,
-      # and GitHub refuses it if main has moved on since.
       - name: commit the raised floors
         env:
           GH_TOKEN: ${{ steps.coverage-bot.outputs.token }}
-        run: |
-          jq -n \
-            --arg repo "$GITHUB_REPOSITORY" --arg measured "$GITHUB_SHA" \
-            --rawfile floors "$RUNNER_TEMP/floors/coverage-baseline.json" '
-            { query: ("mutation($input: CreateCommitOnBranchInput!) {"
-                      + " createCommitOnBranch(input: $input) { commit { oid } } }"),
-              variables: { input: {
-                branch: { repositoryNameWithOwner: $repo, branchName: "main" },
-                expectedHeadOid: $measured,
-                message: { headline: "ci: raise the coverage floors [skip ci]" },
-                fileChanges: { additions: [
-                  { path: "coverage-baseline.json", contents: ($floors | @base64) } ] } } } }
-          ' > "$RUNNER_TEMP/commit.json"
-          if gh api graphql --input "$RUNNER_TEMP/commit.json" \
-            --jq '.data.createCommitOnBranch.commit.oid'; then
-            exit 0
-          fi
-          landed=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
-          if [ "$landed" != "$GITHUB_SHA" ]; then
-            echo "::notice::main moved on during this run; its next run raises the floors"
-            exit 0
-          fi
-          echo "::error::main rejected the coverage bot's commit of the raised floors"
-          exit 1
+        run: >-
+          scripts/commit-floors.sh "$GITHUB_SHA"
+          "$RUNNER_TEMP/floors/coverage-baseline.json" coverage-baseline.json
 
   # Publishes main's measured coverage for the README badge, as a shields.io
   # endpoint file on GitHub Pages. Why there: docs/design.md, "Coverage is

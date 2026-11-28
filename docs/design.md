@@ -152,6 +152,11 @@ floor that only rises.
   [bot signatures][bot-signatures]). Its key is a secret of an environment
   only `main` may use, and its token is minted in a job of its own, so no
   other branch's workflow and no code the tests run can reach it.
+- **Only a ratchet is committed.** The raised floors come from the test job,
+  which runs the dependencies' code, so before committing them the bot's job
+  checks them against the baseline at the measured commit: every floor at
+  least its old value and at most 100, the cap and buffer unchanged, and a
+  file's floors dropped only once the file is gone.
 - **A rejected commit fails the run.** The one rejection tolerated is `main`
   having moved on during the run, since the run for that merge raises the
   floors. Any other would leave the floors stale with nothing to show for it.
