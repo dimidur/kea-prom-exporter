@@ -8,15 +8,12 @@ name: release
 
 jobs:
   # Every gate in ci.yml runs against the tagged tree before anything is
-  # published. The called workflow's coverage-badge job needs pages and
-  # id-token write to be granted here, but it runs only on a push to main,
-  # never on a release.
+  # published. The called workflow's coverage-badge job needs contents: write
+  # to be granted here, but it runs only on main, never on a release.
   verify:
     uses: ./.github/workflows/ci.yml
     permissions:
-      contents: read
-      pages: write
-      id-token: write
+      contents: write
 
   # The tagged tree against the Kea it pins (docs/design.md, "Compatibility is
   # checked against a real Kea"). The called workflow's issue job needs
@@ -158,3 +155,25 @@ jobs:
           STABLE: ${{ steps.classify.outputs.stable }}
           HIGHEST: ${{ steps.classify.outputs.highest }}
         run: scripts/create-release.sh "$TAG" "$STABLE" "$HIGHEST"
+
+  # The README badge shows the Latest release, read once notes has created
+  # this release: docs/design.md, "The badges are committed by CI". No
+  # third-party action runs in this job, which holds a write token.
+  version-badge:
+    needs: notes
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Above badge.sh's worst case against a slow shields.io, so the script
+    # fails with its own message rather than the job being cancelled.
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-cli
+      - name: publish the version badge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/badge.sh version
