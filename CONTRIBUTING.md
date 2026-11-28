@@ -119,8 +119,8 @@ A design decision goes in [docs/design.md](docs/design.md): what the exporter
 does, and what in Kea's output it relies on, not how Kea works inside. Code and
 test comments point to its heading rather than repeat it.
 
-README.md is also the Docker Hub overview, published from each stable release
-tag. Write its relative links inline, `[text](docs/design.md)`: a
+README.md is also the Docker Hub overview, published from the highest stable
+release. Write its relative links inline, `[text](docs/design.md)`: a
 reference-style or HTML link stays relative there and breaks. Keep it well
 under 25,000 bytes, Docker Hub's limit, past which it is cut short.
 
@@ -176,7 +176,17 @@ first: break the code it guards and watch it go red.
 
 Maintainer only: a release is cut by tagging `vX.Y.Z`. Whoever merges a pull
 request labels it with its category from `.github/release.yml` first, since
-the release notes are sorted by those labels; Renovate labels its own.
+the release notes are sorted by those labels; Renovate labels its own. A
+release runs the workflows and scripts of the commit it tags, so tag a patch
+to an older line on a commit that carries `main`'s current `.github/` and
+`scripts/`: older copies move `latest` back to it. For the same reason, once
+a higher release exists, do not re-run or dispatch the release of v0.3.1 or
+an earlier tag.
+
+Re-run a failed release rather than tagging past it: its tag holds back
+every lower release until it publishes
+([docs/design.md](docs/design.md#only-the-highest-release-names-the-latest)),
+and the release-tags ruleset lets only the maintainer delete a tag.
 
 ## License
 

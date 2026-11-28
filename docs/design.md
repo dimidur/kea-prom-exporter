@@ -168,3 +168,28 @@ floor that only rises.
 
 [create-commit]: https://docs.github.com/en/graphql/reference/commits#mutation-createcommitonbranch
 [bot-signatures]: https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification#signature-verification-for-bots
+
+## Only the highest release names the latest
+
+A release that is not the highest stable one, such as a patch to an older
+line, is published like any other: its own image tag, release notes. It
+moves nothing that names the latest release: the image's `latest` tag, the
+Docker Hub overview, GitHub's Latest release. These would otherwise follow
+whichever release came last, so the newest line would appear to step back.
+In the same way, a release moves its minor line's tag only if it is the
+highest in that line.
+
+Each step that moves the image tags, the overview or the Latest release
+decides immediately before it does, from the stable tags pushed by then, so
+re-running a failed job decides afresh rather than reusing an answer from
+before a higher release. It compares against the tags rather than the
+releases: a tag exists from the moment it is pushed, while its release
+appears only once its run has published, so two releases pushed close
+together still see each other. The same holds for a stable tag whose run
+never publishes: it still holds back every lower release.
+
+For the image, that means building and pushing the version tag alone, then
+deciding, then moving `latest` and the minor line's tag onto the pushed
+version without rebuilding (`scripts/tag-image.sh`). Deciding before the
+build would leave the build's minutes between the decision and the move,
+long enough for a higher release to move `latest` first and be overwritten.

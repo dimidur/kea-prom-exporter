@@ -69,3 +69,15 @@ assert_unchanged() {
 		fail "$2 changed"
 	fi
 }
+
+tags_endpoint='repos_owner_repo_tags?per_page=100'
+
+# The repository's tags, as GitHub lists them on the first page.
+tags_pushed() {
+	jq -n '[$ARGS.positional[] | {name: .}]' --args "$@" >"${FAKE}/${tags_endpoint}"
+}
+
+# More tags, on the second page.
+tags_on_page_2() {
+	jq -n '[$ARGS.positional[] | {name: .}]' --args "$@" >"${FAKE}/${tags_endpoint}.page2"
+}
