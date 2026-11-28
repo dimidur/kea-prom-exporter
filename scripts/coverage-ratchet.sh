@@ -14,7 +14,8 @@
 # seed    overwrite the baseline from the current run
 # bump    raise the floors the current run clears by more than the buffer,
 #         give a file with no floor yet its floor, and drop the floors of
-#         files that are gone
+#         files that are gone; prints changed=true or changed=false, for
+#         GITHUB_OUTPUT, and what it changed on stderr
 # total   print only the run's total statement coverage, in percent,
 #         rounded to 2 decimals
 # --reuse read the profile the last run wrote instead of running the tests,
@@ -180,10 +181,12 @@ ratchet_bump() {
 	if ((changes > 0)); then
 		jq -S '.base' <<<"${out}" >"${baseline}.tmp"
 		mv "${baseline}.tmp" "${baseline}"
-		echo "coverage ratchet bumped ${changes} floor(s):"
-		jq -r '.changes[] | "  " + .' <<<"${out}"
+		echo "coverage ratchet bumped ${changes} floor(s):" >&2
+		jq -r '.changes[] | "  " + .' <<<"${out}" >&2
+		echo "changed=true"
 	else
-		echo "coverage ratchet: nothing to bump"
+		echo "coverage ratchet: nothing to bump" >&2
+		echo "changed=false"
 	fi
 }
 
