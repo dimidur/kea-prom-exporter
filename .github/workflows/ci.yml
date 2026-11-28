@@ -151,110 +151,28 @@ jobs:
           scripts/commit-floors.sh "$GITHUB_SHA"
           "$RUNNER_TEMP/floors/coverage-baseline.json" coverage-baseline.json
 
-  # Publishes main's measured coverage for the README badge, as a shields.io
-  # endpoint file on GitHub Pages. Why there: docs/design.md, "Coverage is
-  # held to a ratchet".
+  # main's measured coverage as the README badge: docs/design.md, "The badges
+  # are committed by CI". No third-party action runs in this job, which holds a
+  # write token.
   coverage-badge:
     needs: test
     if: needs.test.outputs.coverage != ''
     runs-on: ubuntu-latest
-    # A backstop only: the deploy attempts below are bounded on their own, so a
-    # failed deploy ends this job as failed well before it, not as cancelled.
+    # Above badge.sh's worst case against a slow shields.io, so the script
+    # fails with its own message rather than the job being cancelled.
     timeout-minutes: 10
     permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.published.outputs.url }}
-    concurrency:
-      group: pages
-      cancel-in-progress: false
+      contents: write
     steps:
-      # Two merges close together can finish out of order, and the older one
-      # must not overwrite the newer badge. main being ahead only by the
-      # coverage bot's commits still counts as this run's commit.
-      - name: check this is main's newest measured commit
-        id: newest
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-cli
+      - name: publish the coverage badge
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          others=$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...main" --jq '
-            [.commits[] | select((.author.login // "") != "dimidur-coverage-bot[bot]")]
-            | length')
-          if [ "$others" = 0 ]; then
-            echo "newest=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::main moved on; the run for its newest commit publishes the badge"
-          fi
-      - name: write the badge
-        if: steps.newest.outputs.newest == 'true'
-        env:
           COVERAGE: ${{ needs.test.outputs.coverage }}
-        run: |
-          mkdir "$RUNNER_TEMP/site"
-          jq -n --argjson coverage "$COVERAGE" '
-            { schemaVersion: 1, label: "coverage", message: "\($coverage)%",
-              color: (if $coverage >= 90 then "brightgreen"
-                      elif $coverage >= 75 then "yellow" else "red" end) }
-          ' > "$RUNNER_TEMP/site/coverage.json"
-      - if: steps.newest.outputs.newest == 'true'
-        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
-        with:
-          path: ${{ runner.temp }}/site
-      # deploy-pages looks the artifact up once, and right after an upload that
-      # lookup can come back empty (actions/deploy-pages#451). Only the deploy
-      # is retried: the artifact can be uploaded only once, and a re-run's
-      # upload makes the lookup find two. When the first two attempts fail at
-      # the lookup, the third starts about 80 s after the first, past the
-      # longest lag measured there (about 46 s) and the 60 s wait reported to
-      # clear it. Remove the retries only once deploy-pages itself waits at
-      # least 60 s for the artifact, or accepts the uploaded artifact's ID
-      # instead of looking it up by name.
-      #
-      # Each attempt is bounded twice. The action's own timeout counts only
-      # from the deployment's creation and is checked between status polls,
-      # so a 60 s timeout gives up by about 96 s and cancels its deployment.
-      # The step's 2-minute limit bounds the rest, the lookup and a hung
-      # request included, and fails the step rather than cancelling the job.
-      - name: deploy the badge (attempt 1 of 3)
-        id: deploy
-        if: steps.newest.outputs.newest == 'true'
-        continue-on-error: true
-        timeout-minutes: 2
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346  # v5.0.1
-        with:
-          timeout: 60000
-      - name: wait before attempt 2
-        if: steps.deploy.outcome == 'failure'
-        run: sleep 20
-      - name: deploy the badge (attempt 2 of 3)
-        id: deploy-2
-        if: steps.deploy.outcome == 'failure'
-        continue-on-error: true
-        timeout-minutes: 2
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346  # v5.0.1
-        with:
-          timeout: 60000
-      - name: wait before attempt 3
-        if: steps.deploy-2.outcome == 'failure'
-        run: sleep 60
-      - name: deploy the badge (attempt 3 of 3)
-        id: deploy-3
-        if: steps.deploy-2.outcome == 'failure'
-        timeout-minutes: 2
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346  # v5.0.1
-        with:
-          timeout: 60000
-      - name: link the published badge
-        id: published
-        if: steps.newest.outputs.newest == 'true'
-        env:
-          PAGE_URL: >-
-            ${{ steps.deploy.outputs.page_url || steps.deploy-2.outputs.page_url
-            || steps.deploy-3.outputs.page_url }}
-        run: echo "url=${PAGE_URL}coverage.json" >> "$GITHUB_OUTPUT"
+        run: scripts/badge.sh coverage "$GITHUB_SHA" "$COVERAGE"
 
   docs:
     runs-on: ubuntu-latest

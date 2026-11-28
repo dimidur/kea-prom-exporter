@@ -160,33 +160,81 @@ floor that only rises.
 - **A rejected commit fails the run.** The one rejection tolerated is `main`
   having moved on during the run, since the run for that merge raises the
   floors. Any other would leave the floors stale with nothing to show for it.
-- **The badge reads GitHub Pages.** It shows measured coverage, since a floor
-  only says how far coverage may fall. A run on `main` whose test job is green
-  publishes its total there, unless a newer merge has landed meanwhile, whose
-  own run publishes instead; storing it in the repository instead would mean a
-  commit after every merge that moves coverage at all.
+- **The badge shows measured coverage,** since a floor only says how far
+  coverage may fall. How it is published: "The badges are committed by CI".
 
 [create-commit]: https://docs.github.com/en/graphql/reference/commits#mutation-createcommitonbranch
 [bot-signatures]: https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification#signature-verification-for-bots
+
+## The badges are committed by CI
+
+GitHub shows a README image from another site through its image proxy, which
+gives up after about four seconds ([shields#1568][shields-1568]). A badge
+service such as shields.io renders a dynamic badge on request and caches it
+for minutes, so the first view after each expiry waits on the service's own
+fetch and often misses that limit; the badge then shows as broken until a
+reload. An image GitHub serves itself, from `raw.githubusercontent.com`, does
+not pass through the proxy at all.
+
+So CI commits the version and coverage badges as SVG files to the `badges`
+branch, which holds only them and a README saying what the branch is for,
+and from which the README links them (`scripts/badge.sh`). Each SVG is
+shields.io's static badge, fetched in CI, where no proxy is waiting on it.
+Fetching rather than drawing with a third-party action means no third-party
+action runs in the job that holds the write token, so fetching and
+committing share one step. The SVG is the one input CI does not pin, so it
+is committed only while it is badge-sized, has an SVG root and holds no
+script, embedded HTML, link or event handler.
+
+Whether a badge may be published, and for the version what it shows, is
+read from GitHub in that step, never handed down by an earlier job, so a
+re-run of a failed job, however late, commits nothing stale:
+
+- **Coverage** is the figure the run measured for its own commit, committed
+  only while that commit is still `main`'s newest, so of two merges finishing
+  out of order the older does not replace the newer one's figure.
+- **Version** is the repository's Latest release, read once the release run
+  has created its release, after the images are on Docker Hub. It follows
+  the choice of Latest rather than making one of its own, and a failure there
+  holds back nothing of the release.
+
+A branch rather than GitHub Pages, which replaces the whole site with each
+deploy, so that whichever run deployed would have to regenerate the other's
+badge too. GitHub signs the commits, made through the same GraphQL mutation
+as the coverage floors. Each is made against the branch head read before the
+source, and GitHub refuses it once anything else has been committed; the
+retry reads both again. Both sources only move forward, so the badge left on
+the branch never shows the older of two runs racing. Made with the
+workflow's own token, the commits start no workflow.
+
+The README of v0.3.1 reads a shields.io endpoint file on GitHub Pages
+instead. That site is still served but no longer updated, so that README
+shows the coverage it last held, and Pages stays enabled for it.
+
+Docker pulls is a count only Docker Hub has, so it stays a shields.io badge;
+its six-hour cache makes a miss rare.
+
+[shields-1568]: https://github.com/badges/shields/issues/1568
 
 ## Only the highest release names the latest
 
 A release that is not the highest stable one, such as a patch to an older
 line, is published like any other: its own image tag, release notes. It
 moves nothing that names the latest release: the image's `latest` tag, the
-Docker Hub overview, GitHub's Latest release. These would otherwise follow
-whichever release came last, so the newest line would appear to step back.
-In the same way, a release moves its minor line's tag only if it is the
-highest in that line.
+Docker Hub overview, GitHub's Latest release, and so the version badge,
+which shows it. These would otherwise follow whichever release came last, so
+the newest line would appear to step back. In the same way, a release moves
+its minor line's tag only if it is the highest in that line.
 
 Each step that moves the image tags, the overview or the Latest release
 decides immediately before it does, from the stable tags pushed by then, so
 re-running a failed job decides afresh rather than reusing an answer from
-before a higher release. It compares against the tags rather than the
-releases: a tag exists from the moment it is pushed, while its release
-appears only once its run has published, so two releases pushed close
-together still see each other. The same holds for a stable tag whose run
-never publishes: it still holds back every lower release.
+before a higher release; the version badge follows the Latest release. It
+compares against the tags rather than the releases: a tag exists from the
+moment it is pushed, while its release appears only once its run has
+published, so two releases pushed close together still see each other. The
+same holds for a stable tag whose run never publishes: it still holds back
+every lower release.
 
 For the image, that means building and pushing the version tag alone, then
 deciding, then moving `latest` and the minor line's tag onto the pushed

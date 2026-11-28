@@ -27,6 +27,17 @@ fresh() {
 	export FAKE
 }
 
+# Runs the rest of the line against the state that replaces the fakes' once
+# the given endpoint file has been read.
+after_reading() {
+	local fake="${FAKE}" endpoint="$1"
+	shift
+	FAKE="${fake}/after-${endpoint}"
+	mkdir -p "${FAKE}"
+	"$@"
+	FAKE="${fake}"
+}
+
 # Asserts what a fake's log holds; nothing when it was never written.
 assert_logged() {
 	local got=""
