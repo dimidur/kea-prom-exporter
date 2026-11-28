@@ -1,0 +1,39 @@
+---
+name: classify release
+description: >-
+  What the tag being released may move, read from the tags pushed so far:
+  docs/design.md, "Only the highest release names the latest". Needs the
+  repository checked out, the pinned gh and jq (setup-cli) and a token that
+  can read the repository.
+
+inputs:
+  stable-only:
+    description: >-
+      "true" to answer stable alone, which is fixed with the tag, without
+      reading the tags.
+    default: "false"
+
+outputs:
+  stable:
+    description: The tag is vX.Y.Z, with no suffix.
+    value: ${{ steps.classify.outputs.stable }}
+  highest:
+    description: Stable, and not below any stable tag; unset with stable-only.
+    value: ${{ steps.classify.outputs.highest }}
+
+runs:
+  using: composite
+  steps:
+    - id: classify
+      shell: bash
+      env:
+        # Only a read of the tags needs the token.
+        GH_TOKEN: ${{ inputs.stable-only != 'true' && github.token || '' }}
+        TAG: ${{ github.ref_name }}
+        STABLE_ONLY: ${{ inputs.stable-only }}
+      run: |
+        flags=()
+        if [ "$STABLE_ONLY" = true ]; then
+          flags+=(--stable-only)
+        fi
+        "$GITHUB_WORKSPACE/scripts/classify-release.sh" "${flags[@]}" "$TAG" >> "$GITHUB_OUTPUT"

@@ -30,6 +30,7 @@
     "govulncheck",
     "honnef",
     "hostnames",
+    "imagetools",
     "jonasal",
     "koalaman",
     "ldflags",

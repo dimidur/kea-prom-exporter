@@ -272,9 +272,10 @@ cannot hold up the others.
 Released images are on Docker Hub as
 [`dimidur/kea-prom-exporter`](https://hub.docker.com/r/dimidur/kea-prom-exporter),
 for `linux/amd64` and `linux/arm64`. Each stable release is tagged with its
-version (`0.3.0`) and its minor line (`0.3`), and `latest` moves to each stable
-release as it is published; a prerelease (`1.2.0-rc1`) gets only its own tag.
-Pin a version. Releases after 0.3.0 have
+version (`0.3.0`). Its minor line's tag (`0.3`) points at the highest stable
+release of that line, and `latest` at the highest overall, so a patch to an
+older line leaves `latest` alone. A prerelease (`1.2.0-rc1`) gets only its
+own tag. Pin a version. Releases after 0.3.0 have
 [release notes](https://github.com/dimidur/kea-prom-exporter/releases) saying
 what each one changed.
 
