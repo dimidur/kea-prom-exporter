@@ -47,6 +47,13 @@ A change that drops statement coverage below a floor in
 `coverage-baseline.json` fails; add tests rather than lower a floor.
 `scripts/coverage-ratchet.sh` runs the same check locally.
 
+Logic that decides what CI commits or publishes lives in `scripts/`, not in a
+workflow, so that it can be tested; a workflow only chooses, by event, branch
+or tag, which runs get to call it. A change to a script there comes with
+tests in `scripts/tests/`, one bats file per script, against the fakes in
+`scripts/fakes/` rather than the network. `scripts/test-scripts.sh` runs them
+as CI does, fetching the pinned bats on first use; it needs git and jq.
+
 ## Tests without a Kea instance
 
 `testdata/` holds **real** `statistic-get-all` and `status-get` responses
@@ -139,7 +146,9 @@ func TestSomething(t *testing.T) {
 ```
 
 Table-driven tests mark the sections inside the subtest, where the acting
-happens, not around the table literal.
+happens, not around the table literal. The bats tests in `scripts/tests/`
+follow the same style, with `# Arrange` markers; a table's rows are calls to
+a helper that holds the markers.
 
 A test that cannot fail is worse than no test. When adding one, make it fail
 first: break the code it guards and watch it go red.

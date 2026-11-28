@@ -23,6 +23,11 @@
   },
   "packageRules": [
     {
+      "description": "gh and jq run in jobs that hold write tokens, and bats runs the tests that vouch for those jobs' scripts, so a release of any of them waits two weeks for its problems to surface.",
+      "matchPackageNames": ["cli/cli", "jqlang/jq", "/^bats-core\\//"],
+      "minimumReleaseAge": "14 days"
+    },
+    {
       "description": "go.mod's go line is the project's only Go version, so it follows every Go release; Renovate leaves it alone by default.",
       "matchManagers": ["gomod"],
       "matchDepNames": ["go"],
@@ -78,6 +83,36 @@
       ],
       "depNameTemplate": "koalaman/shellcheck",
       "datasourceTemplate": "github-release-attachments"
+    },
+    {
+      "customType": "regex",
+      "description": "The gh release file setup-cli downloads: its version and SHA-256 move together.",
+      "managerFilePatterns": ["/^\\.github/actions/setup-cli/action\\.yml$/"],
+      "matchStrings": [
+        "GH_VERSION: (?<currentValue>v\\d+\\.\\d+\\.\\d+)\\s+GH_SHA256: (?<currentDigest>[a-f0-9]{64})"
+      ],
+      "depNameTemplate": "cli/cli",
+      "datasourceTemplate": "github-release-attachments"
+    },
+    {
+      "customType": "regex",
+      "description": "The jq release file setup-cli downloads: its version and SHA-256 move together. jq's tags read jq-X.Y.Z.",
+      "managerFilePatterns": ["/^\\.github/actions/setup-cli/action\\.yml$/"],
+      "matchStrings": [
+        "JQ_VERSION: (?<currentValue>jq-\\d+\\.\\d+\\.\\d+)\\s+JQ_SHA256: (?<currentDigest>[a-f0-9]{64})"
+      ],
+      "depNameTemplate": "jqlang/jq",
+      "datasourceTemplate": "github-release-attachments",
+      "versioningTemplate": "regex:^jq-(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "The bats tools scripts/test-scripts.sh fetches, each a tag and the commit it points to.",
+      "managerFilePatterns": ["/^scripts/test-scripts\\.sh$/"],
+      "matchStrings": [
+        "# renovate: depName=(?<depName>\\S+)\\n\\w+=(?<currentValue>v\\d+\\.\\d+\\.\\d+)@(?<currentDigest>[a-f0-9]{40})"
+      ],
+      "datasourceTemplate": "github-tags"
     },
     {
       "customType": "regex",

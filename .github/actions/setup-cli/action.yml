@@ -1,0 +1,34 @@
+---
+name: setup cli
+description: >-
+  Puts the gh and jq that the scripts under scripts/ rely on first on PATH,
+  at pinned versions verified by SHA-256. The runner image's own copies
+  change with the image, and the scripts depend on how these behave, such as
+  gh printing GitHub's error body on stdout.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        # The release files for linux amd64, each pinned by its SHA-256.
+        GH_VERSION: v2.104.0
+        GH_SHA256: 98cb101ad87dbbd3f6b2f2bfcbd43197ccd07643140121d8a9cfaa91eadbc24e
+        JQ_VERSION: jq-1.8.2
+        JQ_SHA256: b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+      run: |
+        bin="$RUNNER_TEMP/cli"
+        mkdir -p "$bin"
+        gh_dir="gh_${GH_VERSION#v}_linux_amd64"
+        curl -fsSL --retry 3 -o "$RUNNER_TEMP/$gh_dir.tar.gz" \
+          "https://github.com/cli/cli/releases/download/$GH_VERSION/$gh_dir.tar.gz"
+        echo "$GH_SHA256  $RUNNER_TEMP/$gh_dir.tar.gz" | sha256sum -c -
+        tar -xzf "$RUNNER_TEMP/$gh_dir.tar.gz" -C "$RUNNER_TEMP"
+        cp "$RUNNER_TEMP/$gh_dir/bin/gh" "$bin/gh"
+        curl -fsSL --retry 3 -o "$bin/jq" \
+          "https://github.com/jqlang/jq/releases/download/$JQ_VERSION/jq-linux-amd64"
+        echo "$JQ_SHA256  $bin/jq" | sha256sum -c -
+        chmod +x "$bin/jq"
+        echo "$bin" >> "$GITHUB_PATH"
+        "$bin/gh" --version
+        "$bin/jq" --version

@@ -27,11 +27,21 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # A push to main here, not on a fork: the only runs that raise the
+      # floors and publish the coverage badge.
+      MAIN_PUSH: >-
+        ${{ github.event_name == 'push' && github.ref == 'refs/heads/main'
+        && github.repository == 'dimidur/kea-prom-exporter' }}
     outputs:
-      raised: ${{ steps.raise.outputs.raised }}
+      floors-changed: ${{ steps.raise.outputs.changed }}
       coverage: ${{ steps.measure.outputs.coverage }}
     steps:
+      # No token left in the checkout: this job runs the dependencies' code.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-cli
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5  # v7.1.0
         with:
           # go.mod's `go` line is the only place the Go version is set; CI
@@ -85,19 +95,13 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"
           -o /tmp/kea-prom-exporter .
 
-      # Last, so only a green job on main raises the floors. The raised
+      # Last, so only a green job on main raises the floors. The changed
       # baseline goes to raise-floors, which commits it.
       - name: raise the coverage floors
         id: raise
-        if: >-
-          github.event_name == 'push' && github.ref == 'refs/heads/main'
-          && github.repository == 'dimidur/kea-prom-exporter'
-        run: |
-          scripts/coverage-ratchet.sh bump --reuse
-          if ! git diff --quiet -- coverage-baseline.json; then
-            echo "raised=true" >> "$GITHUB_OUTPUT"
-          fi
-      - if: steps.raise.outputs.raised == 'true'
+        if: env.MAIN_PUSH == 'true'
+        run: scripts/coverage-ratchet.sh bump --reuse >> "$GITHUB_OUTPUT"
+      - if: steps.raise.outputs.changed == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: coverage-baseline
@@ -107,9 +111,7 @@ jobs:
       # publishes.
       - name: measure the total coverage
         id: measure
-        if: >-
-          github.event_name == 'push' && github.ref == 'refs/heads/main'
-          && github.repository == 'dimidur/kea-prom-exporter'
+        if: env.MAIN_PUSH == 'true'
         run: |
           coverage=$(scripts/coverage-ratchet.sh total --reuse)
           echo "coverage=$coverage" >> "$GITHUB_OUTPUT"
@@ -118,7 +120,7 @@ jobs:
   # job of its own: docs/design.md, "Coverage is held to a ratchet".
   raise-floors:
     needs: test
-    if: needs.test.outputs.raised == 'true'
+    if: needs.test.outputs.floors-changed == 'true'
     runs-on: ubuntu-latest
     # Nothing here uses the workflow's token: the artifact comes from this run,
     # and the commit is made with the bot's.
@@ -305,6 +307,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+      - uses: ./.github/actions/setup-cli
       # No Go cache: it would share test's key and could be saved from this
       # job, which builds actionlint only.
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5  # v7.1.0
@@ -324,15 +327,18 @@ jobs:
         run: |
           shellcheck --version
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color
-      # Every tracked .sh file, with all optional checks on.
+      # Every tracked shell file, the tests' .bash and .bats included, with
+      # all optional checks on and the files each sources followed.
       - name: shellcheck
         run: |
-          mapfile -t scripts < <(git ls-files '*.sh')
+          mapfile -t scripts < <(git ls-files '*.sh' '*.bash' '*.bats')
           if [ "${#scripts[@]}" -eq 0 ]; then
             echo "::error::no shell scripts found to check"
             exit 1
           fi
-          shellcheck --enable=all "${scripts[@]}"
+          shellcheck --enable=all -x "${scripts[@]}"
+      - name: script tests
+        run: scripts/test-scripts.sh
 
   security:
     runs-on: ubuntu-latest
