@@ -36,6 +36,17 @@ assert_logged() {
 	assert_equal "${got}" "$2"
 }
 
+# Asserts the number of commit requests the fake gh has seen.
+assert_requests() {
+	local count=0 file
+	for file in "${FAKE}"/graphql.*; do
+		if [[ -f "${file}" ]]; then
+			count=$((count + 1))
+		fi
+	done
+	assert_equal "${count}" "$1"
+}
+
 # Asserts a jq expression over a JSON file.
 assert_json() {
 	local got
@@ -44,6 +55,12 @@ assert_json() {
 	fi
 	got="$(jq -c "$2" "$1")"
 	assert_equal "${got}" "$3"
+}
+
+# Asserts a jq expression over the input of a commit request, the first
+# unless a request number is given.
+assert_input() {
+	assert_json "${FAKE}/graphql.${3:-1}" ".variables.input | $1" "$2"
 }
 
 # Asserts that a file is byte for byte the copy taken before.
